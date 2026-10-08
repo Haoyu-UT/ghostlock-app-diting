@@ -228,6 +228,7 @@ addresses.
 | Field | Meaning |
 |---|---|
 | `route.select_stack.waiter_shift` | Relative shift of the select-route waiter on the stack (0 is valid); under a fallback declaration this is `fallback.route.select_stack.waiter_shift` |
+| `route.select_stack.lock_anchor_image` | Optional. Image-relative offset of a zero, writable, reference-free kernel region used as the walk's fake `rt_mutex` instead of the reclaimed payload page, so `rt_mutex_enqueue`'s descent exits on its first test regardless of what that page holds. Absent => the reclaimed page is used (previous behaviour). Device-specific; pick and verify per device (see `docs/analysis/payload-page-option2-plan.md`) |
 | `route.tcp_zerocopy.compact_waiter` | Compact-waiter layout flag for the tcp route; the multicast branch needs it too (`route.multicast_waiter.compact_waiter`) |
 
 ### 4.5 multicast_waiter route fields (`route.multicast_waiter`)

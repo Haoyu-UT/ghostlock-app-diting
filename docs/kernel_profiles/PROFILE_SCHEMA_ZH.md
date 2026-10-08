@@ -192,6 +192,7 @@ cred
 | 字段 | 含义 |
 |---|---|
 | `route.select_stack.waiter_shift` | select 路由 waiter 在栈上的相对位移（0 合法）；回退声明下对应 `fallback.route.select_stack.waiter_shift` |
+| `route.select_stack.lock_anchor_image` | 可选。以镜像相对偏移给出的、内容为零且无人写入的内核区域，用作 walk 的假 `rt_mutex`（替代回收页），使 `rt_mutex_enqueue` 的 descent 不论该页内容如何都必定在第一次判断退出。缺省 ⇒ 仍用回收页（旧行为）。按设备选择并验证（见 `docs/analysis/payload-page-option2-plan.md`） |
 | `route.tcp_zerocopy.compact_waiter` | tcp 路由的紧凑 waiter 布局标记；multicast 分支下同样需要（`route.multicast_waiter.compact_waiter`） |
 
 ### 4.5 multicast_waiter 路由字段（`route.multicast_waiter`）

@@ -165,6 +165,22 @@ int32_t main(void) {
         assert(round_trip(neg, &parsed, release, sizeof(release)) == 0);
         assert(parsed.geometry.pselect_waiter_shift.value_or(99) == -2);
 
+        /* The lock anchor round-trips, and an absent one stays absent (that
+         * absence is what keeps the pre-anchor reclaimed-page behaviour). */
+        profile::kernel_offsets anchored = {};
+        anchored.uname_r = "anchored";
+        anchored.route = ghostlock::profile::kRouteSelectStack;
+        anchored.geometry.select_lock_anchor_image = 0x2a3a590;
+        assert(round_trip(anchored, &parsed, release, sizeof(release)) == 0);
+        assert(parsed.geometry.select_lock_anchor_image.value_or(0) == 0x2a3a590);
+
+        profile::kernel_offsets unanchored = {};
+        unanchored.uname_r = "unanchored";
+        unanchored.route = ghostlock::profile::kRouteSelectStack;
+        unanchored.geometry.pselect_waiter_shift = -2;
+        assert(round_trip(unanchored, &parsed, release, sizeof(release)) == 0);
+        assert(!parsed.geometry.select_lock_anchor_image.has_value());
+
         /* An absent optional stays absent after the round trip. */
         profile::kernel_offsets absent = {};
         absent.uname_r = "absent";
@@ -224,6 +240,12 @@ int32_t main(void) {
                         {{"route.select_stack", {{"waiter_shift", -2}}}});
         assert(parse_doc(doc, &parsed, release, sizeof(release)) == 0);
         assert(parsed.geometry.pselect_waiter_shift.value_or(0) == -2);
+
+        /* The select route's optional lock anchor is decoded by wire name. */
+        doc = build_doc(ghostlock::profile::kRouteSelectStack, "anchor",
+                        {{"route.select_stack", {{"lock_anchor_image", 0x2a3a590}}}});
+        assert(parse_doc(doc, &parsed, release, sizeof(release)) == 0);
+        assert(parsed.geometry.select_lock_anchor_image.value_or(0) == 0x2a3a590);
 
         /* An empty document body is valid (everything stays default/absent). */
         doc = build_doc(ghostlock::profile::kRouteMulticastWaiter, "empty", {});
