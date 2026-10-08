@@ -167,22 +167,21 @@ namespace ghostlock::session::victim {
         park_child_process_forever();
     }
 
-    /* The select route poisons a pselect fd_set with the waiter stamp and then
- * dup2s its timerfd over every fd < PSELECT_ROUTE_NFDS whose bit is set,
- * restoring only stdio — any long-lived protocol fd left in that range is
- * silently destroyed at route prepare() and the victim sees EOF mid-dance
- * (observed on diting 5.10: the W2 child exited via the post-loop
- * `getuid() != 0` guard one dance before its write landed, so verify hit
- * EPIPE forever). The dup2 loop never touches fds >= PSELECT_ROUTE_NFDS. */
-    static void move_fd_above_route_range(support::UniqueFd &fd) {
-        if (!fd.valid()) return;
+    /* The select route rebinds every fd < PSELECT_ROUTE_NFDS whose bit is set:
+     * move the parent-held ends above that range. A failure fails the spawn --
+     * fork() needs no descriptor, so the child would otherwise run unprotected. */
+    static bool move_fd_above_route_range(support::UniqueFd &fd) {
+        if (!fd.valid()) return true;
         const int32_t high = fcntl(fd.get(), F_DUPFD_CLOEXEC,
                                    static_cast<int32_t>(kernel::PSELECT_ROUTE_NFDS) + 64);
         if (high < 0) {
-            pr_warning("protocol fd %d F_DUPFD failed errno=%d\n", fd.get(), errno);
-            return;
+            pr_warning("protocol fd %d F_DUPFD failed errno=%d; not forking a "
+                       "victim whose endpoint the route can clobber\n",
+                       fd.get(), errno);
+            return false;
         }
         fd.reset(high);
+        return true;
     }
 
     static pid_t spawn_child(VictimContext &p) {
@@ -196,9 +195,12 @@ namespace ghostlock::session::victim {
         p.uid_write.reset(p3[1]);
         /* Parent-held ends must survive the route's fd clobber; the child-side
          * ends live in the child's own table and are unaffected. */
-        move_fd_above_route_range(p.task_read);
-        move_fd_above_route_range(p.cmd_write);
-        move_fd_above_route_range(p.uid_read);
+        if (!move_fd_above_route_range(p.task_read) ||
+            !move_fd_above_route_range(p.cmd_write) ||
+            !move_fd_above_route_range(p.uid_read)) {
+            /* The descriptors stay with the context: a retry resets them. */
+            return -1;
+        }
         pid_t child = fork();
         if (child < 0) return -1;
         if (child == 0) {
