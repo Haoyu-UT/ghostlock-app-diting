@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::Parser;
 
 use ghostlock_extract::analysis;
+use ghostlock_extract::anchor;
 use ghostlock_extract::boot::{BootImage, MTK_DEFAULT_PHYS_LOAD, MTK_VADDR_BASE};
 use ghostlock_extract::btf::Btf;
 use ghostlock_extract::derive::{
@@ -75,6 +76,17 @@ struct Cli {
     /// and print a report instead of offsets
     #[arg(long)]
     analysis: bool,
+    /// scan .bss for a usable lock-anchor region and report the
+    /// route.select_stack.lock_anchor_* triple instead of offsets
+    #[arg(long)]
+    anchor_scan: bool,
+    /// minimum symbol extent considered by --anchor-scan
+    #[arg(long, value_parser = parse_int, default_value = "256")]
+    anchor_min_extent: u64,
+    /// assess one named symbol instead of ranking candidates; this is how the
+    /// acceptance test checks a known-good region
+    #[arg(long)]
+    anchor_symbol: Option<String>,
     /// working directory for payload extraction and temp files; defaults to
     /// the system temp dir (pass an app-writable dir when running on Android)
     #[arg(long)]
@@ -427,6 +439,21 @@ fn run(cli: &Cli) -> Result<i32> {
             allow_disasm: !cli.no_disasm,
         });
         let text = analysis::render(&analysis_report);
+        if let Some(out) = &cli.out {
+            std::fs::write(out, text).map_err(|err| ExtractError::new(format!("{err}")))?;
+        } else {
+            print!("{text}");
+        }
+        return Ok(0);
+    }
+
+    if cli.anchor_scan {
+        let text = anchor_scan(
+            &rel_symbols,
+            &boot.kernel,
+            cli.anchor_min_extent,
+            cli.anchor_symbol.as_deref(),
+        );
         if let Some(out) = &cli.out {
             std::fs::write(out, text).map_err(|err| ExtractError::new(format!("{err}")))?;
         } else {
@@ -795,4 +822,123 @@ fn main() {
             std::process::exit(code);
         }
     }
+}
+
+/// Render the `--anchor-scan` report.
+///
+/// See `anchor.rs` for what is derived and `docs/analysis/anchor-derivation-plan.md`
+/// for why: the length comes from extending until something live stands in the
+/// way, not from a symbol size, because kallsyms does not store sizes and the
+/// extent is an upper bound that was already wrong once.
+fn anchor_scan(
+    rel: &BTreeMap<String, BTreeSet<u64>>,
+    kernel: &[u8],
+    min_extent: u64,
+    only: Option<&str>,
+) -> String {
+    let g = |n: &str| -> u64 {
+        rel.get(n).and_then(|s| s.iter().next().copied()).unwrap_or(0)
+    };
+    let bounds = anchor::Bounds {
+        text_start: g("_text"),
+        text_end: g("_etext"),
+        init_start: g("_sinittext"),
+        init_end: g("_einittext"),
+        bss_start: g("__bss_start"),
+        bss_end: g("__bss_stop"),
+        ro_after_init_end: g("__end_ro_after_init"),
+    };
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "[anchor] .bss [+0x{:x}, +0x{:x}), writable from +0x{:x}; \
+text [+0x{:x}, +0x{:x}), init [+0x{:x}, +0x{:x})\n",
+        bounds.bss_start, bounds.bss_end, bounds.ro_after_init_end,
+        bounds.text_start, bounds.text_end, bounds.init_start, bounds.init_end,
+    ));
+
+    let mut cands = anchor::candidates(rel, &bounds, min_extent);
+    if let Some(name) = only {
+        /* A named symbol does not have to clear the extent filter: the point of
+         * asking about it is to check the scan against a region already known to
+         * work, whatever its extent. */
+        let mut all: Vec<(u64, String)> = Vec::new();
+        for (n, offs) in rel {
+            for o in offs {
+                all.push((*o, n.clone()));
+            }
+        }
+        all.sort();
+        cands = all
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, n))| n == name)
+            .map(|(i, (off, n))| anchor::Candidate {
+                name: n.clone(),
+                offset: *off,
+                extent: all
+                    .get(i + 1)
+                    .map(|(o, _)| o.saturating_sub(*off))
+                    .unwrap_or(bounds.bss_end.saturating_sub(*off)),
+            })
+            .collect();
+        if cands.is_empty() {
+            return format!("[anchor] symbol {name:?} not found in kallsyms\n");
+        }
+    }
+    if cands.is_empty() {
+        out.push_str("[anchor] no candidate symbols in writable .bss\n");
+        return out;
+    }
+
+    let refs = anchor::scan_references(kernel, &bounds);
+    out.push_str(&format!(
+        "[anchor] {} candidate symbol(s); {} direct reference(s) found in text\n\n",
+        cands.len(),
+        refs.len()
+    ));
+
+    for cand in cands.iter().take(5) {
+        let a = anchor::assess(cand, &refs, rel, &bounds);
+        out.push_str(&format!(
+            "[anchor] {}  image +0x{:x}  extent 0x{:x}\n",
+            a.candidate.name, a.candidate.offset, a.candidate.extent
+        ));
+        out.push_str(&format!(
+            "  references : {} live read, {} live write, {} init\n",
+            a.live_reads.len(),
+            a.live_writes.len(),
+            a.init_refs.len()
+        ));
+        for r in a.live_reads.iter().take(3) {
+            out.push_str(&format!(
+                "     read  +0x{:x} width {} at +0x{:x}\n",
+                r.target, r.width, r.site
+            ));
+        }
+        for w in a.live_writes.iter().take(3) {
+            out.push_str(&format!(
+                "     write +0x{:x} width {} at +0x{:x}\n",
+                w.target, w.width, w.site
+            ));
+        }
+        out.push_str(&format!(
+            "  safe length: 0x{:x}   (stopped by: {})\n",
+            a.safe_len, a.stopped_by
+        ));
+        out.push_str(&format!("  verdict    : {}\n", a.verdict.label()));
+        out.push_str(&format!(
+            "  stride     : not derived -- the PI walk's lock-relative accesses need \
+register provenance across branches; supply it in the profile (see the design doc)\n"
+        ));
+        out.push_str(&format!(
+            "  => route.select_stack.lock_anchor_image  = {}\n",
+            a.candidate.offset
+        ));
+        out.push_str(&format!(
+            "     route.select_stack.lock_anchor_bytes  = {}\n\n",
+            a.safe_len
+        ));
+    }
+    out
 }

@@ -32,7 +32,17 @@ length. The verdict is human today, and the failure of a wrong verdict is silent
 | whether a reference is dead | yes | reference site inside `[_sinittext, _einittext)` (freed after boot) |
 | **read vs write** | yes | classify the access that consumes the register |
 | **length** | **no — not as a symbol size** | kallsyms stores no sizes; the extent is an upper bound |
-| **stride** | **yes, as a lower bound** | the largest offset the kernel dereferences through a lock pointer in the PI walk |
+| **stride** | **yes, but not as a struct size** | the largest offset any lock-relative access in the PI-walk paths touches |
+
+The stride row is the one that is easy to state wrongly, so to be exact: what the scan derives is **the
+highest offset that anything dereferences through a pointer to this region**, rounded up to the access
+width. It is *not* `sizeof(struct rt_mutex)` and must never be presented as one. The two differ on any
+kernel built with lockdep, where the struct grows a `dep_map` that lock_acquire/release write — and
+lock_acquire is not a path our fake lock can reach, because nothing ever locks through that address
+except the requeue path that put a waiter there. The derived number would be the same 0x20 in both
+cases, so the failure mode of the wrong explanation is not a wrong answer today: it is a number that
+looks like a struct size, gets trusted as one on the next port, and is then wrong. The tool should print
+the accesses it found, not just the maximum.
 
 The pivot: **do not derive "the array's size" — derive "the longest byte range starting
 here that nothing live writes."** That is decidable, it subsumes the size question, and it
@@ -85,6 +95,22 @@ stride disagree, the profile is wrong.
 
 ## Output
 
+### The verdict vocabulary, and why our own anchor is not `safe`
+
+Three verdicts, and the middle one exists because the strict rule would reject the anchor that works:
+
+* **`unsafe`** — any live write. Rejected, no judgement needed.
+* **`safe`** — no live references at all. This is the only verdict the tool accepts on its own.
+* **`needs-review`** — live reads, or a pointer to the region found in a data section. The tool names
+  the reason and the operator accepts or rejects.
+
+`dump_skip.zeroes` lands in **`needs-review`**, not `safe`: `dump_skip()` reads it as the source of a
+bulk copy, so the bytes are copied out but never interpreted. That is benign for a zero source and
+would stop being benign if the region were used as anything else — which is exactly the judgement a
+tool should surface rather than make. The acceptance test must therefore **expect** `needs-review` for
+the anchor we actually use. If a future change makes the tool call it `safe`, that is the tool having
+lost a distinction, not gained one.
+
 A report, and the profile triple in copy-pasteable form. Nothing is written to a profile
 automatically — the operator decides, exactly as with every other extracted value:
 
@@ -94,7 +120,7 @@ automatically — the operator decides, exactly as with every other extracted va
   references : 1 live read (dump_skip+0x…, bulk copy source), 0 live writes, 0 init
   safe length: 0x1000   (stopped by: kernfs_pr_cont_lock, live store at +0x…)
   stride     : >= 0x20  (max lock-relative access +0x18, 8 bytes, ...+0x…)
-  verdict    : usable — live read is a copy source, not an interpreted value
+  verdict    : needs-review — 1 live read, dump_skip+0x… (bulk copy source)
   => route.select_stack.lock_anchor_image  = 44279184
      route.select_stack.lock_anchor_bytes  = 4096
      route.select_stack.lock_anchor_stride = 32
@@ -116,9 +142,23 @@ automatically — the operator decides, exactly as with every other extracted va
 ## Tests
 
 * **Reproduction**: run against `external/boot.img` and assert the known-good triple
-  (`0x2a3a590`, `0x1000`, `0x20`) — including the stopping signal (`kernfs_pr_cont_lock`).
+  (`0x2a3a590`, `0x1000`, `0x20`) — including the stopping signal (`kernfs_pr_cont_lock`) and the
+  `needs-review` verdict.
+
+  What makes this a test rather than a tautology: those three numbers were **measured on the device**,
+  not produced by the tools this one absorbs. The kprobe footprint showed only `+0x08` and `+0x10`
+  ever written and nothing past `+0x18` (that is where `0x20` comes from), and a one-page rotation
+  reaching `kernfs_pr_cont_buf` (that is where `0x1000` comes from). `bss_scan`/`bss_xref` share the
+  ancestry of the new code, so asserting against *their* output would prove nothing; asserting against
+  the device does.
+
+* **Known limitation, stated rather than papered over**: there is only **one image** to validate on.
+  `external/boot.img` and the patched image differ only by an appended KernelSU `.ko` — the kernel
+  proper is byte-identical — so the suite can show the tool reproduces a known answer, and cannot show
+  it generalises. That is a claim for the first real port to a second build, not for this suite.
 * **The bug it exists to prevent**: assert the reported length is **not** the symbol extent
-  (`0x1344`). A regression to the extent is the failure this tool is for.
+  (`0x1344` as first read; the code's own comment carried it until `--anchor-scan` produced `0x1000`).
+  A regression to a stale extent is the failure this tool is for.
 * **Negative**: a synthetic candidate written by live code must be rejected, and one whose
   only reference is a live store must report length 0.
 * **Init handling**: a candidate whose only store is in init text must be reported as
@@ -127,6 +167,39 @@ automatically — the operator decides, exactly as with every other extracted va
 Gates: `cargo test` in `tools/extract_rs`. The tool is host-only and touches no attack
 disassembly, so `cmp_disasm` does not apply; no device gate is possible for the static
 claim itself.
+
+## Implementation status (2026-10-09)
+
+Implemented as `tools/extract_rs/src/anchor.rs` plus `--anchor-scan` and
+`--anchor-symbol`, with the acceptance test in `tools/extract_rs/tests/anchor_scan.rs`.
+
+What shipped: candidate enumeration, the reference scan with read/write/init
+classification, the extend-until-something-live length rule, and the three-valued
+verdict. On this build it reproduces the device measurement -- `dump_skip.zeroes`
+at `+0x2a3a590`, safe length `0x1000`, verdict `needs-review` -- and it rejects
+`__log_buf` as `unsafe` with its live writes named.
+
+Two things it caught immediately, which is the argument for having built it:
+
+* The first version filtered each reference on "is the target inside the text
+  range". The target of a reference from text into .bss is a **.bss** address, so
+  that discarded every reference that matters and kept 667 from function-pointer
+  tables. `__log_buf` came back `safe`. The acceptance test now asserts a
+  reference count in the thousands and that `__log_buf` is `unsafe`.
+* The neighbour facts repeated in this file, in the route's comment and in the
+  slot-persistence plan were wrong: the symbol after the page is `core_uses_pid`,
+  the extent is exactly `0x1000`, and `kernfs_pr_cont_lock` sits `+0x340` past
+  the end rather than immediately after it. All three are corrected. The refusal
+  logic was right; only the explanation was not.
+
+Not implemented: **the stride derivation**. It is the one part that needs
+register provenance across branches -- the lock pointer moves between registers
+and is spilled, and a straight-line pass loses it at the first branch, so a
+naive version would report a maximum over unrelated offsets (the walk also
+touches `task_struct` fields at `+0x780` and beyond). Shipping a number that
+looks derived but is not is worse than shipping none: the profile's stride
+remains a hand-measured value the route validates. The CLI says so in its output
+rather than omitting the line.
 
 ## Sequencing
 
