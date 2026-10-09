@@ -195,3 +195,27 @@ every boot), so a damaged boot must be rebooted. The fix is preventive.
   had been recycled into a live cred at that moment (it is on a slab freelist, so its contents are
   whatever the last allocation left). Deciding this needs a series that samples `usage` after every
   run rather than once.
+
+## Stock run, and a defect the patched image hid (2026-10-09)
+
+The pin was first exercised on the **unrooted** image, and the first clean-boot run died outright:
+
+```
+[+] SELinux permissive
+[-]   PI route did not produce a verified write
+[-] cred pin: usage pin failed; the boot will stop rooting after ~4 successful runs
+<b> native exited code=1
+```
+
+The pin's write missed — the ordinary probabilistic case that every other stage carries an
+attempt ladder for — and the call site treated it as fatal. On the patched image the pin had
+landed in all eight runs of `rate-fix6`, so that branch never executed until stock reached it.
+
+Now: three attempts per write, and on exhaustion **warn and continue**. Aborting guarantees a
+failed run; continuing may well succeed and only leaves the boot exposed to the cliff the pin
+exists to prevent. The uid repair is retried as a pair with the usage pin, so the cred is never
+left half-pinned (usage immortal, `getuid()` garbage).
+
+Worth recording as a general point: a hardening step whose failure is fatal has inverted its own
+purpose, and the unrooted image is where that shows up, because it is the only configuration that
+exercises the late-load branch and the cold first-boot state.

