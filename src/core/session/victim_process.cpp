@@ -236,11 +236,27 @@ namespace ghostlock::session::victim {
 
     int32_t verify_w2_stage(void *context) {
         auto *stage = static_cast<struct w2_stage_context *>(context);
-        if (write(stage->pipes.cmd_write.get(), "C", 1) != 1) return 0;
+        /* Both early returns here used to be silent, which made two different
+         * failures indistinguishable in the log: a child that is dead (EPIPE on
+         * the command, or a 0-byte reply) and a child that is alive but never
+         * answers (a command written into a full pipe, or EAGAIN on a
+         * non-blocking read). Every W2 failure in the rate-fix4 series read as
+         * "no output between the round headers" -- two runs of the series were
+         * spent on that ambiguity. errno is what tells them apart. */
+        errno = 0;
+        if (write(stage->pipes.cmd_write.get(), "C", 1) != 1) {
+            pr_warning("W2 verify: no command sent (errno=%d); the child is not consuming\n",
+                       errno);
+            return 0;
+        }
 
         uint32_t child_uid = 9999;
-        if (read(stage->pipes.uid_read.get(), &child_uid, sizeof(child_uid)) !=
-            static_cast<ssize_t>(sizeof(child_uid))) {
+        errno = 0;
+        const ssize_t got = read(stage->pipes.uid_read.get(), &child_uid, sizeof(child_uid));
+        if (got != static_cast<ssize_t>(sizeof(child_uid))) {
+            pr_warning("W2 verify: reply read %lld of %llu bytes (errno=%d)\n",
+                       static_cast<long long>(got),
+                       static_cast<unsigned long long>(sizeof(child_uid)), errno);
             return 0;
         }
         pr_info("child uid = %u\n", child_uid);
