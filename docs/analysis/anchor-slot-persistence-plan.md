@@ -78,7 +78,7 @@ object's own size (0x20 on this build — no `CONFIG_DEBUG_SPINLOCK` /
 
 The rotation's own bound was wrong. `dump_skip.zeroes` is the page-sized
 `static char zeroes[PAGE_SIZE]` in `fs/coredump.c` — only ever *read* (the zero source
-for core-dump holes) — and its symbol extent is **0x1344, i.e. 4932 bytes**, not the
+for core-dump holes) — and its symbol extent is **0x1000** (an earlier reading said 0x1344; `--anchor-scan` settled it), not the
 "~78 KB / ~1000 slots" the comment claimed. At the old 0x80 stride that is 38 slots,
 and the next symbol is `kernfs_pr_cont_lock` / `kernfs_pr_cont_buf` (kernfs's **live**
 printk continuation buffer, with `blocked_hash` and `lease_notifier_chain` on the

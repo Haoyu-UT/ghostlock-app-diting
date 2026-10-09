@@ -408,14 +408,20 @@ namespace ghostlock::route {
      * The whole usable region is `dump_skip.zeroes` -- the page-sized
      * `static char zeroes[PAGE_SIZE]` in fs/coredump.c, which is only ever *read*
      * (it is the zero source for core-dump holes): image +0x2a3a590, 0x1000
-     * bytes, 128 slots. It is boxed in by live neighbours (`blocked_hash`,
-     * `lease_notifier_chain` before it; `kernfs_pr_cont_lock` and
-     * `kernfs_pr_cont_buf` -- kernfs's live printk continuation buffer --
-     * immediately after it), so an index past the end MUST be refused: the walk
-     * would take a live kernel variable for a lock. The "~78 KB, ~1000 slots"
-     * this comment used to claim was wrong by ~20x (the symbol extent is 0x1344,
-     * and most of that is the array plus linker padding), and a long run would
-     * have rotated straight into kernfs_pr_cont_buf. */
+     * bytes, 128 slots. It is boxed in by live neighbours -- `mb_entry_cache`,
+     * `lease_notifier_chain` and `blocked_hash` before it, `core_uses_pid`
+     * immediately after the page, and kernfs's live printk continuation buffer
+     * (`kernfs_pr_cont_lock`/`kernfs_pr_cont_buf`) +0x340 past the end -- so an
+     * index past the end MUST be refused: the walk would take a live kernel
+     * variable for a lock.
+     *
+     * Two of those neighbour facts were wrong when this comment was first
+     * written, and `ghostlock-extract --anchor-scan` is what corrected them: the
+     * extent is exactly 0x1000 (the next symbol is `core_uses_pid`), not the
+     * 0x1344 a coarser symbol list suggested, and kernfs is not what sits
+     * immediately past the page. The refusal itself is unchanged -- what it
+     * protects is the same -- but the reason is now derived rather than
+     * remembered. */
     /* All three numbers are properties of ONE kernel build, so all three come
      * from the profile (`route.select_stack.lock_anchor_{image,bytes,stride}`).
      * They used to be compile-time constants here, which made the byte count --
