@@ -17,11 +17,23 @@ data class SelectConfig(
      * See `docs/analysis/payload-page-option2-plan.md`.
      */
     val lockAnchorImage: ULong? = null,
+    /**
+     * Length of the verified-safe part of the anchor region, and the slot stride
+     * within it. Both are per-kernel-build facts; absent => the native defaults
+     * (0x1000 / 0x20), which are diting's. Native refuses to run on a geometry
+     * where `bytes` is not a non-zero multiple of `stride`, or `stride` is below
+     * the fake rt_mutex's own size.
+     * See `docs/analysis/anchor-slot-persistence-plan.md`.
+     */
+    val lockAnchorBytes: ULong? = null,
+    val lockAnchorStride: ULong? = null,
 ) : RouteConfig {
     override fun entries(): List<Pair<String, ULong>> = buildList {
         waiterShift?.let { add("waiter_shift" to it.toLong().toULong()) }
         compactWaiter?.let { add("compact_waiter" to it.toULong()) }
         lockAnchorImage?.let { add("lock_anchor_image" to it) }
+        lockAnchorBytes?.let { add("lock_anchor_bytes" to it) }
+        lockAnchorStride?.let { add("lock_anchor_stride" to it) }
         enterDelayUs?.let { add("enter_delay_us" to it.toULong()) }
         timeoutUs?.let { add("timeout_us" to it.toULong()) }
     }
@@ -30,6 +42,8 @@ data class SelectConfig(
         "waiter_shift" -> copy(waiterShift = value.toLong().toInt())
         "compact_waiter" -> copy(compactWaiter = value.toUByte())
         "lock_anchor_image" -> copy(lockAnchorImage = value)
+        "lock_anchor_bytes" -> copy(lockAnchorBytes = value)
+        "lock_anchor_stride" -> copy(lockAnchorStride = value)
         "enter_delay_us" -> copy(enterDelayUs = value.toUInt())
         "timeout_us" -> copy(timeoutUs = value.toUInt())
         else -> this
@@ -44,6 +58,8 @@ data class SelectConfig(
             enterDelayUs = value("execution.routes.select_stack.enter_delay_us")?.toUInt(),
             timeoutUs = value("execution.routes.select_stack.timeout_us")?.toUInt(),
             lockAnchorImage = value("lock_anchor_image")?.toULong(),
+            lockAnchorBytes = value("lock_anchor_bytes")?.toULong(),
+            lockAnchorStride = value("lock_anchor_stride")?.toULong(),
         )
     }
 }

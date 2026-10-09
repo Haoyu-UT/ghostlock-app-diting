@@ -16,6 +16,7 @@ namespace ghostlock::config {
     /* Capacities match the historical fixed buffers (content bytes + NUL). */
     inline constexpr size_t kHomeDirCapacity = 256;
     inline constexpr size_t kRootScriptPathCapacity = 300;
+    inline constexpr size_t kAnchorStatePathCapacity = 300;
 
     /* Copy at most capacity-1 bytes (the previous snprintf truncation), then drop
  * trailing slashes but never the root slash itself. */
@@ -37,6 +38,21 @@ namespace ghostlock::config {
         result += "/.ghostlock_root.sh";
         if (result.size() > kRootScriptPathCapacity - 1) {
             result.resize(kRootScriptPathCapacity - 1);
+        }
+        return result;
+    }
+
+    /* home_dir + "/.ghostlock_anchor", truncated to the sidecar capacity.
+ *
+ * Holds the boot-scoped anchor-slot reservation. It has to outlive the process:
+ * a slot the walk has used is poisoned for the rest of the boot, so the next
+ * process must not be handed it again. See select_stack_anchor_slot() in
+ * route/select_stack_route.cpp for the measurement behind that. */
+    [[nodiscard]] inline std::string anchor_state_file(std::string_view home_dir) {
+        std::string result(home_dir);
+        result += "/.ghostlock_anchor";
+        if (result.size() > kAnchorStatePathCapacity - 1) {
+            result.resize(kAnchorStatePathCapacity - 1);
         }
         return result;
     }

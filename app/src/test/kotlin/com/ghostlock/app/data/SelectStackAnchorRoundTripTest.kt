@@ -10,19 +10,23 @@ import org.junit.Assert.assertNotNull
 import org.junit.Test
 
 /**
- * Guards `route.select_stack.lock_anchor_image` across the whole Kotlin half of
- * the profile pipeline: merged value map -> `ProfileResolver` -> `Profile` ->
- * GLK1 bytes -> decode.
+ * Guards the `route.select_stack.lock_anchor_*` keys across the whole Kotlin
+ * half of the profile pipeline: merged value map -> `ProfileResolver` ->
+ * `Profile` -> GLK1 bytes -> decode.
  *
- * This key has three places where it can vanish silently, and it did in the
- * first cut of the feature: `ProfileResolver.nativeValue` (branch-relative
- * lookup), `SelectConfig.from` (merged map -> config) and `SelectConfig.entries`
- * (config -> wire). A drop at any of them leaves a profile that validates,
- * imports and runs, but quietly falls back to the reclaimed payload page.
+ * These keys have three places where they can vanish silently, and the offset
+ * did in the first cut of the feature: `ProfileResolver.nativeValue`
+ * (branch-relative lookup), `SelectConfig.from` (merged map -> config) and
+ * `SelectConfig.entries` (config -> wire). A drop at any of them leaves a
+ * profile that validates, imports and runs, but quietly falls back to the
+ * reclaimed payload page -- or, for the geometry keys, to a bound that does not
+ * match the region the offset names.
  */
 class SelectStackAnchorRoundTripTest {
     private val release = "5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284"
     private val anchor = 44279184L // dump_skip.zeroes, image +0x2a3a590
+    private val anchorBytes = 0x1000L // one page: the array, not the symbol extent
+    private val anchorStride = 0x20L // sizeof(struct rt_mutex), lock debug off
 
     /** Document as the import delivers it (the batch-D device profile shape). */
     private fun document(withAnchor: Boolean): ValueMap {
@@ -30,7 +34,11 @@ class SelectStackAnchorRoundTripTest {
             "waiter_shift" to -2L,
             "compact_waiter" to 1L,
         )
-        if (withAnchor) branch["lock_anchor_image"] = anchor
+        if (withAnchor) {
+            branch["lock_anchor_image"] = anchor
+            branch["lock_anchor_bytes"] = anchorBytes
+            branch["lock_anchor_stride"] = anchorStride
+        }
         return valueMapOf(
             "release" to release,
             "schema_version" to 1L,
@@ -82,6 +90,8 @@ class SelectStackAnchorRoundTripTest {
         assertNotNull("wire must decode", decoded)
         val config = decoded!!.routeConfig as SelectConfig
         assertEquals("anchor must survive encode+decode", anchor.toULong(), config.lockAnchorImage)
+        assertEquals("geometry length must survive", anchorBytes.toULong(), config.lockAnchorBytes)
+        assertEquals("geometry stride must survive", anchorStride.toULong(), config.lockAnchorStride)
         /* The neighbours must be untouched by the new key. */
         assertEquals(-2, config.waiterShift)
         assertEquals(1u.toUByte(), config.compactWaiter)
@@ -96,6 +106,35 @@ class SelectStackAnchorRoundTripTest {
             (profile.document.routeConfig as SelectConfig).lockAnchorImage,
         )
         val decoded = NativeProfileDocument.fromBinary(profile.toBinary())!!
-        assertEquals(null, (decoded.routeConfig as SelectConfig).lockAnchorImage)
+        val config = decoded.routeConfig as SelectConfig
+        /* Absent geometry keys must stay absent too: native treats them as "use
+         * this build's default grid", and a 0 smuggled through here would be a
+         * zero-length region. */
+        assertEquals(null, config.lockAnchorImage)
+        assertEquals(null, config.lockAnchorBytes)
+        assertEquals(null, config.lockAnchorStride)
+    }
+
+    @Test
+    fun `geometry without an offset is carried but unused`() {
+        /* A profile may pin the grid while leaving the anchor to the extractor.
+         * The pipeline must not drop either half on the way through. */
+        val branch = valueMapOf(
+            "waiter_shift" to -2L,
+            "lock_anchor_bytes" to anchorBytes,
+            "lock_anchor_stride" to anchorStride,
+        )
+        val doc = valueMapOf(
+            "release" to release,
+            "schema_version" to 1L,
+            "kernel_major" to 5L,
+            "route" to valueMapOf("select_stack" to branch),
+            "fallback" to valueMapOf("to" to "none"),
+        )
+        val config = NativeProfileDocument.fromBinary(nativeProfile(doc).toBinary())!!
+            .routeConfig as SelectConfig
+        assertEquals(null, config.lockAnchorImage)
+        assertEquals(anchorBytes.toULong(), config.lockAnchorBytes)
+        assertEquals(anchorStride.toULong(), config.lockAnchorStride)
     }
 }

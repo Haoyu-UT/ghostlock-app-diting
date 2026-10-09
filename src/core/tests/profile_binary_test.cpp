@@ -171,8 +171,14 @@ int32_t main(void) {
         anchored.uname_r = "anchored";
         anchored.route = ghostlock::profile::kRouteSelectStack;
         anchored.geometry.select_lock_anchor_image = 0x2a3a590;
+        /* The grid travels with the offset: a bound that ships separately from
+         * the region it bounds is what lets a profile walk past it. */
+        anchored.geometry.select_lock_anchor_bytes = 0x1000;
+        anchored.geometry.select_lock_anchor_stride = 0x20;
         assert(round_trip(anchored, &parsed, release, sizeof(release)) == 0);
         assert(parsed.geometry.select_lock_anchor_image.value_or(0) == 0x2a3a590);
+        assert(parsed.geometry.select_lock_anchor_bytes.value_or(0) == 0x1000);
+        assert(parsed.geometry.select_lock_anchor_stride.value_or(0) == 0x20);
 
         profile::kernel_offsets unanchored = {};
         unanchored.uname_r = "unanchored";
@@ -180,6 +186,8 @@ int32_t main(void) {
         unanchored.geometry.pselect_waiter_shift = -2;
         assert(round_trip(unanchored, &parsed, release, sizeof(release)) == 0);
         assert(!parsed.geometry.select_lock_anchor_image.has_value());
+        assert(!parsed.geometry.select_lock_anchor_bytes.has_value());
+        assert(!parsed.geometry.select_lock_anchor_stride.has_value());
 
         /* An absent optional stays absent after the round trip. */
         profile::kernel_offsets absent = {};
@@ -246,6 +254,19 @@ int32_t main(void) {
                         {{"route.select_stack", {{"lock_anchor_image", 0x2a3a590}}}});
         assert(parse_doc(doc, &parsed, release, sizeof(release)) == 0);
         assert(parsed.geometry.select_lock_anchor_image.value_or(0) == 0x2a3a590);
+        /* The geometry keys are decoded by name too, and stay absent when the
+         * document omits them (native then uses this build's 0x1000 / 0x20). */
+        assert(!parsed.geometry.select_lock_anchor_bytes.has_value());
+        assert(!parsed.geometry.select_lock_anchor_stride.has_value());
+
+        doc = build_doc(ghostlock::profile::kRouteSelectStack, "anchor-geom",
+                        {{"route.select_stack",
+                          {{"lock_anchor_image", 0x2a3a590},
+                           {"lock_anchor_bytes", 0x1000},
+                           {"lock_anchor_stride", 0x20}}}});
+        assert(parse_doc(doc, &parsed, release, sizeof(release)) == 0);
+        assert(parsed.geometry.select_lock_anchor_bytes.value_or(0) == 0x1000);
+        assert(parsed.geometry.select_lock_anchor_stride.value_or(0) == 0x20);
 
         /* An empty document body is valid (everything stays default/absent). */
         doc = build_doc(ghostlock::profile::kRouteMulticastWaiter, "empty", {});

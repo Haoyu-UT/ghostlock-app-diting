@@ -131,6 +131,13 @@ namespace ghostlock::profile {
          * the reclaimed page is used, i.e. the previous behaviour.
          * See docs/analysis/payload-page-option2-plan.md. */
         std::optional<uint64_t> select_lock_anchor_image;
+        /* Length of the verified-safe part of that region, and the distance
+         * between slots within it. Both are properties of one kernel build (a
+         * symbol layout and `sizeof(struct rt_mutex)`), so both belong in the
+         * profile rather than in the route's source. Absent => this build's
+         * 0x1000 and 0x20. See the geometry check in select_stack_route.cpp. */
+        std::optional<uint64_t> select_lock_anchor_bytes;
+        std::optional<uint64_t> select_lock_anchor_stride;
     };
 
     /* Native transport representation of one Kotlin-resolved profile. */
@@ -163,6 +170,8 @@ namespace ghostlock::profile {
          * offset) instead of fake_lock, so the walk's tree lives in a region we
          * know is zero and nobody writes. */
         std::optional<uint64_t> lock_anchor_image;
+        std::optional<uint64_t> lock_anchor_bytes;
+        std::optional<uint64_t> lock_anchor_stride;
     };
 
     struct TcpZerocopyLayout {
@@ -304,6 +313,8 @@ namespace ghostlock::profile {
                            .waiter_shift = values_.geometry.pselect_waiter_shift,
                            .compact_waiter = values_.misc.compact_waiter,
                            .lock_anchor_image = values_.geometry.select_lock_anchor_image,
+                           .lock_anchor_bytes = values_.geometry.select_lock_anchor_bytes,
+                           .lock_anchor_stride = values_.geometry.select_lock_anchor_stride,
                        }
                        : SelectStackLayout{};
         }
