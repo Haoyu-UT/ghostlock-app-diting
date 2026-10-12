@@ -16,6 +16,9 @@ enum class RouteKind(
     MULTICAST_WAITER(3u, "multicast_waiter", MulticastConfig.EMPTY, { value ->
         MulticastConfig.from(value)
     }),
+
+    /** rt_sigreturn fpsimd-copy stamp; the pre-5.10.136 waiter geometry. */
+    SIGRETURN(4u, "sigreturn", SigreturnConfig.EMPTY, { value -> SigreturnConfig.from(value) }),
     ;
 
     fun emptyConfig(): RouteConfig = empty

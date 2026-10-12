@@ -3,10 +3,12 @@
 Level: **L** — a new middleware route on the attack-critical path. Plan first, then code, per
 `AGENTS.md`; this document is the operator-approval artifact.
 
-Status: **proposed, 2026-10-12. Nothing implemented.** Experiments live on a dedicated scratch
-branch `experiment/sigreturn-stamp` (off `port/diting-5.10`); it is not a review or release unit —
-per `BRANCH-POLICY.md` the port line remains the home of the eventual commit cluster, and nothing
-moves there until a real-device gate passes.
+Status: **P1 built offline, 2026-10-12 — uncommitted, no device run.** The route, its encoder, the
+profile plumbing and the host tests exist on `experiment/sigreturn-stamp` (off `port/diting-5.10`,
+uncommitted); native build, `lint-tidy`, the host suite and the offline APK build are green. The
+branch is not a review or release unit — per `BRANCH-POLICY.md` the port line remains the home of
+the eventual commit cluster, and nothing moves there until a real-device gate passes. What the
+device still has to answer is itemized at the end of this document.
 
 ## The problem
 
@@ -148,12 +150,15 @@ window; no anchor operation is issued between the futex dance and "back".
    (`route_wait_ms`-class delays) shrink to a memory-polled handshake, which is *tighter* than the
    current 30 ms park but has no kernel-side keep-alive.
 
-## Profile surface (proposed)
+## Profile surface (as built)
 
 ```
 route.sigreturn {
     waiter_off_sve   = 0x150   ; waiter byte 0 inside the copied vregs (SVE path)
     waiter_off_plain = 0x140   ; same for the plain path
+    lock_anchor_image  = …     ; the same three anchor keys route.select_stack carries --
+    lock_anchor_bytes  = …     ; the anchor region is one shared kernel object, and a document
+    lock_anchor_stride = …     ; never merges another route's section
 }
 ```
 
@@ -199,6 +204,143 @@ measured separately), with their geometry resting on static disassembly.
 - **P2** — single gate run on 5.10.236 with the new route selected.
 - **P3** — 3-run series (reboot between runs), then the below-floor geometry rows marked candidate.
 - **P4** — docs (port README, k81-era analysis) and PR evaluation.
+
+## P1 as built (offline, 2026-10-12)
+
+Native:
+
+- `src/core/route/sigreturn_route.{h,cpp}` — the route. Pure, host-testable core
+  (`geometry_from`, `locate_fpstate`, `patch_fpstate`) plus the Android half: the SA_SIGINFO handler
+  that locates the delivered frame's fpsimd record and splices the strip into it, the
+  `tgkill(self)` re-stamp loop (30 ms window, 4 attempts, one anchor slot per attempt, the same
+  page-respray-on-retry ladder as select_stack), and the same prepare/execute/disarm/destroy
+  lifecycle. The trigger signal is chosen at runtime: the first of `SIGUSR1`, `SIGRTMIN+4`,
+  `SIGRTMIN+5` whose disposition is still `SIG_DFL`, so the route can never silently take over a
+  handler another component installed; the previous disposition and the thread's signal mask are
+  restored in `destroy()`. The window blocks the process's other asynchronous signals (synchronous
+  faults stay deliverable) and unblocks the trigger on the victim thread.
+- `memory/payload_builder.{h,cpp}` — `WaiterWords` + `waiter_words()` + `encode_waiter_words()`:
+  the eleven-word strip the select route's compact branch stamps, now a single definition
+  (`payload_builder_test` pins the exact bytes: leaf `{target-8,0,0}` / pointer
+  `{value,0,target}`, zero pi triple, `prio` 140).
+- `route/lock_anchor.{h,cpp}` — the anchor grid + boot-scoped slot allocator, moved out of
+  `select_stack_route.cpp` unchanged (statement order, log text, error numbers preserved) so both
+  routes draw from one serial. The select route's call site is the only edit there.
+- `profile/model.h`, `profile/binary.cpp` — `RouteKind::Sigreturn` (wire 4), the `route.sigreturn`
+  section (`waiter_off_sve`, `waiter_off_plain`, plus the shared `lock_anchor_*` trio), and the
+  route accepted by the decoder.
+- `route/route_policy.hpp`, `route/component_catalog.hpp`, `route/orchestrator.hpp`,
+  `session/backend/cve_2026_43499_backend.cpp` — the policy, the middleware id, the dispatch
+  target, the pipeline, the explicit instantiations. Every capability is the neutral default:
+  same write vehicle, same W3 leaf-direction probe, no fallback.
+
+Kotlin:
+
+- `RouteKind.SIGRETURN(4)` + `SigreturnConfig` (the two offsets + the anchor trio), the
+  `route.sigreturn` section name, and the resolver mapping for the bare `sig.*` paths.
+- **Cross-route contract change (flag for review):** the consumer's `consumer_max_calls` /
+  `consumer_burst_calls` were always sourced from the *select_stack* branch of the merged profile.
+  They are now read from the active route's own group with the select_stack path kept as the legacy
+  source, so every existing profile resolves to exactly the value it did before while a sigreturn
+  profile can state its cadence. `execution-sigreturn.conf` (1 call / 1 burst, the measured diting
+  cadence) ships as the preset, and `ProfileConfig.Routes` lists the route.
+
+Gates run: native build (0 warnings), `make -C src lint-tidy` (exit 0), the full host suite green
+(the pre-existing x86_64-only `tcp_zerocopy_route_test` build failure aside), `:profile-core:test`
+green, `:app:testDebugUnitTest` green apart from the pre-existing
+`ProfileMigrationEquivalenceTest` fixture-count failure, `:app:assembleDebug` offline green.
+
+`tools/cmp_disasm.py` (baseline = this branch at `2d83582`, built in a scratch worktree) **FAILs**,
+and as the tool's own note requires, it has to be read:
+`MISSING multicast_owner_worker/multicast_waiter_worker` on both binaries is the documented
+baseline-vs-itself artifact; `owner_thread`, `consumer_thread`, `run_main_route_threads`,
+`do_kernel5_fake_lock_route`, `do_one_write` are LAYOUT-SHIFT only (annotated address operands);
+the one real difference is `waiter_thread`: 895 → 276 instructions. Isolated in a scratch copy, the
+cause is the **fourth entry in `RoutePolicyList`**: with `SigreturnPolicy` removed from the list (my
+other changes kept) `waiter_thread` returns to its baseline shape, and the inlined route dispatch
+reappears inside `run_orchestrated_pipeline` (+0x1134) instead. Behavior is unchanged — the
+statements and their order are identical, the dispatch is simply no longer inlined into the worker
+— but the project treats every attack-path shape change as device-gated, so P2's regression item
+covers it, and a reviewer may want the dispatch kept out of the worker on purpose rather than by
+inliner accident.
+
+## P1.5c — the in-app measurement (2026-10-12, device, verdict: variant A as designed does not deliver)
+
+Run on 5.10.236 with the KSU-patched boot flashed (persistent root), the port's probe
+kit plus purpose-built probes (adjust_pi with task/waiter prios, the eleven waiter
+words read through `pi_blocked_on` at the walk, the fpsimd copy's destination, and a
+pre-copy sampler of the copy's own local). Evidence: `sigret-app/` in the port tree.
+
+What is now **measured, not inferred**:
+
+- The stamp is delivered *identically to the design*: `stamps=3659 misses=0 path_sve=0`
+  (plain path, `off_plain=0xf0`), trigger SIGUSR1, anchor rotation and account exact,
+  W1's stamp shape byte-identical to select's.
+- **The geometry is right in-app**: `copy_dst = rt_sigreturn_entry_sp − 0x300` (the
+  static Σ) and the walk's `pi_blocked_on − copy_dst = 0xf0` exactly — the strip lands
+  on the byte the walk dereferences.
+- **The walk runs** on every consumer call: `rt_mutex_adjust_pi` → chain, with the
+  victim at prio 120 vs the stamp's 140 (the prio gate passes) and `orig_lock == 0`,
+  `orig_waiter == 0` — the same signature the working select route shows.
+- **But the walk reads clobbered stack**: in the control (select, W1 landed) the walk's
+  `next_lock` is the anchor every time; in the sigreturn route eight consumer-side
+  walks read a task pointer, image pointers or 0 — never the anchor. One of the zeros
+  oopsed at `rt_mutex_adjust_prio_chain+0x188` dereferencing it as `lock`.
+- The clobbering writer is the loop's own syscall traffic: a ladder probe shows the
+  signal-delivery frames (canaries, self-referential stack pointers) at exactly the
+  strip's depths, and a pre-copy sampler of the copy's own 0x200-byte local shows the
+  region zeroed between consecutive stamps. A 300 µs *user-mode* spin between stamps
+  (99 stamps/30 ms) did not change it.
+
+**Structural reading.** `route.select_stack` parks the victim inside the carrier, so
+the stamp *is* the carrier's own local and everything else nests below it — the walk
+can never read anything but the stamp. Variant A writes into a dead region, and every
+subsequent syscall on that thread (above all the next `tgkill`'s delivery) runs
+through those depths. Variant B's `rt_sigreturn` loop is the carrier that owns the
+region continuously (its only writer is the copy itself), so the sequencing in
+"Sequencing" above is superseded: **B is now the route, A is the measured-dead
+scaffold** (kept for its evidence and for the probe kit's calibration path).
+
+Consequence for the profile surface: unchanged (the offsets are the same arithmetic);
+what changes is the choreography — userspace builds one valid frame (captured from a
+real delivered frame, per Risk 3), the handler's first delivery points `sp` at it and
+`pc` at a `svc #139` loop, and the loop exits on a `cntvct_el0` deadline.
+
+## Device verification list (P2/P3)
+
+1. **Route recognition.** Import a profile whose `route { sigreturn { … } }` block carries the
+   5.10.236 offsets (`waiter_off_sve = 256`, `waiter_off_plain = 240`) on the current build; the run
+   log must show `sigreturn pre-stamp` with both offsets echoed, not `geometry unusable`.
+2. **Trigger-signal selection.** The log's `sigreturn trigger: signal=…` line must name a signal the
+   process had free; if every candidate was already handled, that is a finding (the route refuses —
+   check whether ART owns `SIGUSR1` on this ROM).
+3. **The stamp actually happens.** `post-stamp … stamps=N misses=M path_sve=P` with `N` in the high
+   hundreds to thousands (one stamp per tgkill round trip, for the ~5 ms until the walk fires) and
+   `M` near zero; `path_sve=0` expected on this userspace.
+   `M` climbing with `N` near zero means the frame never carried a fpsimd record.
+4. **The write lands at all.** W1 (`selinux_enforcing` → permissive) observed by the existing
+   verify path on the first attempt or a retry; this is the first proof the walk accepts a
+   sigreturn-stamped waiter.
+5. **The full chain.** `child uid = 0` → seccomp cleared → `exploit complete` → KernelSU late-load,
+   with the same stage-by-stage log as the select_stack route.
+6. **Re-stamp rate vs the walk (Risk 1).** Per-attempt failure distribution over ≥10 attempts: the
+   tick-clobber exposure is only bounded by the loop, so this measures whether the residual rate
+   beats the incumbent route's.
+7. **Signal hygiene.** After a run, the process's disposition for the chosen signal and the victim
+   thread's mask are back to their previous values (no leaked handler), and ART-side behaviour
+   (GC, ANR dumps) is unaffected during the window.
+8. **FP side effect.** Confirm the victim's integer-only loop survives the strip landing in its FP
+   registers, and that the *stage verify* (which runs after the route, on the main thread) is
+   unaffected.
+9. **Anchor accounting.** `anchor slots: reserved a..b of N` and the per-attempt slot rotation lines
+   behave exactly as under select_stack (one slot per attempt, budget exhausted → clean refusal).
+10. **Below-floor geometry (P3).** Only after the above: a 5.10.81/5.10.101 candidate profile with
+    its own offsets (`0x150`/`0x140`) — which needs that era's userspace booted first, since the
+    current userspace does not come up on that kernel.
+11. **Regression on the incumbent.** A select_stack run on the same build must be unchanged
+    (the only select_stack edit is the anchor call site).
+12. **Frame validity under load.** If variant B (SROP) is ever pursued, capture a real frame first;
+    variant A alone does not need it.
 
 ## What would kill this plan
 

@@ -348,6 +348,17 @@ data class NativeProfileDocument(
             fun vuOrNull(path: String): UInt? = value(path)?.toUInt()
             fun vulOrNull(path: String): ULong? = value(path)?.toULong()
             fun vbOrNull(path: String): UByte? = value(path)?.toUByte()
+            /* The consumer's walk cadence is one route-independent wire slot
+             * (execution.consumer) but was always sourced from the select_stack
+             * branch. Read the active route's own group first, and keep the
+             * select_stack path as the legacy source: every existing profile
+             * resolves to exactly the value it did before (its group is the one
+             * the presets fill), and a route of its own -- sigreturn -- can now
+             * state its cadence without borrowing another route's keys. */
+            fun vuConsumer(field: String): UInt =
+                route?.let { value("execution.routes.$it.$field") }?.toUInt()
+                    ?: value("execution.routes.select_stack.$field")?.toUInt()
+                    ?: 0u
             val routeConfig = RouteKind.fromToken(route)?.buildConfig(value) ?: NoRouteConfig
             return NativeProfileDocument(
                 release = release,
@@ -429,8 +440,8 @@ data class NativeProfileDocument(
                     handoffModulePollIntervalMs = vu("execution.handoff.module_poll_interval_ms"),
                     handoffEnforcePollAttempts = vu("execution.handoff.enforce_poll_attempts"),
                     handoffEnforcePollIntervalMs = vu("execution.handoff.enforce_poll_interval_ms"),
-                    consumerMaxCalls = vu("execution.routes.select_stack.consumer_max_calls"),
-                    consumerBurstCalls = vu("execution.routes.select_stack.consumer_burst_calls"),
+                    consumerMaxCalls = vuConsumer("consumer_max_calls"),
+                    consumerBurstCalls = vuConsumer("consumer_burst_calls"),
                 ),
                 safeMode = 0u,
                 routeConfig = routeConfig,
@@ -628,6 +639,7 @@ private fun routeSectionName(route: UInt): String = when (RouteKind.fromWire(rou
     RouteKind.TCP_ZEROCOPY -> "route.tcp_zerocopy"
     RouteKind.SELECT_STACK -> "route.select_stack"
     RouteKind.MULTICAST_WAITER -> "route.multicast_waiter"
+    RouteKind.SIGRETURN -> "route.sigreturn"
     null -> ""
 }
 

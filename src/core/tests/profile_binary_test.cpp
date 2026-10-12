@@ -268,6 +268,27 @@ int32_t main(void) {
         assert(parsed.geometry.select_lock_anchor_bytes.value_or(0) == 0x1000);
         assert(parsed.geometry.select_lock_anchor_stride.value_or(0) == 0x20);
 
+        /* The sigreturn route's own section: both copy-window offsets are
+         * decoded, and the anchor keys are stated through this route's section
+         * (a profile never merges another route's section, so an anchored
+         * sigreturn profile could not state them otherwise). */
+        doc = build_doc(ghostlock::profile::kRouteSigreturn, "sigret",
+                        {{"route.sigreturn",
+                          {{"waiter_off_sve", 0x150},
+                           {"waiter_off_plain", 0x140},
+                           {"lock_anchor_image", 0x2a3a590}}}});
+        assert(parse_doc(doc, &parsed, release, sizeof(release)) == 0);
+        assert(parsed.route == ghostlock::profile::kRouteSigreturn);
+        assert(parsed.geometry.sig_waiter_off_sve.value_or(0) == 0x150);
+        assert(parsed.geometry.sig_waiter_off_plain.value_or(0) == 0x140);
+        assert(parsed.geometry.select_lock_anchor_image.value_or(0) == 0x2a3a590);
+        /* Both offsets stay absent when the document omits them: the route then
+         * refuses at prepare() instead of stamping at an unverified depth. */
+        doc = build_doc(ghostlock::profile::kRouteSigreturn, "sigret-bare", {});
+        assert(parse_doc(doc, &parsed, release, sizeof(release)) == 0);
+        assert(!parsed.geometry.sig_waiter_off_sve.has_value());
+        assert(!parsed.geometry.sig_waiter_off_plain.has_value());
+
         /* An empty document body is valid (everything stays default/absent). */
         doc = build_doc(ghostlock::profile::kRouteMulticastWaiter, "empty", {});
         assert(parse_doc(doc, &parsed, release, sizeof(release)) == 0);
@@ -313,7 +334,7 @@ int32_t main(void) {
             doc[5] = static_cast<char>(version >> 8);
             assert(parse_doc(doc, &parsed, release, sizeof(release)) == -1);
         }
-        for (int route : {0, 4, 99}) {
+        for (int route : {0, 5, 99}) {
             const std::string doc = build_doc(static_cast<uint8_t>(route), "r", {});
             assert(parse_doc(doc, &parsed, release, sizeof(release)) == -1);
         }

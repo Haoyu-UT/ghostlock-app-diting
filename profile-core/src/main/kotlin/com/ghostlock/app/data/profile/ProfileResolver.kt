@@ -51,6 +51,11 @@ object ProfileResolver {
             "lock_anchor_image" -> "lock_anchor_image"
             "lock_anchor_bytes" -> "lock_anchor_bytes"
             "lock_anchor_stride" -> "lock_anchor_stride"
+            /* The sigreturn route's per-build copy-window offsets. Bare paths,
+             * like the select route's own geometry keys above, so both the
+             * active route's branch and its fallback branch are searched. */
+            "sig.waiter_off_sve" -> "waiter_off_sve"
+            "sig.waiter_off_plain" -> "waiter_off_plain"
             else -> null
         }
         if (branchField != null) {

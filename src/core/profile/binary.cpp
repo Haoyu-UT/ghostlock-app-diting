@@ -193,6 +193,19 @@ namespace ghostlock::binary_profile {
             OPT("lock_offset", geometry.mcast_lock_offset),
         };
 
+        /* The sigreturn route's own section. The anchor trio is not duplicated
+         * here by accident: the lock word is the same object for every route,
+         * and a profile that selects sigreturn must be able to state it without
+         * falling back to another route's section (which the decoder never
+         * merges across routes). */
+        constexpr Field kRouteSigreturn[] = {
+            OPT("waiter_off_sve", geometry.sig_waiter_off_sve),
+            OPT("waiter_off_plain", geometry.sig_waiter_off_plain),
+            OPT("lock_anchor_image", geometry.select_lock_anchor_image),
+            OPT("lock_anchor_bytes", geometry.select_lock_anchor_bytes),
+            OPT("lock_anchor_stride", geometry.select_lock_anchor_stride),
+        };
+
         struct Section {
             std::string_view name;
             const Field *fields;
@@ -214,6 +227,7 @@ namespace ghostlock::binary_profile {
             {"route.tcp_zerocopy", kRouteTcp, std::size(kRouteTcp)},
             {"route.select_stack", kRouteSelect, std::size(kRouteSelect)},
             {"route.multicast_waiter", kRouteMulticast, std::size(kRouteMulticast)},
+            {"route.sigreturn", kRouteSigreturn, std::size(kRouteSigreturn)},
         };
 #undef PLAIN
 #undef OPT
@@ -228,6 +242,8 @@ namespace ghostlock::binary_profile {
                     return "route.select_stack";
                 case profile::kRouteMulticastWaiter:
                     return "route.multicast_waiter";
+                case profile::kRouteSigreturn:
+                    return "route.sigreturn";
                 default:
                     return {};
             }
@@ -282,7 +298,8 @@ namespace ghostlock::binary_profile {
              * is rejected instead of being inferred. */
             if (out->route != profile::kRouteTcpZerocopy &&
                 out->route != profile::kRouteSelectStack &&
-                out->route != profile::kRouteMulticastWaiter) {
+                out->route != profile::kRouteMulticastWaiter &&
+                out->route != profile::kRouteSigreturn) {
                 return -1;
             }
 

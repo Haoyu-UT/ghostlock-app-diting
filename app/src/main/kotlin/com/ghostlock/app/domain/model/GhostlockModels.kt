@@ -84,7 +84,7 @@ data class ProfileConfig(
 ) {
     companion object {
         /** Routes a profile may declare ("" is the inference fallback). */
-        val Routes = listOf("tcp_zerocopy", "select_stack", "multicast_waiter")
+        val Routes = listOf("tcp_zerocopy", "select_stack", "multicast_waiter", "sigreturn")
 
         /**
          * Route-independent execution tuning paths the general editor always

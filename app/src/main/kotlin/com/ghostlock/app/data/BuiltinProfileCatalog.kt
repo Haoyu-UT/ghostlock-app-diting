@@ -95,6 +95,10 @@ internal class BuiltinProfileCatalog(context: Context) {
         "tcp_zerocopy" if field == "compact_waiter" -> "compact_waiter"
         "select_stack" if field == "waiter_shift" -> "pselect_waiter_shift"
         "multicast_waiter" -> "mcast.$field"
+        /* The sigreturn route's own geometry keys; the resolver's branchField
+         * table maps `sig.*` back onto route.<name>.<field>, exactly as the
+         * mcast prefix does. */
+        "sigreturn" -> "sig.$field"
         else -> "$route.$field"
     }
 

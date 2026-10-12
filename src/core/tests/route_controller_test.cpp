@@ -34,6 +34,14 @@ namespace ghostlock::route {
             .code = ROUTE_OK
         };
     }
+
+    RouteStatus do_sigreturn_fake_lock_route(const memory::WriteRequest *request) {
+        assert(request);
+        return (RouteStatus)
+        {
+            .code = ROUTE_OK
+        };
+    }
 } // namespace ghostlock::route
 
 static void reset_stubs(ghostlock::route::RouteStatus status) {

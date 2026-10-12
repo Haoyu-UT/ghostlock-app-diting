@@ -700,11 +700,15 @@ namespace ghostlock::session::backend {
         ExploitSession &, const profile::kernel_offsets &, const char *, bool, VictimChain &);
     template StageResult Cve2026_43499Policy::run<route::MulticastPolicy>(
         ExploitSession &, const profile::kernel_offsets &, const char *, bool, VictimChain &);
+    template StageResult Cve2026_43499Policy::run<route::SigreturnPolicy>(
+        ExploitSession &, const profile::kernel_offsets &, const char *, bool, VictimChain &);
 
     template Status Cve2026_43499Policy::attack_write<route::SelectPolicy>(
         ExploitSession &, const memory::WriteRequest &, const char *);
     template Status Cve2026_43499Policy::attack_write<route::TcpPolicy>(
         ExploitSession &, const memory::WriteRequest &, const char *);
     template Status Cve2026_43499Policy::attack_write<route::MulticastPolicy>(
+        ExploitSession &, const memory::WriteRequest &, const char *);
+    template Status Cve2026_43499Policy::attack_write<route::SigreturnPolicy>(
         ExploitSession &, const memory::WriteRequest &, const char *);
 } // namespace ghostlock::session::backend

