@@ -541,9 +541,13 @@ namespace ghostlock::route::sigreturn {
                     static_cast<unsigned long long>(lock_word),
                     static_cast<long long>(now_us_since(route_t0) / 1000));
             stamp_window(route_t0);
-            pr_info("sigreturn post-stamp attempt=%d/%d stamps=%d misses=%d path_sve=%d "
-                    "+%lldms\n",
-                    attempt, kAttempts, g_patched - patched_before, g_misses,
+            /* `stamps` is the handler's patch count (one per trigger signal, so
+             * always 1 here). The loop's own copy count is the trampoline's
+             * counter -- without it, "did the loop actually run?" costs a trace. */
+            pr_info("sigreturn post-stamp attempt=%d/%d stamps=%d copies=%lu misses=%d "
+                    "path_sve=%d +%lldms\n",
+                    attempt, kAttempts, g_patched - patched_before,
+                    ghostlock_loop_stamps, g_misses,
                     g_last_path_sve,
                     static_cast<long long>(now_us_since(route_t0) / 1000));
             race->consumer_go.store(0);
