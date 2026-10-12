@@ -281,6 +281,39 @@ namespace ghostlock::memory {
             for (size_t i = 0; i < 8; i++) {
                 if (window[i] != std::byte{0}) return 0;
             }
+            /* The `prio` word (+0x40) is family-shaped, and both stack-stamp
+             * routes must agree with the page builder on which shape they are
+             * writing -- getting it wrong reads as prio = 0 (highest) on
+             * 5.15/6.1, which is exactly the defect waiter_prio_word() exists to
+             * prevent. 5.10: `int prio` alone (140). 5.15/6.1: (prio << 32) |
+             * wake_state, per the measured layout table in
+             * docs/analysis/waiter-layout-family-gating-plan.md. The word values
+             * are spelled out on purpose: a fixed vector pins the numbers, not
+             * the constants the production sites happen to use. */
+            constexpr std::uint64_t k5_10_prio_word = 140;
+            constexpr std::uint64_t kPacked_prio_word = (140ULL << 32) | 3;
+            std::array<std::byte, kWaiterBytes> prio_strip{};
+            if (!encode_waiter_words(prio_strip, 0,
+                                     waiter_words(leaf_layout, leaf_task, leaf_lock,
+                                                  k5_10_prio_word)))
+                return 0;
+            if (load64(reinterpret_cast<const unsigned char *>(prio_strip.data()), 0x40) !=
+                k5_10_prio_word)
+                return 0;
+            if (!encode_waiter_words(prio_strip, 0,
+                                     waiter_words(leaf_layout, leaf_task, leaf_lock,
+                                                  kPacked_prio_word)))
+                return 0;
+            if (load64(reinterpret_cast<const unsigned char *>(prio_strip.data()), 0x40) !=
+                kPacked_prio_word)
+                return 0;
+            /* The packed shape must leave the neighbouring words alone: +0x38 is
+             * the lock and +0x48 the deadline in both families. */
+            if (load64(reinterpret_cast<const unsigned char *>(prio_strip.data()), 0x38) !=
+                    leaf_lock ||
+                load64(reinterpret_cast<const unsigned char *>(prio_strip.data()), 0x48) != 0)
+                return 0;
+
             /* An undersized span is refused instead of written out of bounds. */
             std::array<std::byte, kWaiterBytes - 1> too_small{};
             if (encode_waiter_words(too_small, 0, pointer_words)) return 0;

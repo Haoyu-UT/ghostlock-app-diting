@@ -1,5 +1,10 @@
 #include "kernel/target.h"
 
+/* The family-shaped prio word lives with the other kernel constants (5.10's
+ * `int prio` at +0x40 vs 5.15/6.1's packed {wake_state, prio}) so the vector
+ * below can pin both shapes against the same constants the payload sites use. */
+#include "kernel/constants.hpp"
+
 using namespace ghostlock;
 
 #include <cassert>
@@ -121,3 +126,18 @@ int32_t main() {
     assert(!near_end.checked_add(2));
     return 0;
 }
+
+/* The `prio` word at waiter+0x40 is family-shaped, and the two shapes differ by
+ * which half holds `prio`: 5.10 has `int prio` at +0x40 with +0x44 as padding,
+ * 5.15/6.1 have `unsigned int wake_state` at +0x40 and `prio` at +0x44. Reading
+ * the wrong shape gives prio = 0 (highest priority) on 5.15/6.1, which silently
+ * disables the write vehicle's prio-gate arm -- see
+ * docs/analysis/waiter-layout-family-gating-plan.md. Pinned here so a future
+ * edit to either the constant or the packing fails the build, not a device run. */
+static_assert(ghostlock::kernel::waiter_prio_word(ghostlock::kernel::FAKE_WAITER_PRIO, false) ==
+              static_cast<std::uint64_t>(ghostlock::kernel::FAKE_WAITER_PRIO));
+static_assert(ghostlock::kernel::waiter_prio_word(ghostlock::kernel::FAKE_WAITER_PRIO, true) ==
+              ((static_cast<std::uint64_t>(ghostlock::kernel::FAKE_WAITER_PRIO) << 32) |
+               ghostlock::kernel::FAKE_WAITER_WAKE_STATE));
+static_assert(ghostlock::kernel::waiter_prio_word(140, true) == 0x0000008c00000003ULL);
+static_assert(ghostlock::kernel::waiter_prio_word(140, false) == 0x000000000000008cULL);

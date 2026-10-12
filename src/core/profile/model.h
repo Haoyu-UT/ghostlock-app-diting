@@ -268,6 +268,38 @@ namespace ghostlock::profile {
             return loaded_ && values_.uname_r ? values_.uname_r : "";
         }
 
+        /* Which `struct rt_mutex_waiter` priority layout the device has.
+         *
+         * compact_waiter is a document-global boolean that covers three families,
+         * but the word at waiter+0x40 is only `int prio` on 5.10: 5.15 added
+         * `unsigned int wake_state` there and moved prio to +0x44. kernel_major
+         * cannot discriminate them (both are major 5), so the minor comes from the
+         * release string -- the resolved profile always carries the device's own
+         * uname (ProfileMerger stamps it). A release that does not parse falls back
+         * to the major alone, which is certain for 6.x and leaves a 5.x template on
+         * the 5.10 shape (templates are not runnable profiles).
+         *
+         * See docs/analysis/waiter-layout-family-gating-plan.md. */
+        [[nodiscard]] bool compact_waiter_has_wake_state() const noexcept {
+            if (!loaded_) return false;
+            unsigned major = 0;
+            unsigned minor = 0;
+            const char *p = release();
+            while (*p >= '0' && *p <= '9') {
+                major = major * 10U + static_cast<unsigned>(*p - '0');
+                p++;
+            }
+            if (major != 0 && *p == '.') {
+                p++;
+                while (*p >= '0' && *p <= '9') {
+                    minor = minor * 10U + static_cast<unsigned>(*p - '0');
+                    p++;
+                }
+            }
+            if (major == 0) return values_.meta.kernel_major >= 6;
+            return major > 5U || (major == 5U && minor >= 15U);
+        }
+
         [[nodiscard]] const struct execution_settings *execution() const noexcept {
             return loaded_ ? &values_.execution : nullptr;
         }

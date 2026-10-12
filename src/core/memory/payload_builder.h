@@ -111,7 +111,12 @@ namespace ghostlock::memory {
      * +0x48, which is why an incomplete stamp oopses rather than quietly
      * missing. The select route's compact branch stamps exactly this list
      * into the pselect fd_set buffer; the sigreturn route stamps it through
-     * rt_sigreturn's fpsimd copy, so both build it from this one definition. */
+     * rt_sigreturn's fpsimd copy, so both build it from this one definition.
+     *
+     * The `prio` slot is NOT one layout across the compact families: 5.10 has
+     * `int prio` at +0x40 with +0x44 as padding, 5.15/6.1 have `unsigned int
+     * wake_state` at +0x40 and `prio` at +0x44. Use waiter_prio_word() to build
+     * it -- never write the value by hand. */
     inline constexpr std::size_t kWaiterBytes = 0x58;
     inline constexpr std::size_t kWaiterWords = kWaiterBytes / sizeof(std::uint64_t);
 

