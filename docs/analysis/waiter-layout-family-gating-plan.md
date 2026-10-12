@@ -258,3 +258,38 @@ Per `AGENTS.md`, this is an attack-path change:
 - `payload-page-option2-plan.md`, `payload-page-identity-plan.md` — the page builder this line
   lives in.
 - `stale-waiter-lifetime-plan.md` — waiter lifetime, adjacent but a different mechanism.
+
+---
+
+## As implemented (2026-10-12, Option A)
+
+Operator approved 2026-10-12; implemented the same day. The discriminator is
+`Profile::compact_waiter_has_wake_state()` (`src/core/profile/model.h`): the minor comes from the
+release string, because `kernel_major` cannot separate 5.10 from 5.15 and the wire carries no
+minor. A release that does not parse falls back to the major alone (6.x → packed; a 5.x template
+stays on the 5.10 shape and templates are not runnable profiles).
+
+The word itself has one definition, `kernel::waiter_prio_word(prio, packed_wake_state)`
+(`src/core/kernel/constants.hpp`, next to `FAKE_WAITER_PRIO` and the new
+`FAKE_WAITER_WAKE_STATE = 3`), used by all three emission sites:
+
+| site | before | after |
+|---|---|---|
+| `util.cpp` (page builder, compact branch) | `+0x40 = 140`, `+0x44 = 0` always | family-gated pair: 5.10 `{140, 0}`, 5.15/6.1 `{0, 140}` (upstream's page-builder values) |
+| `select_stack_route.cpp` word 10 | `140` always | `waiter_prio_word(140, family)` → 5.10 `140`, 5.15/6.1 `(140 << 32) \| 3` |
+| `sigreturn_route.cpp` (strip via `waiter_words`) | `140` always | same helper |
+
+5.10 output is byte-identical to before at every site; only 5.15/6.1 change. Tests: the encoder's
+both shapes are pinned with literal vectors in `payload_builder.cpp`'s fixed-vector test, and the
+helper's contract is a `static_assert` block in `target_constants_test.cpp` (that rule now defines
+`TARGET_CONFIG_H`, which `constants.hpp` needs).
+
+Gates run: `make -C src ghostlock` 0 warnings; `make -C src lint-tidy` exit 0; host tests
+`payload_builder_test`, `target_constants_test`, `select_stack_route_test`, `sigreturn_route_test`,
+`profile_test` all pass; `tools/cmp_disasm.py` against the pre-change 581 binary (record:
+`external/port/pr/` in the root repo). The 5.10 no-regression device run is the same sigreturn
+route the port already gates on diting.
+
+Not done here, still open from this document: the `futex_lock_pi` guard scope, the W3-0
+`leaf 1 → 0` justification, and the three `LOCAL DIAGNOSTIC` blocks — all of them are
+"before any upstream PR" items, not regressions.
