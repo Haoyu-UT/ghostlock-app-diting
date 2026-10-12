@@ -29,6 +29,18 @@ bool ghostlock::race::PiRace::reset(
     route_delay_usec.store(initial_delay_usec,
                            std::memory_order_relaxed);
     fast_repair.store(0, std::memory_order_relaxed);
+    /* LOCAL DIAGNOSTIC (run-18): only the fields a reader looks at while a record
+     * is live (state 0 = empty covers the rest), plus the allocator and the two
+     * view flags. */
+    consumer_diag_on.store(0, std::memory_order_relaxed);
+    consumer_diag_next.store(0, std::memory_order_relaxed);
+    consumer_seq_seen.store(0, std::memory_order_relaxed);
+    for (auto &slot: consumer_call_diag) {
+        slot.state.store(0, std::memory_order_relaxed);
+        slot.phase.store(0, std::memory_order_relaxed);
+        slot.t0_us.store(0, std::memory_order_relaxed);
+        slot.t1_us.store(0, std::memory_order_relaxed);
+    }
     main_cpu = main_cpu_value;
     consumer_cpu = consumer_cpu_value;
     request = nullptr;

@@ -254,7 +254,7 @@ namespace {
      * strip is stable for the overwhelming majority of the window (the kernel
      * chain between copies is ~1-3 us), short enough that a tick's clobber is
      * repaired quickly. */
-    constexpr int64_t kCopyIntervalNs = 100000;
+    constexpr int64_t kCopyIntervalNs = 500000;
 
     /* Trigger candidates, first one nobody in this process already handles.
      * SIGUSR1 is the measured-good choice on this ROM; the RT signals are the
@@ -506,11 +506,85 @@ namespace ghostlock::route::sigreturn {
         /* Reached only through the return frame. */
     }
 
+    /* LOCAL DIAGNOSTIC (run-18) -- see PiRace::ConsumerCallDiag. Prints what the
+     * consumer's own syscalls did during the window that just closed: one view
+     * line per attempt (which sequence the consumer last picked up, whether a
+     * call is still in flight), plus one line per call. A call printed IN-FLIGHT
+     * is one that had not returned when the window closed -- the run-17 w3c
+     * failure, which the route's own counters cannot name. */
+    void print_consumer_diag(const ghostlock::race::PiRace &pi_race, int32_t attempt,
+                             int32_t &prev) noexcept {
+        const int32_t next = pi_race.consumer_diag_next.load(std::memory_order_acquire);
+        const int32_t seen = pi_race.consumer_seq_seen.load(std::memory_order_relaxed);
+        const int32_t inflight = pi_race.consumer_inflight.load(std::memory_order_relaxed);
+        pr_info("sigret consumer diag attempt=%d saw=%d inflight=%d new=%d\n",
+                attempt, seen, inflight, next - prev);
+        for (int32_t i = prev; i != next && i - prev < ghostlock::race::PiRace::kConsumerDiagSlots;
+             i++) {
+            const auto &record =
+                    pi_race.consumer_call_diag[i % ghostlock::race::PiRace::kConsumerDiagSlots];
+            const int32_t state = record.state.load(std::memory_order_acquire);
+            if (state == 0) continue;
+            const int64_t t0 = record.t0_us.load(std::memory_order_relaxed);
+            const int64_t t1 = record.t1_us.load(std::memory_order_relaxed);
+            pr_info("sigret consumer call seq=%d idx=%d nice=%d state=%s phase=%d "
+                    "sched=%d/e%d futex=%d rt=%d/e%d dur_us=%lld\n",
+                    record.seq.load(std::memory_order_relaxed),
+                    record.index.load(std::memory_order_relaxed),
+                    record.nice.load(std::memory_order_relaxed),
+                    state == 2 ? "done" : "IN-FLIGHT",
+                    record.phase.load(std::memory_order_relaxed),
+                    record.sched_ret.load(std::memory_order_relaxed),
+                    record.sched_errno.load(std::memory_order_relaxed),
+                    record.futex_used.load(std::memory_order_relaxed),
+                    record.futex_ret.load(std::memory_order_relaxed),
+                    record.futex_errno.load(std::memory_order_relaxed),
+                    static_cast<long long>(t1 > 0 && t0 > 0 ? t1 - t0 : -1));
+        }
+        prev = next;
+    }
+
+    /* LOCAL DIAGNOSTIC (run-18), second half: the per-attempt lines above catch a
+     * call that was still in flight when its window closed; this dump is what
+     * that call finally returned, printed once the route call is over (records
+     * are allocated round-robin and a route call opens at most a handful, so no
+     * slot is reused inside one call). */
+    void dump_consumer_diag(const ghostlock::race::PiRace &pi_race, int32_t calls,
+                            int32_t successes) noexcept {
+        const int32_t next = pi_race.consumer_diag_next.load(std::memory_order_acquire);
+        pr_info("sigret consumer dump calls=%d successes=%d records=%d\n", calls, successes, next);
+        for (int32_t i = 0; i < next && i < ghostlock::race::PiRace::kConsumerDiagSlots; i++) {
+            const auto &record = pi_race.consumer_call_diag[i];
+            const int32_t state = record.state.load(std::memory_order_acquire);
+            if (state == 0) continue;
+            const int64_t t0 = record.t0_us.load(std::memory_order_relaxed);
+            const int64_t t1 = record.t1_us.load(std::memory_order_relaxed);
+            pr_info("sigret consumer final seq=%d idx=%d nice=%d state=%s phase=%d "
+                    "sched=%d/e%d futex=%d rt=%d/e%d dur_us=%lld\n",
+                    record.seq.load(std::memory_order_relaxed),
+                    record.index.load(std::memory_order_relaxed),
+                    record.nice.load(std::memory_order_relaxed),
+                    state == 2 ? "done" : "IN-FLIGHT",
+                    record.phase.load(std::memory_order_relaxed),
+                    record.sched_ret.load(std::memory_order_relaxed),
+                    record.sched_errno.load(std::memory_order_relaxed),
+                    record.futex_used.load(std::memory_order_relaxed),
+                    record.futex_ret.load(std::memory_order_relaxed),
+                    record.futex_errno.load(std::memory_order_relaxed),
+                    static_cast<long long>(t1 > 0 && t0 > 0 ? t1 - t0 : -1));
+        }
+    }
+
     route::RouteStatus SigreturnRoute::execute() noexcept {
         struct timespec route_t0{};
         clock_gettime(CLOCK_MONOTONIC, &route_t0);
         int32_t calls_total = 0;
         int32_t successes_total = 0;
+        /* LOCAL DIAGNOSTIC (run-18): per-call consumer records, this route only. */
+        race->consumer_diag_on.store(1, std::memory_order_relaxed);
+        int32_t diag_prev = race->consumer_diag_next.load(std::memory_order_relaxed);
+        /* PORT-PLAN item 11: what this route call drew, and what a walk could have
+         * read. attempt 1's slot was drawn by prepare() -> build_stamp(1). */
 
         for (int32_t attempt = 1; attempt <= kAttempts; attempt++) {
             if (attempt > 1) {
@@ -556,6 +630,7 @@ namespace ghostlock::route::sigreturn {
 
             const int32_t calls = race->consumer_calls.load();
             const int32_t successes = race->consumer_success.load();
+            print_consumer_diag(*race, attempt, diag_prev); /* LOCAL DIAGNOSTIC (run-18) */
             calls_total += calls;
             successes_total += successes;
             if (calls > 0 && successes > 0) {
@@ -566,6 +641,7 @@ namespace ghostlock::route::sigreturn {
             }
             (void) fail(33, 0);
         }
+        dump_consumer_diag(*race, calls_total, successes_total); /* LOCAL DIAGNOSTIC (run-18) */
         stamps = g_patched;
         stamp_misses = g_misses;
         consumer_calls = calls_total;

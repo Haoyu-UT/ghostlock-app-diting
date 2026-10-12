@@ -79,6 +79,44 @@ namespace ghostlock::race {
         std::atomic<int32_t> consumer_inflight;
         std::atomic<uint32_t> route_delay_usec;
         std::atomic<int32_t> fast_repair;
+
+        /* LOCAL DIAGNOSTIC (run-18, item 47 follow-up) -- remove with the other
+         * LOCAL DIAGNOSTIC blocks before any PR.
+         *
+         * What it answers: `consumer_calls`/`consumer_success` say how many calls
+         * the consumer made and how many returned 0, but nothing about *which
+         * syscall a lost call went into*. Run-17's w3c failure (the consumer made
+         * one call and then nothing for three attempts) cannot be told apart from
+         * a thread that exited, a sleep, or a syscall that never returned. So the
+         * consumer writes one record per call -- state 1 (in flight, with the
+         * phase it is in) before the first syscall, state 2 (returned, with both
+         * returns and errnos) after the last -- and the route thread prints the
+         * records once the window has closed. A record still at state 1 there is
+         * a call that had not returned: the failure, named.
+         *
+         * Cost: gated on `consumer_diag_on`, which only the route under
+         * measurement sets, so every other route (the select incumbent included)
+         * executes exactly one relaxed load more per call and nothing else. */
+        struct ConsumerCallDiag {
+            std::atomic<int32_t> state;    /* 0 empty, 1 in flight, 2 returned */
+            std::atomic<int32_t> phase;    /* 1 sched_setattr, 2 FUTEX_LOCK_PI, 3 FUTEX_UNLOCK_PI */
+            std::atomic<int32_t> seq;      /* the consumer_go sequence it belongs to */
+            std::atomic<int32_t> index;    /* call index within that sequence */
+            std::atomic<int32_t> nice;     /* the nice the call asked for */
+            std::atomic<int32_t> sched_ret;
+            std::atomic<int32_t> sched_errno;
+            std::atomic<int32_t> futex_used; /* the sched_setattr-failure fallback ran */
+            std::atomic<int32_t> futex_ret;
+            std::atomic<int32_t> futex_errno;
+            std::atomic<int64_t> t0_us;    /* before the first syscall */
+            std::atomic<int64_t> t1_us;    /* after the last; 0 while in flight */
+        };
+        static constexpr int32_t kConsumerDiagSlots = 16;
+        ConsumerCallDiag consumer_call_diag[kConsumerDiagSlots];
+        std::atomic<int32_t> consumer_diag_next; /* monotonic slot allocator */
+        std::atomic<int32_t> consumer_diag_on;
+        std::atomic<int32_t> consumer_seq_seen; /* last consumer_go the consumer picked up */
+
         int32_t main_cpu = 0;
         int32_t consumer_cpu = 0;
         ghostlock::support::PthreadOwner waiter_owner;

