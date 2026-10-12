@@ -1,8 +1,42 @@
 # Anchor slots: give the clean ones back — audit and plan (2026-10-12)
 
 Level: **L** (attack-critical: the anchor allocator hands out the addresses the walk dereferences).
-Status: **audit complete, no code changed.** PORT-PLAN items 11 and 11d; item 11c is fixed and
-device-verified, and this plan must not weaken it.
+Status: **measured on the device 2026-10-12 and then reverted — a dead end, recorded so no one
+re-walks it.** Items 11 and 11d are closed; item 11c's fix is untouched and still device-verified.
+
+## The verdict, and the three measurements behind it
+
+**1. The plan's premise was wrong, so the planned rule saved nothing.** It assumed a route call
+"consumes its whole chunk"; the allocator's cursor already reuses a chunk's tail *in-process*, so
+only the record's final partial chunk ever leaked and that amortises across runs. Measured:
+**14 slots per run before, 14 after**.
+
+**2. The precise replacement rule did deliver the 2x, and was still not worth keeping.** Where the
+slots actually go is two per route call — one for the attempt whose walk reads it (poisoned) and one
+for the second attempt, which does not walk at all. The rule that returns the second one is
+structural, not timing-based: a walk can only happen while the victim is blocked on the fake lock,
+and a call that returned 0 proves that block is over, so everything drawn after the first attempt
+whose *own* call returned 0 is pristine (per-sequence verdicts attribute a late return to the
+attempt that made it). It measured out exactly — `returned 7 as clean; spent 14/128` → `spent 15`,
+one slot per route call, ~7 per run (~18 runs/boot) — but the arm carrying it ran **0 complete in
+7 runs**, against 3/4 with the coarse rule and 4/4 with no release at all, so the operator closed
+it rather than spend the device time separating that from the carrier's own variance.
+
+**3. The released slots were provably clean, so the 0/7 is not a soundness failure.** The per-call
+durations in the fsynced log are the witness: across all 24 sampled calls of those runs, the walking
+call is always the first (58-173 ms, one 1.37 s) and the second is always a 5-8 µs no-op — never two
+walks in one call. Independently, every crash carries the carrier's own `+0x188`, never the
+dirty-slot `+0x3f0` the rule would produce, and one of the seven died on the first route call before
+any release had run.
+
+## If it is ever reopened
+
+The code is gone; what it would need is a *contemporaneous* control (release on/off builds,
+alternating runs) — the 4/4 baseline predates the arm by hours and boots, and the carrier's per-arm
+rate has swung 2-in-4 to 4-in-4 this session. If a rate cost is real, the suspect is the release
+write and the re-reservation it forces, both in the route's setup path (see the allocator's own
+comment about that window), and the fix would be to move the write off the thread whose stack holds
+the strip at the moment a walk is in flight.
 
 ## What the allocator does today
 
