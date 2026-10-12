@@ -306,6 +306,34 @@ what changes is the choreography — userspace builds one valid frame (captured 
 real delivered frame, per Risk 3), the handler's first delivery points `sp` at it and
 `pc` at a `svc #139` loop, and the loop exits on a `cntvct_el0` deadline.
 
+## Variant B as built (2026-10-12, device-measured)
+
+The carrier is rt_sigreturn itself, entered once per attempt:
+
+- One `tgkill`. The `SA_SIGINFO` handler patches the strip into the delivered
+  frame's fpsimd record, `memcpy`s the frame twice (0x2000 bytes each, 16-aligned so
+  the records keep the kernel's 128-bit alignment; the copies live in `extern "C"`
+  globals with `[[gnu::used]]`, because LTO drops asm-only references), and rewrites
+  `sp`/`pc` in **both** the delivered frame and the loop copy, so the `rt_sigreturn`
+  that follows the handler resumes at `sigreturn_loop_trampoline` with
+  `sp = loop_frame`.
+- The trampoline is naked asm: spin on `cntvct_el0` until the next copy is due
+  (`kCopyIntervalNs = 100 µs`), then `mov x8, #139; svc #0`; on the `cntvct` deadline
+  it loads `sp = return_frame` and `svc`s once more, which restores the interrupted
+  context exactly — `stamp_window` resumes as if nothing had happened, and the route
+  reads the consumer's counters as usual.
+- Measured: ~5285 copies in 5 ms (~1 µs per iteration); the copy's own source reads
+  the strip word-for-word (`tree_pc = page+0x100`, `lock` = the anchor, `prio` =
+  140); the destination is zero *before* each copy, because `parse_user_sigframe`
+  re-creates its local at exactly the strip's depths at the top of every
+  `rt_sigreturn` — hence the inter-copy spin, which is the one piece **not yet
+  measured on the route** (the last runs never started; see RESTORE.md).
+- `kAttempts`/per-attempt page respray and the anchor rotation are unchanged from A;
+  the loop counter currently reads 1 (globals placement — item 2 in RESTORE.md).
+
+Device state, the exact probe set, the run recipes and the ordered open items live in
+`external/port/sigret-app/RESTORE.md` (root repo).
+
 ## Device verification list (P2/P3)
 
 1. **Route recognition.** Import a profile whose `route { sigreturn { … } }` block carries the
