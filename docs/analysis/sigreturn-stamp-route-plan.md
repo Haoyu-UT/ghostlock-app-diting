@@ -376,3 +376,44 @@ The P1.5b read-back showing the copy does not land where the Σ arithmetic says 
 invalidate the depth model itself, not just this route); or, after the re-stamp mitigation, a
 measured per-attempt failure rate worse than the incumbent route's; or the write-vehicle checks
 (K-class) failing on device in a way the select_stack route does not already exhibit.
+
+## Carrier study, 2026-10-12 (measured; the design input for item 43)
+
+The route's flaw is structural, and it is now quantified. The strip lives at a fixed depth on
+the victim's kernel stack -- the stale waiter is `futex_wait_requeue_pi`'s local at `sp+0x90`,
+so the walk's words sit at **0x210** below the syscall entry sp on 5.10.236 and **0x1c0** on
+5.10.81/101 (the 0x50 is `do_futex`'s frame, 0x70 vs 0x20). The rt_sigreturn carrier fits both
+(its copy covers depths [0x100, 0x300)), but it returns the victim to EL0, where every interrupt
+writes frames through the strip.
+
+The obvious fix -- a syscall that copies user bytes over the strip and then *blocks*, parking the
+victim in EL1 so interrupts go to the IRQ stack -- was measured across the standard set, in QEMU,
+with two harnesses (`external/port/k81/qemu/{carriers,marker-sweep}.txt`, sources beside them):
+
+| carrier copy | L | depth | fits 236 (0x210) | fits 81/101 (0x1c0) |
+|---|---|---|---|---|
+| readv/writev iovec (wrapper) | 0x80 | 0xf8 | no | no |
+| recvmsg iovec | 0x80 | 0xe8 | no | no |
+| sendto sockaddr | 0x6e | 0x11c | no | no |
+| sendmsg iovec | 0x80 | 0x290 | no | no |
+| pselect6 fd_sets | 3*size | **0x210** | **yes** | no -- 0x50 deep of the strip |
+| ppoll pollfds | 0xf0 | 0x454 | no | no |
+| rt_sigreturn fpsimd local | 0x200 | **0x300** | **yes** | **yes** |
+| semop sembuf array | 0x100 | -- | SYSVIPC is not enabled in this kernel | |
+
+A carrier fits iff its copy spans the strip: `Sigma <= home <= Sigma + L - 0x58`. Two conclusions:
+
+1. **"Stamp, then park somewhere harmless" does not exist.** Every parking syscall in the set
+   (pause, rt_sigsuspend, read, futex-wait, nanosleep) was tested with a ramp already written at
+   the strip's depth: all of them overwrite those bytes with their own frames. A parked path's
+   frames *are* the clobberer.
+2. **The below-floor slack is 0x50 bytes of frame geometry.** select's buffer starts exactly at
+   the strip on 236 (which is why that route works there) and 0x50 below it on 81 -- no `nfds`,
+   shift or alignment choice can bridge that, because the buffer's start depth is a property of
+   `core_sys_select`'s frame, not of the copy length.
+
+So the remaining design space is: (a) tune the EL0 loop (item 47 -- the exposure is real but the
+rate is a measurement, not a model); (b) find a carrier outside the set measured here whose copy
+starts at depth <= 0x1c0 with L >= 0x78 (the band's mouth is ~0x1c0-0x1c0+L-0x58); or (c) accept
+the floor at 5.10.136 and ship the three supported builds. What is *ruled out* is the cheapest
+idea -- parking the victim somewhere shallow after the stamp.
