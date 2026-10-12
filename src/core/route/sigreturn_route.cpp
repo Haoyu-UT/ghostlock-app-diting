@@ -254,6 +254,12 @@ namespace {
      * strip is stable for the overwhelming majority of the window (the kernel
      * chain between copies is ~1-3 us), short enough that a tick's clobber is
      * repaired quickly. */
+    /* 500 us, measured 2026-10-12/13: the crash is exposure to *transient* strip
+     * states (every copy zeroes and re-stamps the strip, and the walk can sample
+     * it mid-transition), so the exposure scales with the copy rate. 500 us ran
+     * 4/4 where 20 us ran 4/6 and 100 us 2/4, and the walk's own duration is
+     * unchanged across arms (median ~100 ms) -- the knob wants to go up, not down.
+     * See PORT-PLAN item 47 and external/port/sigret-app/README.md sections 11-13. */
     constexpr int64_t kCopyIntervalNs = 500000;
 
     /* Trigger candidates, first one nobody in this process already handles.
