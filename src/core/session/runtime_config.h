@@ -22,6 +22,11 @@ namespace ghostlock::config {
         std::string ksu_log_path = "/data/local/tmp/.ghostlock_ksu.log";
         /* Kernel-log dump directory from --dump-kernel-log; empty disables the dump. */
         std::string debug_dir;
+        /* GHOSTLOCK_ANCHOR_TRUSTED: the app proved this install's data predates
+ * the current boot, so a missing anchor state file means no run has happened
+ * since the region was zeroed, and slot 0 is safe. Without it a missing file
+ * is refused -- see select_stack_anchor_slot(). */
+        bool anchor_trusted = false;
 
         RuntimeConfig() noexcept = default;
 

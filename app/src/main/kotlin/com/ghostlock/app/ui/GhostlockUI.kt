@@ -1,5 +1,6 @@
 package com.ghostlock.app.ui
 
+import android.content.Context
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -34,6 +35,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.nestedscroll.nestedScroll
@@ -52,6 +54,9 @@ import com.ghostlock.app.R
 import com.ghostlock.app.domain.model.CpuPair
 import com.ghostlock.app.domain.model.ExecutionFieldValue
 import com.ghostlock.app.domain.model.ProfileFieldNode
+import com.ghostlock.app.domain.model.ProfileLayers
+import com.ghostlock.app.domain.model.RunLogEntry
+import com.ghostlock.app.domain.model.RunLogState
 import com.ghostlock.app.domain.model.ShizukuStatus
 import com.ghostlock.app.domain.model.UserProfileFile
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
@@ -121,16 +126,29 @@ data class GhostlockUiState(
     val dialogConfirmLabelRes: Int = R.string.parse_start,
     /** Documentation URL shown as an extra button on a NOTICE dialog. */
     val dialogDocUrl: String? = null,
+    /**
+     * Offer "export log & report" on this dialog: a run that ended badly is
+     * exactly the moment someone wants to send the log, and the notice telling
+     * them it ended badly is where they are looking.
+     */
+    val dialogExportLog: Boolean = false,
+    /**
+     * Layers of the resolution that raised the start-up notice; non-null means
+     * the dialog body is built from this instead of [dialogMessageRes], so it
+     * states the layers that are already inactive (§C.12b).
+     */
+    val dialogLayerNotice: ProfileLayers? = null,
     val overwriteDialogVisible: Boolean = false,
     val overwriteMessage: String = "",
     val logLines: List<GhostlockLogLine> = emptyList(),
+    /** Runs retained on the device, as the export picker lists them. */
+    val runLogs: List<RunLogEntry> = emptyList(),
+    val runLogPickerVisible: Boolean = false,
     val executionRelease: String = "",
     val executionHasProfile: Boolean = false,
     val executionFields: List<ExecutionFieldValue> = emptyList(),
     val executionEditing: Map<String, String> = emptyMap(),
     val advancedScreenVisible: Boolean = false,
-    val debugExportEnabled: Boolean = true,
-    val debugExportLocation: String = "",
     val debugKernelLogEnabled: Boolean = true,
     val aboutVisible: Boolean = false,
     val parametersVisible: Boolean = false,
@@ -159,6 +177,8 @@ data class GhostlockUiState(
     val userProfiles: List<UserProfileFile> = emptyList(),
     /** Loaded user document feeding the imported layer; null means none. */
     val activeUserProfile: String? = null,
+    /** Which layers the last resolution applied, and which it deliberately did not. */
+    val profileLayers: ProfileLayers? = null,
     /** File name of the open user-profile detail screen, null when closed. */
     val userProfileDetail: String? = null,
     val userProfileRenameTarget: String? = null,
@@ -166,6 +186,23 @@ data class GhostlockUiState(
 )
 
 enum class DialogType { NONE, LIST, INPUT, CONFIRM, NOTICE }
+
+/**
+ * One line per layer that is present but deliberately not applied. Shared by
+ * the start-up notice and the profile screen's banner, so the two can never
+ * describe the same state differently.
+ */
+@Composable
+internal fun layerNoticeBody(layers: ProfileLayers): String = buildList {
+    val imported = layers.imported
+    if (imported != null && !layers.importedApplied) {
+        add(stringResource(R.string.layer_import_not_applied, imported))
+    }
+    if (layers.overridesPresent && !layers.overridesApplied) {
+        add(stringResource(R.string.layer_overrides_not_applied))
+    }
+}.joinToString("\n\n")
+
 
 data class GhostlockLogLine(val text: String, val color: Int)
 
@@ -175,6 +212,10 @@ interface GhostlockActions {
     fun onStatusClick()
     fun onCloseExecutionSheet()
     fun onCopyLogs()
+    fun onExportRunLog()
+    fun onRunLogSelected(stamp: String)
+    fun onRunLogPickerDismiss()
+    fun onClearRunLogs()
     fun onImportOffsetsHocon()
     fun onImportOffsetsJson()
     fun onDocumentsResult(request: DocumentRequest, uris: List<String>)
@@ -189,6 +230,7 @@ interface GhostlockActions {
     fun onDialogConfirm(value: String)
     fun onDialogDismiss()
     fun onDialogDismissFinished()
+    fun onDialogExportLog()
     fun onOverwriteConfirm()
     fun onOverwriteDismiss()
     fun onExecutionFieldChanged(path: String, value: String)
@@ -203,8 +245,6 @@ interface GhostlockActions {
     fun onCloseAdvanced()
     fun onShowAbout()
     fun onCloseAbout()
-    fun onDebugExportChanged(enabled: Boolean)
-    fun onDebugExportLocationPick()
     fun onDebugKernelLogChanged(enabled: Boolean)
     fun onOpenParameters()
     fun onCloseParameters()
@@ -366,6 +406,7 @@ internal fun GhostlockApp(
                 }
                 GhostlockDialog(state = state, actions = actions)
                 GhostlockOverwriteDialog(state = state, actions = actions)
+                RunLogPickerDialog(state = state, actions = actions)
                 GhostlockExecutionSheet(state = state, actions = actions)
             }
         }
@@ -527,6 +568,15 @@ private fun GhostlockDialog(
                         style = MiuixTheme.textStyles.body2,
                         color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                     )
+                    if (state.dialogExportLog) {
+                        TextButton(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 12.dp),
+                            text = stringResource(R.string.run_log_export),
+                            onClick = actions::onDialogExportLog,
+                        )
+                    }
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -548,8 +598,13 @@ private fun GhostlockDialog(
                 }
 
                 DialogType.NOTICE -> {
+                    val layerNotice = state.dialogLayerNotice
                     Text(
-                        text = stringResource(state.dialogMessageRes),
+                        text = if (layerNotice != null) {
+                            layerNoticeBody(layerNotice)
+                        } else {
+                            stringResource(state.dialogMessageRes)
+                        },
                         modifier = Modifier.fillMaxWidth(),
                         style = MiuixTheme.textStyles.body2,
                         color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
@@ -559,6 +614,14 @@ private fun GhostlockDialog(
                             .fillMaxWidth()
                             .padding(top = 16.dp),
                     ) {
+                        if (state.dialogExportLog) {
+                            TextButton(
+                                modifier = Modifier.weight(1f),
+                                text = stringResource(R.string.run_log_export),
+                                onClick = actions::onDialogExportLog,
+                            )
+                            Spacer(modifier = Modifier.width(12.dp))
+                        }
                         state.dialogDocUrl?.let { docUrl ->
                             val uriHandler = LocalUriHandler.current
                             TextButton(
@@ -581,6 +644,61 @@ private fun GhostlockDialog(
             }
         },
     )
+}
+
+@Composable
+private fun RunLogPickerDialog(
+    state: GhostlockUiState,
+    actions: GhostlockActions,
+) {
+    val context = LocalContext.current
+    OverlayDialog(
+        show = state.runLogPickerVisible,
+        title = stringResource(R.string.run_log_pick_title),
+        summary = stringResource(R.string.run_log_pick_summary),
+        onDismissRequest = actions::onRunLogPickerDismiss,
+        content = {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                state.runLogs.forEach { run ->
+                    TextButton(
+                        modifier = Modifier.fillMaxWidth(),
+                        text = runLogLabel(context, run),
+                        onClick = { actions.onRunLogSelected(run.stamp) },
+                    )
+                }
+                if (state.runLogs.isEmpty()) {
+                    Text(
+                        text = stringResource(R.string.run_log_empty),
+                        style = MiuixTheme.textStyles.body2,
+                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                    )
+                }
+                if (state.runLogs.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(12.dp))
+                    TextButton(
+                        modifier = Modifier.fillMaxWidth(),
+                        text = stringResource(R.string.run_log_clear),
+                        onClick = actions::onClearRunLogs,
+                    )
+                }
+            }
+        },
+    )
+}
+
+/** `20261009-212803 · Shizuku · interrupted · 42 KB` */
+private fun runLogLabel(context: Context, run: RunLogEntry): String {
+    val state = context.getString(
+        when (run.state) {
+            RunLogState.RUNNING -> R.string.run_log_state_running
+            RunLogState.COMPLETED -> R.string.run_log_state_completed
+            RunLogState.FAILED -> R.string.run_log_state_failed
+            RunLogState.INTERRUPTED -> R.string.run_log_state_interrupted
+        },
+    )
+    val size = android.text.format.Formatter.formatShortFileSize(context, run.bytes)
+    return "${run.stamp} · ${run.entry} · $state · $size"
 }
 
 @Composable
@@ -636,6 +754,13 @@ private fun MainContent(
                 state = state,
                 actions = actions,
                 modifier = Modifier.fillMaxWidth(),
+            )
+        }
+        item(key = "export-run-log") {
+            TextButton(
+                modifier = Modifier.fillMaxWidth(),
+                text = stringResource(R.string.run_log_export),
+                onClick = actions::onExportRunLog,
             )
         }
         item(key = "run") {

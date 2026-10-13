@@ -18,6 +18,8 @@ import com.ghostlock.app.data.ota.OtaPayloadExtractor
 import com.ghostlock.app.domain.model.OffsetImportResult
 import com.ghostlock.app.domain.model.ParseResult
 import com.ghostlock.app.domain.model.ProfileConfig
+import com.ghostlock.app.domain.model.RunLogEntry
+import com.ghostlock.app.domain.model.RunLogState
 import com.ghostlock.app.domain.model.UserProfileFile
 import com.ghostlock.app.domain.repository.GhostlockRepository
 import com.ghostlock.app.domain.repository.ProfileConfigController
@@ -44,10 +46,10 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         const val UserProfilesDirectoryName = "user_profiles"
         const val EditSessionPreferences = "ghostlock_edit_session"
         const val ExtractBinaryName = "libextract.so"
-        const val DefaultDebugLocation = "Download/ghostlock-debug-log"
         const val PrefForceAttackTest = "force_attack_test"
-        const val PrefDebugExportEnabled = "debug_export_enabled"
-        const val PrefDebugExportLocation = "debug_export_location"
+
+        /** Build identity the layer-disable notice was last shown for. */
+        const val PrefLayerNoticeAck = "profile_layer_notice_ack"
         const val PrefDebugKernelLogEnabled = "debug_kernel_log_enabled"
         const val PrefDebugProfileOverrides = "debug_profile_overrides"
 
@@ -145,7 +147,13 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         val all = runCatching { HoconSupport.parseValue(raw ?: "") }
             .getOrNull().asValueMap() ?: valueMapOf()
         deepMergeValues(all.mutableChild(release), overrides)
-        preferences.edit { putString(PrefDebugProfileOverrides, HoconSupport.render(all)) }
+        preferences.edit {
+            putString(PrefDebugProfileOverrides, HoconSupport.render(all))
+            /* The migration is this build writing them, so they apply (§B.7);
+             * leaving them unstamped would silently disable a user's own
+             * offsets on the very update that carried them over. */
+            putString(AndroidProfileConfigController.PrefOverridesBuildSha, BuildConfig.BUILD_IDENTITY)
+        }
     }
 
     override suspend fun snapshot(): KernelSnapshot {
@@ -190,6 +198,13 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         preferences.edit { putBoolean(PrefForceAttackTest, enabled) }
     }
 
+    override fun layerNoticeAcknowledged(): String? =
+        preferences.getString(PrefLayerNoticeAck, null)?.takeIf { it.isNotEmpty() }
+
+    override fun acknowledgeLayerNotice(build: String) {
+        preferences.edit { putString(PrefLayerNoticeAck, build) }
+    }
+
     override fun setShizukuEnabled(enabled: Boolean) {
         shizukuEnabled = enabled
         shizukuPreferenceSet = true
@@ -205,30 +220,30 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
 
     /* debug-ui: preferences for the hidden debug screen. */
     override suspend fun debugSettings(): DebugSettings = DebugSettings(
-        exportEnabled = preferences.getBoolean(PrefDebugExportEnabled, true),
-        exportLocation = normalizeDebugLocation(preferences.getString(PrefDebugExportLocation, null)),
         kernelLogEnabled = preferences.getBoolean(PrefDebugKernelLogEnabled, true),
     )
-
-    override fun setDebugExportEnabled(enabled: Boolean) {
-        preferences.edit { putBoolean(PrefDebugExportEnabled, enabled) }
-    }
-
-    override fun setDebugExportLocation(location: String) {
-        preferences.edit { putString(PrefDebugExportLocation, normalizeDebugLocation(location)) }
-    }
 
     override fun setDebugKernelLogEnabled(enabled: Boolean) {
         preferences.edit { putBoolean(PrefDebugKernelLogEnabled, enabled) }
     }
 
-    private fun normalizeDebugLocation(value: String?): String {
-        val cleaned = value.orEmpty().trim().trim('/').replace(Regex("/{2,}"), "/")
-        val safe = cleaned.takeIf { candidate ->
-            candidate.isNotEmpty() && candidate.split('/').none { it == ".." || it == "." }
-        }
-        return safe ?: DefaultDebugLocation
+    override suspend fun listRunLogs(): List<RunLogEntry> = withContext(Dispatchers.IO) {
+        RunLogStore.list(appContext)
     }
+
+    override suspend fun exportRunLog(stamp: String, documentUri: String): Boolean =
+        withContext(Dispatchers.IO) {
+            RunLogStore.exportZip(appContext, stamp, documentUri.toUri())
+        }
+
+    override suspend fun clearRunLogs() = withContext(Dispatchers.IO) {
+        RunLogStore.clear(appContext)
+    }
+
+    override suspend fun markInterruptedRunLogs(): Int = withContext(Dispatchers.IO) {
+        RunLogStore.markInterrupted(appContext)
+    }
+
 
     /* Profile configuration now lives in AndroidProfileConfigController: the
      * repository only wires it and forwards the native document. */
@@ -407,6 +422,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 "<s> profile resolved hasProfile=${config.hasProfile} " +
                     "blob=${profileBlob?.size ?: 0} invalid=${config.invalidPaths.size}",
             )
+            logProfileLayers(archivedLog, config)
             when {
                 !config.hasProfile || profileBlob == null -> {
                     archivedLog("<s> error: profile is unavailable for $release")
@@ -429,6 +445,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     } else {
                         profileBlob
                     }
+                    logProfileDigest(archivedLog, runtimeBlob)
                     dumpRuntimeProfile(archivedLog, writeSidecar, release, pair, runtimeBlob)
                     archivedLog("<b> starting UserService")
                     resetRunState()
@@ -509,10 +526,11 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         run: suspend ((String) -> Unit, String?, (String, ByteArray) -> Boolean) -> Int,
     ): Int {
         val settings = debugSettings()
-        if (!settings.exportEnabled) return run(onLog, null) { _, _ -> false }
-        val archive = DebugAttackLog.open(appContext, entry, settings.exportLocation)
+        /* Unconditional: a run with no log is a run nobody can report, and the
+         * user who most needs one is the one whose device just died. */
+        val archive = DebugAttackLog.open(appContext, entry)
         if (archive == null) {
-            onLog("<k> warning: cannot create ${settings.exportLocation} debug log")
+            onLog("<k> warning: cannot create the run log")
             return run(onLog, null) { _, _ -> false }
         }
         val archivedLog: (String) -> Unit = { line ->
@@ -528,16 +546,68 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 "<k> GhostLock ${BuildConfig.VERSION_NAME}+${BuildConfig.VERSION_CODE} " +
                     "build ${BuildInfo.BUILD_TIME_LABEL}",
             )
-            archivedLog("<k> debug log: ${archive.folderPath}/${archive.displayName}")
+            archivedLog(
+                "<k> run log: ${archive.displayName} (retained on the device; " +
+                    "export it from the log screen)",
+            )
             archivedLog("<k> debug dump dir: ${archive.folderFile.absolutePath}")
-            run(
+            val code = run(
                 archivedLog,
                 if (settings.kernelLogEnabled) archive.folderFile.absolutePath else null,
                 writeSidecar,
             )
+            /* Recorded before the descriptor closes: a run that ends without a
+             * terminal state reads as interrupted at the next start. */
+            archive.finish(if (code == 0) RunLogState.COMPLETED else RunLogState.FAILED)
+            code
         } finally {
             runCatching { archive.close() }
         }
+    }
+
+    /**
+     * States which profile layers this run used and which were skipped, and why
+     * (PORT-PLAN Phase 8 §C.10-11). A skipped layer is the difference between
+     * "the port is broken" and "what you imported is not being applied", which
+     * is exactly the distinction a log has to make from someone else's phone.
+     */
+    private fun logProfileLayers(log: (String) -> Unit, config: ProfileConfig) {
+        val layers = config.layers ?: return
+        log("<k> profile layers: ${layers.describe()}")
+        if (layers.overridesPresent && !layers.overridesApplied) {
+            log(
+                "<k> profile: stored overrides are present but disabled " +
+                    "(written by build ${layers.overridesBuild ?: "unknown"}); " +
+                    "re-save them in Parameters to re-enable",
+            )
+        }
+        if (layers.imported != null && !layers.importedApplied) {
+            log(
+                "<k> profile: imported document ${layers.imported} is loaded but not " +
+                    "applied; this kernel has a bundled profile",
+            )
+        }
+        if (layers.uncarriedKeys.isNotEmpty()) {
+            log(
+                "<k> warning: profile carries keys no wire section declares: " +
+                    layers.uncarriedKeys.joinToString(),
+            )
+        }
+    }
+
+    /**
+     * The digest the app just put in the blob native receives (§E.18); native
+     * recomputes and logs its own, and refuses the run on a mismatch.
+     */
+    private fun logProfileDigest(log: (String) -> Unit, blob: ByteArray) {
+        val digest = NativeProfileDocument.digestOf(blob)
+        log(
+            if (digest == null) {
+                "<k> profile digest: absent"
+            } else {
+                "<k> profile digest=0x%016x".format(digest.toLong())
+            },
+        )
     }
 
     /**
@@ -590,6 +660,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 "<k> profile: hasProfile=${config.hasProfile} " +
                     "invalid=${config.invalidPaths.size} release=$release",
             )
+            logProfileLayers(onLog, config)
             if (!config.hasProfile) {
                 error(
                     "no profile matched $release; import its .conf and select it, " +
@@ -609,6 +680,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             if (safeModeEnabled) {
                 profileBlob = NativeProfileDocument.patchSafeMode(profileBlob) ?: profileBlob
             }
+            logProfileDigest(onLog, profileBlob)
             dumpRuntimeProfile(onLog, writeSidecar, release, pair, profileBlob)
             val ksuOffset = AtomicLong()
             val nativeOffset = AtomicLong()
@@ -654,6 +726,13 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     environment()["TMPDIR"] = workDir.absolutePath
                     environment()["HOME"] = workDir.absolutePath
                     environment()["GHOSTLOCK_KSU_LOG"] = ksuLog.absolutePath
+                    /* Only when it is provable: a missing anchor state file is
+                     * then known to mean "no run since the reboot" instead of
+                     * "cannot tell", which is what let a clean install never
+                     * run at all. See InstallClock. */
+                    if (InstallClock.installPredatesBoot(appContext)) {
+                        environment()["GHOSTLOCK_ANCHOR_TRUSTED"] = "1"
+                    }
                 }
             onLog("<b> starting native: ${binary.absolutePath}")
             resetRunState()
@@ -773,6 +852,12 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                             AndroidProfileConfigController.PrefDebugProfileOverrides,
                             HoconSupport.render(valueMapOf(deviceRelease to overrides)),
                         )
+                        /* The session inherits the writer's identity too: without
+                         * it the layer would read as disabled inside the editor
+                         * and the user's own values would be shown as defaults. */
+                        profileController.overridesBuildStamp()?.let { stamp ->
+                            putString(AndroidProfileConfigController.PrefOverridesBuildSha, stamp)
+                        }
                     }
                 }
             }

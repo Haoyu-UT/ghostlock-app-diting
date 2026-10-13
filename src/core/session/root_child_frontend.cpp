@@ -40,6 +40,11 @@ namespace ghostlock::session::frontend {
          * exited during policy recovery and the device panicked. */
         usleep(session::g_exploit_session.profile.handoff_pre_dispatch_settle_ms() * 1000U);
         attack::timer_mark("exploit complete");
+        /* Paired with the "start" sample in the backend: the delta between them
+         * is what shows a device that throttled or ran short of memory while the
+         * chain ran, which no single sample can distinguish from one that was
+         * already slow. */
+        support::log_environment("end");
         if (!ever_rooted) {
             pr_error("w2 never rooted a child\n");
             return StageResult::Failed;

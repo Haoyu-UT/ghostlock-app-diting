@@ -38,7 +38,9 @@ data class NativeProfileDocument(
     fun toBinary(): ByteArray {
         val releaseBytes = release.toByteArray(Charsets.UTF_8)
         require(releaseBytes.size <= 0xffff) { "release is too long" }
-        val sections = sections()
+        /* The digest is computed over the schema before the digest entry
+         * exists, so it can never cover itself. */
+        val sections = sections() + Section("profile", listOf("digest" to schemaDigest()))
         var size = HeaderSize + releaseBytes.size + 2
         for (section in sections) {
             size += 1 + section.name.toByteArray(Charsets.UTF_8).size + 4
@@ -71,162 +73,218 @@ data class NativeProfileDocument(
         return buffer.array()
     }
 
-    private fun sections(): List<Section> = buildList {
+    /**
+     * The complete wire schema: every section and key this document can carry,
+     * with the value it holds or `null` when it is omitted. [sections] is the
+     * present-only projection that becomes the bytes; the digest hashes the
+     * schema itself, so a key that exists on one side of the transport and not
+     * the other — the way a new profile key once vanished between the resolved
+     * document and the wire — is a mismatch instead of a silent drop.
+     */
+    private fun schema(): List<Pair<String, List<WireEntry>>> = buildList {
         add(
-            Section(
-                "meta",
-                listOf(
-                    "kernel_major" to kernelMajor.toULong(),
-                    "recommend_shizuku" to recommendShizuku.toULong(),
-                    "fallback_route" to fallbackRoute.toULong(),
-                    "safe_mode" to safeMode.toULong(),
-                ),
+            "meta" to listOf(
+                WireEntry("kernel_major", kernelMajor.toULong()),
+                WireEntry("recommend_shizuku", recommendShizuku.toULong()),
+                WireEntry("fallback_route", fallbackRoute.toULong()),
+                WireEntry("safe_mode", safeMode.toULong()),
             ),
         )
-        add(Section("task_struct", taskEntries()))
-        add(Section("cred", credEntries()))
-        add(Section("offset", offsetEntries()))
-        kernelSection()?.let(::add)
+        add("task_struct" to taskEntries())
+        add("cred" to credEntries())
+        add("offset" to offsetEntries())
         add(
-            Section(
-                "execution.recommended_cpus",
-                listOf(
-                    "main" to execution.recommendedMainCpu.toULong(),
-                    "consumer" to execution.recommendedConsumerCpu.toULong(),
-                ),
-            ),
-        )
-        add(
-            Section(
-                "execution.heap",
-                listOf(
-                    "prepare_max_attempts" to execution.heapPrepareMaxAttempts.toULong(),
-                    "prepare_timeout_ms" to execution.heapPrepareTimeoutMs.toULong(),
-                    "kernelsnitch_timeout_ms" to execution.heapKernelsnitchTimeoutMs.toULong(),
-                ),
+            "kernel" to listOf(
+                WireEntry("kernel_phys_load", kernelPhysLoad),
+                WireEntry("kernel_phys_offset", kernelPhysOffset),
+                WireEntry("compact_waiter", compactWaiter?.toULong()),
+                WireEntry("kernelsnitch_collisions", kernelsnitchCollisions?.toULong()),
+                WireEntry("mm_struct_sz", mmStructSz?.toULong()),
             ),
         )
         add(
-            Section(
-                "execution.race",
-                listOf(
-                    "route_wait_ms" to execution.raceRouteWaitMs.toULong(),
-                    "route_done_timeout_ms" to execution.raceRouteDoneTimeoutMs.toULong(),
-                    "setup_settle_us" to execution.raceSetupSettleUs.toULong(),
-                    "state_poll_interval_us" to execution.raceStatePollIntervalUs.toULong(),
-                ),
+            "execution.recommended_cpus" to listOf(
+                WireEntry("main", execution.recommendedMainCpu.toULong()),
+                WireEntry("consumer", execution.recommendedConsumerCpu.toULong()),
             ),
         )
         add(
-            Section(
-                "execution.stages",
-                listOf(
-                    "w1_attempts" to execution.w1Attempts.toULong(),
-                    "w1_settle_us" to execution.w1SettleUs.toULong(),
-                    "w1_scratch_repair_attempts" to execution.w1ScratchRepairAttempts.toULong(),
-                    "w2_attempts" to execution.w2Attempts.toULong(),
-                    "w2_settle_us" to execution.w2SettleUs.toULong(),
-                    "w3_chain_rounds" to execution.w3ChainRounds.toULong(),
-                    "w3_attempts" to execution.w3Attempts.toULong(),
-                    "w3_settle_us" to execution.w3SettleUs.toULong(),
-                ),
+            "execution.heap" to listOf(
+                WireEntry("prepare_max_attempts", execution.heapPrepareMaxAttempts.toULong()),
+                WireEntry("prepare_timeout_ms", execution.heapPrepareTimeoutMs.toULong()),
+                WireEntry("kernelsnitch_timeout_ms", execution.heapKernelsnitchTimeoutMs.toULong()),
             ),
         )
         add(
-            Section(
-                "execution.handoff",
-                listOf(
-                    "pre_dispatch_settle_ms" to execution.handoffPreDispatchSettleMs.toULong(),
-                    "module_poll_attempts" to execution.handoffModulePollAttempts.toULong(),
-                    "module_poll_interval_ms" to execution.handoffModulePollIntervalMs.toULong(),
-                    "enforce_poll_attempts" to execution.handoffEnforcePollAttempts.toULong(),
-                    "enforce_poll_interval_ms" to execution.handoffEnforcePollIntervalMs.toULong(),
-                ),
+            "execution.race" to listOf(
+                WireEntry("route_wait_ms", execution.raceRouteWaitMs.toULong()),
+                WireEntry("route_done_timeout_ms", execution.raceRouteDoneTimeoutMs.toULong()),
+                WireEntry("setup_settle_us", execution.raceSetupSettleUs.toULong()),
+                WireEntry("state_poll_interval_us", execution.raceStatePollIntervalUs.toULong()),
             ),
         )
         add(
-            Section(
-                "execution.consumer",
-                listOf(
-                    "max_calls" to execution.consumerMaxCalls.toULong(),
-                    "burst_calls" to execution.consumerBurstCalls.toULong(),
-                ),
+            "execution.stages" to listOf(
+                WireEntry("w1_attempts", execution.w1Attempts.toULong()),
+                WireEntry("w1_settle_us", execution.w1SettleUs.toULong()),
+                WireEntry("w1_scratch_repair_attempts", execution.w1ScratchRepairAttempts.toULong()),
+                WireEntry("w2_attempts", execution.w2Attempts.toULong()),
+                WireEntry("w2_settle_us", execution.w2SettleUs.toULong()),
+                WireEntry("w3_chain_rounds", execution.w3ChainRounds.toULong()),
+                WireEntry("w3_attempts", execution.w3Attempts.toULong()),
+                WireEntry("w3_settle_us", execution.w3SettleUs.toULong()),
             ),
         )
-        routeSection()?.let(::add)
+        add(
+            "execution.handoff" to listOf(
+                WireEntry("pre_dispatch_settle_ms", execution.handoffPreDispatchSettleMs.toULong()),
+                WireEntry("module_poll_attempts", execution.handoffModulePollAttempts.toULong()),
+                WireEntry("module_poll_interval_ms", execution.handoffModulePollIntervalMs.toULong()),
+                WireEntry("enforce_poll_attempts", execution.handoffEnforcePollAttempts.toULong()),
+                WireEntry("enforce_poll_interval_ms", execution.handoffEnforcePollIntervalMs.toULong()),
+            ),
+        )
+        add(
+            "execution.consumer" to listOf(
+                WireEntry("max_calls", execution.consumerMaxCalls.toULong()),
+                WireEntry("burst_calls", execution.consumerBurstCalls.toULong()),
+            ),
+        )
+        routeSchema()?.let(::add)
     }
 
-    private fun taskEntries(): List<Pair<String, ULong>> = listOf(
-        "prio" to taskStruct.prio.toULong(),
-        "normal_prio" to taskStruct.normalPrio.toULong(),
-        "sched_task_group" to taskStruct.schedTaskGroup.toULong(),
-        "pi_lock" to taskStruct.piLock.toULong(),
-        "pi_waiters" to taskStruct.piWaiters.toULong(),
-        "pi_top_task" to taskStruct.piTopTask.toULong(),
-        "pi_blocked_on" to taskStruct.piBlockedOn.toULong(),
-        "pid" to taskStruct.pid.toULong(),
-        "tgid" to taskStruct.tgid.toULong(),
-        "atomic_flags" to taskStruct.atomicFlags.toULong(),
-        "real_cred" to taskStruct.realCred.toULong(),
-        "cred" to taskStruct.cred.toULong(),
-        "comm" to taskStruct.comm.toULong(),
-        "tasks" to taskStruct.tasks.toULong(),
-        "seccomp" to taskStruct.seccomp.toULong(),
-    )
-
-    private fun credEntries(): List<Pair<String, ULong>> = listOf(
-        "copy_size" to cred.copySize.toULong(),
-        "usage_offset" to cred.usageOffset.toULong(),
-        "usage_value" to cred.usageValue.toULong(),
-        "caps_offset" to cred.capsOffset.toULong(),
-        "caps_count" to cred.capsCount.toULong(),
-        "caps_value" to cred.capsValue,
-        "ref_count" to cred.refCount.toULong(),
-        "ref0_offset" to cred.ref0Offset.toULong(),
-        "ref1_offset" to cred.ref1Offset.toULong(),
-        "ref2_offset" to cred.ref2Offset.toULong(),
-        "ref3_offset" to cred.ref3Offset.toULong(),
-        "ref0_image" to cred.ref0Image,
-        "ref1_image" to cred.ref1Image,
-        "ref2_image" to cred.ref2Image,
-        "ref3_image" to cred.ref3Image,
-    )
-
-    private fun offsetEntries(): List<Pair<String, ULong>> = listOf(
-        "init_task" to kernelOffset.initTask,
-        "init_cred" to kernelOffset.initCred,
-        "empty_zero_page" to kernelOffset.emptyZeroPage,
-        "root_task_group" to kernelOffset.rootTaskGroup,
-        "selinux_enforcing" to kernelOffset.selinuxEnforcing,
-        "selinux_blob_sizes" to kernelOffset.selinuxBlobSizes,
-        "security_hook_heads" to kernelOffset.securityHookHeads,
-        "slide_nfulnl_logger" to kernelOffset.slideNfulnlLogger,
-        "slide_loggers_0_1" to kernelOffset.slideLoggers01,
-        "slide_boot_id" to kernelOffset.slideBootId,
-    )
-
-    private fun kernelSection(): Section? {
-        val entries = buildList {
-            kernelPhysLoad?.let { add("kernel_phys_load" to it) }
-            kernelPhysOffset?.let { add("kernel_phys_offset" to it) }
-            compactWaiter?.let { add("compact_waiter" to it.toULong()) }
-            kernelsnitchCollisions?.let { add("kernelsnitch_collisions" to it.toULong()) }
-            mmStructSz?.let { add("mm_struct_sz" to it.toULong()) }
-        }
-        return if (entries.isEmpty()) null else Section("kernel", entries)
+    /** The present-only projection of [schema] that is written to the wire. */
+    private fun sections(): List<Section> = schema().mapNotNull { (name, entries) ->
+        val present = entries.mapNotNull { entry -> entry.value?.let { entry.key to it } }
+        if (present.isEmpty()) null else Section(name, present)
     }
 
-    private fun routeSection(): Section? {
+    /**
+     * Every key this document's schema declares, across its sections. A
+     * resolved profile carrying a key outside this set is a key no wire
+     * section can carry — the shape of the bug that lost the lock anchor
+     * between the document and the transport.
+     */
+    fun wireKeys(): Set<String> = schema().flatMapTo(linkedSetOf()) { (_, entries) ->
+        entries.map { it.key }
+    }
+
+    /** The active route's section, carrying its keys even when all are absent. */
+    private fun routeSchema(): Pair<String, List<WireEntry>>? {
         val kind = RouteKind.fromWire(routeKind) ?: return null
-        val entries = routeConfig.entries()
-        return if (entries.isEmpty()) null else Section(routeSectionName(kind.wire), entries)
+        val values = routeConfig.entries().toMap()
+        return routeSectionName(kind.wire) to
+            routeConfig.keys().map { WireEntry(it, values[it]) }
     }
+
+    /**
+     * Canonical digest of [schema]: sections and keys in sorted order, each key
+     * followed by a presence byte and, when present, its value little-endian.
+     * Native recomputes the same stream from what it decoded (`binary.cpp`,
+     * `schema_digest`) and treats a mismatch as fatal.
+     *
+     * Scope, stated because it is easy to over-read: this catches a **dropped
+     * key** — a key one side of the transport declares and the other does not —
+     * plus a mangled or truncated payload. It does **not** catch staleness: an
+     * old imported layer or an override from an older build resolves to the
+     * same document on both sides and hashes equal. The layer policy is what
+     * stops those (§B/§C of PORT-PLAN Phase 8).
+     */
+    private fun schemaDigest(): ULong {
+        val entries = mutableListOf<Pair<String, String>>()   // section -> key
+        val values = mutableMapOf<Pair<String, String>, ULong?>()
+        for ((section, keys) in schema()) {
+            for (entry in keys) {
+                if (section == "profile" || (section == "meta" && entry.key == "safe_mode")) {
+                    /* safe_mode is rewritten in transit by the app (patchSafeMode)
+                     * and `profile` carries this digest itself. */
+                    continue
+                }
+                entries += section to entry.key
+                values[section to entry.key] = entry.value
+            }
+        }
+        entries.sortWith(compareBy({ it.first }, { it.second }))
+        var hash = FnvOffsetBasis
+        fun feed(byte: Int) {
+            hash = (hash xor byte.toULong()) * FnvPrime
+        }
+        for ((section, key) in entries) {
+            section.forEach { feed(it.code) }
+            feed(SchemaSeparator)
+            key.forEach { feed(it.code) }
+            feed(SchemaSeparator)
+            val value = values[section to key]
+            if (value == null) {
+                feed(0)
+            } else {
+                feed(1)
+                for (index in 0 until 8) feed(((value shr (8 * index)) and 0xFFu).toInt())
+            }
+        }
+        return hash
+    }
+
+    private fun taskEntries(): List<WireEntry> = listOf(
+        WireEntry("prio", taskStruct.prio.toULong()),
+        WireEntry("normal_prio", taskStruct.normalPrio.toULong()),
+        WireEntry("sched_task_group", taskStruct.schedTaskGroup.toULong()),
+        WireEntry("pi_lock", taskStruct.piLock.toULong()),
+        WireEntry("pi_waiters", taskStruct.piWaiters.toULong()),
+        WireEntry("pi_top_task", taskStruct.piTopTask.toULong()),
+        WireEntry("pi_blocked_on", taskStruct.piBlockedOn.toULong()),
+        WireEntry("pid", taskStruct.pid.toULong()),
+        WireEntry("tgid", taskStruct.tgid.toULong()),
+        WireEntry("atomic_flags", taskStruct.atomicFlags.toULong()),
+        WireEntry("real_cred", taskStruct.realCred.toULong()),
+        WireEntry("cred", taskStruct.cred.toULong()),
+        WireEntry("comm", taskStruct.comm.toULong()),
+        WireEntry("tasks", taskStruct.tasks.toULong()),
+        WireEntry("seccomp", taskStruct.seccomp.toULong()),
+    )
+
+    private fun credEntries(): List<WireEntry> = listOf(
+        WireEntry("copy_size", cred.copySize.toULong()),
+        WireEntry("usage_offset", cred.usageOffset.toULong()),
+        WireEntry("usage_value", cred.usageValue.toULong()),
+        WireEntry("caps_offset", cred.capsOffset.toULong()),
+        WireEntry("caps_count", cred.capsCount.toULong()),
+        WireEntry("caps_value", cred.capsValue),
+        WireEntry("ref_count", cred.refCount.toULong()),
+        WireEntry("ref0_offset", cred.ref0Offset.toULong()),
+        WireEntry("ref1_offset", cred.ref1Offset.toULong()),
+        WireEntry("ref2_offset", cred.ref2Offset.toULong()),
+        WireEntry("ref3_offset", cred.ref3Offset.toULong()),
+        WireEntry("ref0_image", cred.ref0Image),
+        WireEntry("ref1_image", cred.ref1Image),
+        WireEntry("ref2_image", cred.ref2Image),
+        WireEntry("ref3_image", cred.ref3Image),
+    )
+
+    private fun offsetEntries(): List<WireEntry> = listOf(
+        WireEntry("init_task", kernelOffset.initTask),
+        WireEntry("init_cred", kernelOffset.initCred),
+        WireEntry("empty_zero_page", kernelOffset.emptyZeroPage),
+        WireEntry("root_task_group", kernelOffset.rootTaskGroup),
+        WireEntry("selinux_enforcing", kernelOffset.selinuxEnforcing),
+        WireEntry("selinux_blob_sizes", kernelOffset.selinuxBlobSizes),
+        WireEntry("security_hook_heads", kernelOffset.securityHookHeads),
+        WireEntry("slide_nfulnl_logger", kernelOffset.slideNfulnlLogger),
+        WireEntry("slide_loggers_0_1", kernelOffset.slideLoggers01),
+        WireEntry("slide_boot_id", kernelOffset.slideBootId),
+    )
 
     companion object {
         const val Magic = 0x0D000721u
 
         /** Wire v2 container version (object sections). */
         const val Version: UShort = 2u
+
+        /* FNV-1a over the schema stream; native mirrors this byte for byte
+         * (`schema_digest` in core/profile/binary.cpp). */
+        private const val FnvOffsetBasis = 0xcbf29ce484222325uL
+        private const val FnvPrime = 0x100000001b3uL
+        private const val SchemaSeparator = 0x1F
 
         private const val FrontendRootChild: UShort = 1u
         private const val FrontendUmhForward: UShort = 2u
@@ -279,6 +337,60 @@ data class NativeProfileDocument(
                             .order(ByteOrder.LITTLE_ENDIAN)
                             .putLong(valueOffset, 1L)
                         return copy
+                    }
+                    entry++
+                }
+            }
+            return null
+        }
+
+        /**
+         * The digest this document carries in its `profile` section, or null
+         * when it predates the digest. Read out of the transmitted bytes, so a
+         * caller logs the value native will actually verify.
+         */
+        fun digestOf(document: ByteArray): ULong? = scanSection(document, "profile", "digest")
+
+        /**
+         * Locates one `section`/`key` entry in a v2 document by scanning, and
+         * returns its raw 64-bit value. v2 has no fixed slot offsets.
+         */
+        private fun scanSection(
+            document: ByteArray,
+            wantedSection: String,
+            wantedKey: String,
+        ): ULong? {
+            if (document.size < HeaderSize) return null
+            val buffer = ByteBuffer.wrap(document).order(ByteOrder.LITTLE_ENDIAN)
+            if (buffer.int.toUInt() != Magic) return null
+            if (buffer.short.toUShort() != Version) return null
+            buffer.short // frontend
+            buffer.short // backend
+            buffer.short // middleware
+            val releaseLength = buffer.short.toInt() and 0xffff
+            buffer.short // reserved
+            if (buffer.remaining() < releaseLength + 2) return null
+            buffer.position(buffer.position() + releaseLength)
+            val sectionCount = buffer.short.toInt() and 0xffff
+            repeat(sectionCount) {
+                if (buffer.remaining() < 1) return null
+                val nameLength = buffer.get().toInt() and 0xff
+                if (buffer.remaining() < nameLength + 4) return null
+                val nameBytes = ByteArray(nameLength)
+                buffer.get(nameBytes)
+                val entryCount = buffer.int.toUInt().toLong()
+                var entry = 0L
+                while (entry < entryCount) {
+                    if (buffer.remaining() < 1) return null
+                    val keyLength = buffer.get().toInt() and 0xff
+                    if (buffer.remaining() < keyLength + 8) return null
+                    val keyBytes = ByteArray(keyLength)
+                    buffer.get(keyBytes)
+                    val value = buffer.long.toULong()
+                    if (String(nameBytes, Charsets.UTF_8) == wantedSection &&
+                        String(keyBytes, Charsets.UTF_8) == wantedKey
+                    ) {
+                        return value
                     }
                     entry++
                 }
@@ -623,6 +735,9 @@ data class NativeProfileDocument(
 }
 
 private data class Section(val name: String, val entries: List<Pair<String, ULong>>)
+
+/** One wire schema slot: the value held, or null when the document omits it. */
+private data class WireEntry(val key: String, val value: ULong?)
 
 private fun routeSectionName(route: UInt): String = when (RouteKind.fromWire(route)) {
     RouteKind.TCP_ZEROCOPY -> "route.tcp_zerocopy"

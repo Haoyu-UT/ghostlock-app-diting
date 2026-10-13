@@ -76,6 +76,10 @@ static void runtime_config_init_paths(config::RuntimeConfig *config) {
     config->ksu_log_path = (ksu_log && ksu_log[0])
                                ? std::string(ksu_log)
                                : config->home_dir + "/.ghostlock_ksu.log";
+
+    const char *anchor_trusted = getenv("GHOSTLOCK_ANCHOR_TRUSTED");
+    config->anchor_trusted = anchor_trusted && anchor_trusted[0] &&
+                             anchor_trusted[0] != '0';
 }
 
 /* Capture all process environment and CPU/path choices exactly once. Input:
@@ -87,6 +91,7 @@ int32_t ghostlock::config::RuntimeConfig::init() {
     root_script_path.clear();
     ksu_log_path.clear();
     debug_dir.clear();
+    anchor_trusted = false;
 
     runtime_config_init_cpus(this);
     runtime_config_init_paths(this);

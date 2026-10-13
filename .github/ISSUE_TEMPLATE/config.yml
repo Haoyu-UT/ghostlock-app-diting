@@ -1,0 +1,16 @@
+# Issue chooser for the fork. Blank issues stay enabled on purpose: the form
+# asks for what triage needs, but a report that does not fit it is still better
+# than no report.
+#
+# Both links exist to route the two reports that are not ours to fix:
+# the port is bound to one exact kernel build, so a different kernel is an
+# unsupported device rather than a bug — and anything on a kernel upstream
+# ships a profile for belongs in upstream's tracker, not here.
+blank_issues_enabled: true
+contact_links:
+  - name: Check your kernel first / 先核对内核版本
+    url: https://github.com/Haoyu-UT/ghostlock-app-diting#supported-devices
+    about: This port is bound to one exact kernel build · 本移植只绑定一个精确的内核版本
+  - name: A bug in the app itself, on an upstream-supported kernel / 上游支持的内核上应用本身的 bug
+    url: https://github.com/YuKongA/ghostlock-app/issues
+    about: Upstream supports 5.15 / 6.1 / 6.6 / 6.12 normally; this repository is a port · 上游正常支持这些内核，本仓库只是移植

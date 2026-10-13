@@ -1,5 +1,7 @@
 #include "profile/binary.h"
 
+#include <algorithm>
+#include <array>
 #include <cstring>
 #include <iterator>
 #include <string_view>
@@ -193,6 +195,12 @@ namespace ghostlock::binary_profile {
             OPT("lock_offset", geometry.mcast_lock_offset),
         };
 
+        /* The digest's own section name and key. It is transport metadata, not
+         * a profile field, so it stays out of the field tables (and out of
+         * kernel_offsets) — see the kDigest* constants below. */
+        constexpr std::string_view kDigestSection = "profile";
+        constexpr std::string_view kDigestKey = "digest";
+
         struct Section {
             std::string_view name;
             const Field *fields;
@@ -247,6 +255,96 @@ namespace ghostlock::binary_profile {
             }
         }
 
+        /* --- schema digest --------------------------------------------------
+         * Both sides of the transport hash one canonical stream: every section
+         * and key the *schema* declares — written or not — in sorted order,
+         * each followed by a presence byte and, when present, its value
+         * little-endian. Kotlin computes the same stream in `NativeProfile.kt`
+         * and carries the result in the `profile` section; this side recomputes
+         * it from what it decoded, so a key one side declares and the other
+         * does not is a refusal rather than a silent drop.
+         *
+         * Scope: it catches a dropped key and a mangled or truncated payload.
+         * It is NOT a staleness check — an old layer resolves to the same
+         * document on both sides and hashes equal; the app's layer policy is
+         * what stops those. */
+        constexpr uint64_t kFnvOffsetBasis = 0xcbf29ce484222325ull;
+        constexpr uint64_t kFnvPrime = 0x100000001b3ull;
+        constexpr uint8_t kSchemaSeparator = 0x1f;
+        /* The schema is 80 keys today (15 task + 15 cred + 10 offset + …); the
+         * bound only has to be an upper bound, because dropping a key here
+         * would diverge from the app's stream and be refused, not ignored. */
+        constexpr size_t kMaxDigestKeys = 128;
+
+        uint64_t fnv_byte(uint64_t hash, uint8_t byte) {
+            return (hash ^ byte) * kFnvPrime;
+        }
+
+        uint64_t fnv_text(uint64_t hash, std::string_view text) {
+            for (const char c: text) {
+                hash = fnv_byte(hash, static_cast<uint8_t>(c));
+            }
+            return hash;
+        }
+
+        /* safe_mode is rewritten in transit by the app (`patchSafeMode`), and
+         * the digest section carries the digest itself. */
+        bool digest_skipped(std::string_view section, std::string_view key) {
+            return section == kDigestSection ||
+                   (section == "meta" && key == "safe_mode");
+        }
+
+        struct DigestKey {
+            std::string_view section;
+            const Field *field;
+            size_t section_index;
+            size_t field_index;
+        };
+
+        /* `seen` carries which keys the parsed document actually contained.
+         * When null the struct itself is the source (serialize / host tests),
+         * where a field is present exactly when its type says so. */
+        uint64_t schema_digest(const profile::kernel_offsets &in,
+                               const std::array<uint64_t, std::size(kSections)> *seen) {
+            std::array<DigestKey, kMaxDigestKeys> keys{};
+            size_t count = 0;
+            for (size_t s = 0; s < std::size(kSections); s++) {
+                const Section &section = kSections[s];
+                /* Only the active route's section belongs to the schema. */
+                if (section.name.starts_with("route.") &&
+                    section.name != route_section_name(in.route)) {
+                    continue;
+                }
+                for (size_t i = 0; i < section.count && count < keys.size(); i++) {
+                    if (digest_skipped(section.name, section.fields[i].key)) continue;
+                    keys[count++] = {section.name, &section.fields[i], s, i};
+                }
+            }
+            std::sort(keys.begin(), keys.begin() + static_cast<ptrdiff_t>(count),
+                      [](const DigestKey &a, const DigestKey &b) {
+                          if (a.section != b.section) return a.section < b.section;
+                          return a.field->key < b.field->key;
+                      });
+            uint64_t hash = kFnvOffsetBasis;
+            for (size_t k = 0; k < count; k++) {
+                const DigestKey &key = keys[k];
+                const bool present = seen != nullptr
+                                         ? (((*seen)[key.section_index] >> key.field_index) & 1u) != 0
+                                         : key.field->has(in);
+                hash = fnv_text(hash, key.section);
+                hash = fnv_byte(hash, kSchemaSeparator);
+                hash = fnv_text(hash, key.field->key);
+                hash = fnv_byte(hash, kSchemaSeparator);
+                hash = fnv_byte(hash, present ? 1u : 0u);
+                if (!present) continue;
+                const uint64_t value = key.field->load(in);
+                for (int32_t i = 0; i < 8; i++) {
+                    hash = fnv_byte(hash, static_cast<uint8_t>(value >> (8 * i)));
+                }
+            }
+            return hash;
+        }
+
         size_t present_count(const Section &section,
                              const profile::kernel_offsets &in) {
             size_t n = 0;
@@ -258,7 +356,7 @@ namespace ghostlock::binary_profile {
 
         int32_t parse_v2(std::string_view document, profile::kernel_offsets *out,
                          char *release_buf, size_t release_buf_cap,
-                         component_ids *ids) {
+                         component_ids *ids, digests *out_digests) {
             const auto *bytes = reinterpret_cast<const uint8_t *>(document.data());
             const auto *end = bytes + document.size();
             if (document.size() < kHeaderSize) return -1;
@@ -290,6 +388,10 @@ namespace ghostlock::binary_profile {
             if (p + 2 > end) return -1;
             size_t sections = static_cast<size_t>(read_le(p, 2));
             p += 2;
+            /* Which keys the document actually carried, per section. Needed by
+             * the digest: absence is part of the schema stream. */
+            std::array<uint64_t, std::size(kSections)> seen{};
+            std::optional<uint64_t> transmitted;
             for (size_t s = 0; s < sections; s++) {
                 if (p + 1 > end) return -1;
                 const size_t name_len = *p++;
@@ -300,13 +402,16 @@ namespace ghostlock::binary_profile {
                 const size_t entries = static_cast<size_t>(read_le(p, 4));
                 p += 4;
                 const Section *section = nullptr;
+                size_t section_index = 0;
+                const bool digest_section = name == kDigestSection;
                 /* A route section only applies to the document's own route;
                  * other-route sections are ignored (never silently merged). */
                 if (!name.starts_with("route.") ||
                     name == route_section_name(out->route)) {
-                    for (const Section &candidate: kSections) {
-                        if (candidate.name == name) {
-                            section = &candidate;
+                    for (size_t i = 0; i < std::size(kSections); i++) {
+                        if (kSections[i].name == name) {
+                            section = &kSections[i];
+                            section_index = i;
                             break;
                         }
                     }
@@ -319,24 +424,39 @@ namespace ghostlock::binary_profile {
                                                key_len);
                     const uint64_t raw = read_le(p + key_len, 8);
                     p += key_len + 8;
+                    if (digest_section) {
+                        if (key == kDigestKey) transmitted = raw;
+                        continue;
+                    }
                     if (!section) continue;
                     for (size_t i = 0; i < section->count; i++) {
                         if (section->fields[i].key == key) {
                             section->fields[i].store(*out, raw);
+                            seen[section_index] |= uint64_t{1} << i;
                             break;
                         }
                     }
                 }
             }
+            /* Verified whether or not the caller asked for the values: a
+             * mismatch means this build and the app disagree about the schema,
+             * and running on it would use defaults for whatever went missing. */
+            const uint64_t computed = schema_digest(*out, &seen);
+            if (out_digests) {
+                out_digests->transmitted = transmitted;
+                out_digests->computed = computed;
+            }
+            if (transmitted && *transmitted != computed) return kDigestMismatch;
             if (ids) *ids = {frontend, backend, middleware};
             return 0;
         }
     } // namespace
 
     int32_t parse(std::string_view document, profile::kernel_offsets *out,
-                  char *release_buf, size_t release_buf_cap, component_ids *ids) {
+                  char *release_buf, size_t release_buf_cap, component_ids *ids,
+                  digests *out_digests) {
         if (!out || !release_buf || document.size() < kHeaderSize) return -1;
-        return parse_v2(document, out, release_buf, release_buf_cap, ids);
+        return parse_v2(document, out, release_buf, release_buf_cap, ids, out_digests);
     }
 
     int32_t serialize(const profile::kernel_offsets *in, char *buffer,
@@ -350,6 +470,8 @@ namespace ghostlock::binary_profile {
         const Section *emitted[std::size(kSections)];
         size_t emitted_count = 0;
         size_t total = kHeaderSize + release_length + 2;
+        /* The digest section is transport metadata, written by hand below. */
+        total += 1 + kDigestSection.size() + 4 + 1 + kDigestKey.size() + 8;
         for (const Section &section: kSections) {
             /* Only the active route's section is written. */
             if (section.name.starts_with("route.") &&
@@ -378,7 +500,8 @@ namespace ghostlock::binary_profile {
         memcpy(bytes + kHeaderSize, in->uname_r, release_length);
 
         uint8_t *p = bytes + kHeaderSize + release_length;
-        write_le(p, emitted_count, 2);
+        /* +1: the digest section written after this loop. */
+        write_le(p, emitted_count + 1, 2);
         p += 2;
         for (size_t s = 0; s < emitted_count; s++) {
             const Section &section = *emitted[s];
@@ -397,6 +520,18 @@ namespace ghostlock::binary_profile {
                 p += 8;
             }
         }
+        /* Every serialized document carries a digest over its own schema, so a
+         * round trip through parse() is verifiable (host tests, tooling). */
+        *p++ = static_cast<uint8_t>(kDigestSection.size());
+        memcpy(p, kDigestSection.data(), kDigestSection.size());
+        p += kDigestSection.size();
+        write_le(p, 1, 4);
+        p += 4;
+        *p++ = static_cast<uint8_t>(kDigestKey.size());
+        memcpy(p, kDigestKey.data(), kDigestKey.size());
+        p += kDigestKey.size();
+        write_le(p, schema_digest(*in, nullptr), 8);
+        p += 8;
         return static_cast<int32_t>(p - bytes);
     }
 } // namespace ghostlock::binary_profile

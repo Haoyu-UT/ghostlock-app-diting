@@ -17,6 +17,12 @@
 using namespace ghostlock;
 
 namespace {
+    /* FNV-1a over the canonical schema stream for the vector in the digest
+     * block. Asserted with the same value in the Kotlin test
+     * (profile-core `NativeProfileDigestTest`), which is what makes the two
+     * implementations a checked contract rather than two hopeful copies. */
+    constexpr uint64_t kGoldenSchemaDigest = 0xcc8fc4e3d6a4eadfull;
+
     void put_u16(std::string &out, uint16_t value) {
         out.push_back(static_cast<char>(value & 0xff));
         out.push_back(static_cast<char>((value >> 8) & 0xff));
@@ -341,6 +347,92 @@ int32_t main(void) {
         /* A profile without a declared route never serializes. */
         values.route = ghostlock::profile::kRouteAuto;
         assert(binary_profile::serialize(&values, buffer, sizeof(buffer)) == -1);
+    }
+
+    /* ---- Schema digest: round trip, tampering, and the cross-language vector.
+     *
+     * The digest covers the *schema* (every key both sides declare, present or
+     * not), so the Kotlin implementation in `NativeProfile.kt` and this one
+     * must produce the same number for the same document. The vector below is
+     * asserted identically in `NativeProfileDigestTest.kt`: it is the
+     * cross-language contract between the two implementations. ---- */
+    {
+        char buffer[8192];
+        profile::kernel_offsets golden = {};
+        golden.uname_r = "digest-vector";
+        golden.route = ghostlock::profile::kRouteSelectStack;
+        golden.meta.kernel_major = 5;
+        golden.misc.compact_waiter = 1;
+        golden.geometry.pselect_waiter_shift = -2;
+        golden.geometry.select_lock_anchor_image = 0x2a3a590;
+        golden.geometry.select_lock_anchor_bytes = 0x1000;
+        golden.geometry.select_lock_anchor_stride = 0x20;
+        golden.execution.select_enter_delay_us = 5000;
+        golden.execution.select_timeout_us = 30000;
+        const int32_t size = binary_profile::serialize(&golden, buffer, sizeof(buffer));
+        assert(size > 0);
+        binary_profile::digests digests{};
+        assert(binary_profile::parse(std::string_view(buffer, static_cast<size_t>(size)),
+                                     &parsed, release, sizeof(release), nullptr, &digests) == 0);
+        assert(digests.transmitted.has_value());
+        assert(digests.transmitted.value() == digests.computed);
+        assert(digests.transmitted.value() == kGoldenSchemaDigest);
+
+        /* Serializing twice is byte-identical: the digest is a function of the
+         * document, not of the run. */
+        char again[8192];
+        const int32_t again_size = binary_profile::serialize(&golden, again, sizeof(again));
+        assert(again_size == size);
+        assert(memcmp(again, buffer, static_cast<size_t>(size)) == 0);
+
+        /* A document from an app build that predates the digest parses, and
+         * says so — nothing can be verified. */
+        std::string legacy = build_doc(ghostlock::profile::kRouteSelectStack, "legacy",
+                                       {{"route.select_stack", {{"waiter_shift", -2}}}});
+        binary_profile::digests legacy_digests{};
+        assert(binary_profile::parse(std::string_view(legacy), &parsed, release, sizeof(release),
+                                     nullptr, &legacy_digests) == 0);
+        assert(!legacy_digests.transmitted.has_value());
+        assert(legacy_digests.computed != 0);
+
+        std::string document(buffer, static_cast<size_t>(size));
+
+        /* One value byte changed in transit. */
+        const size_t anchor_key = document.find("lock_anchor_image");
+        assert(anchor_key != std::string::npos);
+        std::string tampered = document;
+        tampered[anchor_key + std::strlen("lock_anchor_image")] ^= 0x01;
+        assert(parse_doc(tampered, &parsed, release, sizeof(release)) ==
+               binary_profile::kDigestMismatch);
+
+        /* A key the sender declared and this build does not decode — the way a
+         * new profile key once vanished between the document and the wire. It
+         * is present in the document, so the sender's schema counted it; this
+         * decode does not, and the streams diverge. */
+        std::string renamed = document;
+        renamed[anchor_key + std::strlen("lock_anchor_image") - 1] = 'X';
+        assert(parse_doc(renamed, &parsed, release, sizeof(release)) ==
+               binary_profile::kDigestMismatch);
+
+        /* A wrong digest, and a digest that is truncated away mid-entry. */
+        assert(parse_doc(build_doc(ghostlock::profile::kRouteSelectStack, "wrong",
+                                   {{"meta", {{"kernel_major", 5}}},
+                                    {"profile", {{"digest", 0x1234}}}},
+                                   binary_profile::kFrontendRootChild,
+                                   binary_profile::kBackendCve202643499),
+                         &parsed, release, sizeof(release)) ==
+               binary_profile::kDigestMismatch);
+        assert(parse_doc(document.substr(0, document.size() - 4), &parsed, release,
+                         sizeof(release)) == -1);
+
+        /* patches made after the digest was computed stay valid: safe_mode is
+         * excluded from the stream because the app rewrites it in transit. */
+        std::string safe = document;
+        const size_t safe_key = safe.find("safe_mode");
+        assert(safe_key != std::string::npos);
+        safe[safe_key + std::strlen("safe_mode")] = 1;
+        assert(parse_doc(safe, &parsed, release, sizeof(release)) == 0);
+        assert(parsed.meta.safe_mode == 1);
     }
 
     puts("profile_binary_test: ok");

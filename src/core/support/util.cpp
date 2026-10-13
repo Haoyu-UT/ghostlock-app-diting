@@ -149,6 +149,110 @@ namespace ghostlock::support {
                    (unsigned long long) ghostlock::profile::slide_sysctl_bootid());
     }
 
+    /* Machine state at a stage boundary: how fast the cores are actually
+     * running, how hot they are, how loaded the device is, and whether the
+     * spray has memory to work with.
+     *
+     * Why this exists: the exploit's windows are tens of milliseconds wide, and
+     * the tuning constants shipped in the profile were swept on one device in
+     * one thermal state. A log pulled from someone else's phone can show WHICH
+     * stage failed but not whether that phone was throttled, busy, or short of
+     * memory -- which is the first thing to rule out when a stage simply does
+     * not land. Nothing here was observable from a remote device before.
+     *
+     * Called only at stage boundaries, never inside a dance. This project has
+     * already lost a session to an instrument that perturbed the thing it was
+     * measuring (the heavy kprobe set), so the rule is: few calls, outside the
+     * window. Every field degrades to the literal "unreadable" rather than
+     * being dropped, so a value the platform refuses to expose reads as
+     * missing rather than as normal -- the same convention log_startup_context
+     * already uses for the SELinux enforce node. */
+    void log_environment(const char *tag) {
+        std::array<char, 32> online{};
+        std::array<char, 16> load{};
+        std::array<char, 24> batt{};
+        std::array<char, 16> capacity{};
+        std::array<char, 2048> meminfo{};
+        read_first_line("/sys/devices/system/cpu/online", online.data(), online.size());
+        read_first_line("/proc/loadavg", load.data(), load.size());
+        read_first_line("/sys/class/power_supply/battery/status", batt.data(), batt.size());
+        read_first_line("/sys/class/power_supply/battery/capacity", capacity.data(), capacity.size());
+
+        long total_kb = -1;
+        long avail_kb = -1;
+        support::UniqueFd fd(open("/proc/meminfo", O_RDONLY | O_CLOEXEC));
+        if (fd.valid()) {
+            const ssize_t n = read(fd.get(), meminfo.data(), meminfo.size() - 1);
+            if (n > 0) {
+                meminfo[static_cast<size_t>(n)] = 0;
+                const char *at = strstr(meminfo.data(), "MemTotal:");
+                if (at) total_kb = strtol(at + strlen("MemTotal:"), nullptr, 10);
+                at = strstr(meminfo.data(), "MemAvailable:");
+                if (at) avail_kb = strtol(at + strlen("MemAvailable:"), nullptr, 10);
+            }
+        }
+        pr_info("env[%s] cpu_online=%s load=%s mem_total_kb=%ld mem_avail_kb=%ld "
+                "battery=%s/%s%%\n", tag, online.data(), load.data(), total_kb,
+                avail_kb, batt.data(), capacity.data());
+
+        /* Current frequency per CPU, in kHz. The race is pinned to two cores,
+         * and a throttled cluster is the leading non-obvious reason a window is
+         * missed -- but the node is vendor-gated on some builds, so unreadable
+         * is itself a finding. */
+        char freq[256] = {};
+        for (int cpu = 0; cpu < 8; cpu++) {
+            std::array<char, 64> path{};
+            std::array<char, 24> value{};
+            snprintf(path.data(), path.size(),
+                     "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", cpu);
+            read_first_line(path.data(), value.data(), value.size());
+            const size_t used = strlen(freq);
+            if (used + 24 >= sizeof(freq)) break;
+            snprintf(freq + used, sizeof(freq) - used, "%s%d=%s", used ? "," : "",
+                     cpu, value.data());
+        }
+        pr_info("env[%s] freq_khz=%s\n", tag, freq);
+
+        /* Only the zones that track the clusters the race runs on. Enumerating
+         * by index instead fills the line with modem, antenna and mmwave
+         * sensors -- this SoC puts them first -- and the buffer runs out before
+         * reaching cpuss/gpuss, which are the ones that say whether the cores
+         * were throttled. Matched by prefix because zone names differ per SoC;
+         * the temperature node is only read for a zone that already matched, so
+         * a non-matching zone costs one open, not two. */
+        static const char *const kClusterZones[] = {
+            "cpuss", "gpuss", "aoss", "cpu", "gpu", "soc", "pa"
+        };
+        char thermal[512] = {};
+        size_t matched = 0;
+        for (int zone = 0; zone < 32; zone++) {
+            std::array<char, 64> path{};
+            std::array<char, 48> type{};
+            std::array<char, 16> temp{};
+            snprintf(path.data(), path.size(),
+                     "/sys/class/thermal/thermal_zone%d/type", zone);
+            read_first_line(path.data(), type.data(), type.size());
+            bool keep = false;
+            for (const char *prefix : kClusterZones) {
+                if (strncmp(type.data(), prefix, strlen(prefix)) == 0) {
+                    keep = true;
+                    break;
+                }
+            }
+            if (!keep) continue;
+            matched++;
+            snprintf(path.data(), path.size(),
+                     "/sys/class/thermal/thermal_zone%d/temp", zone);
+            read_first_line(path.data(), temp.data(), temp.size());
+            const size_t used = strlen(thermal);
+            if (used + 64 >= sizeof(thermal)) break;
+            snprintf(thermal + used, sizeof(thermal) - used, "%s%s=%s",
+                     used ? "," : "", type.data(), temp.data());
+        }
+        pr_info("env[%s] thermal_zone_c=%s\n", tag,
+                matched ? thermal : "none-matched");
+    }
+
     void disable_rseq_for_thread(void) {
         return;
     }

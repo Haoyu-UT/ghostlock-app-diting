@@ -629,6 +629,26 @@ namespace ghostlock::route {
                          stored_slots, static_cast<unsigned long long>(geom.slots),
                          stored_next);
                 next = geom.slots;
+            } else if (config::runtime_config_snapshot().anchor_trusted) {
+                /* No file, but the app proved this install's data predates the
+                 * boot: any run this boot would have written the file, so its
+                 * absence proves the region is still zeroed and slot 0 is safe.
+                 * Without the flag this case used to be a dead end -- the file
+                 * is written only after this check passes, so a clean install
+                 * could never create one, and a reboot could not either. The
+                 * flag is withheld when the install postdates the boot, because
+                 * then a previous install's runs may have poisoned the region
+                 * and a reboot really is the only fix. */
+                if (!write_anchor_state(state_path, boot_id, 0, geom.slots)) {
+                    pr_error("[route] anchor slot state is missing and cannot be created in %s; "
+                             "refusing to start from a slot this boot may already have spent\n",
+                             state_path.c_str());
+                    next = geom.slots;
+                } else {
+                    pr_info("[route] anchor slots: no state file and this install predates the "
+                            "boot; starting at 0/%llu\n",
+                            static_cast<unsigned long long>(geom.slots));
+                }
             } else {
                 /* No usable reservation file, and there is NO safe guess: which
                  * slots this boot already spent is unknowable (a clean reinstall

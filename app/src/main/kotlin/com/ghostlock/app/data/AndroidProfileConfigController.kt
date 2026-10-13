@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import androidx.core.content.edit
 import androidx.core.net.toUri
+import com.ghostlock.app.BuildConfig
 import com.ghostlock.app.data.profile.CpuPairView
 import com.ghostlock.app.data.profile.ProfileMerger
 import com.ghostlock.app.data.profile.ProfileResolver
@@ -12,6 +13,7 @@ import com.ghostlock.app.domain.model.CpuPair
 import com.ghostlock.app.domain.model.ExecutionFieldValue
 import com.ghostlock.app.domain.model.ProfileConfig
 import com.ghostlock.app.domain.model.ProfileFieldNode
+import com.ghostlock.app.domain.model.ProfileLayers
 import com.ghostlock.app.domain.repository.ProfileConfigController
 import java.io.File
 import java.nio.charset.StandardCharsets
@@ -26,6 +28,12 @@ import java.nio.charset.StandardCharsets
  * Imported profiles come verbatim from [userProfiles]; every edit (general,
  * route/fallback and advanced) persists as a sparse override in preferences,
  * so stored user documents are never rewritten.
+ *
+ * Layer policy (PORT-PLAN Phase 8 §B): a **bundled** profile is authoritative
+ * for the device's own release, so a loaded import does not shadow it, and the
+ * override layer applies only when it was written by the build that is running.
+ * Both rules only decide what is *applied*; nothing on disk is moved or
+ * deleted, and the disabled layers stay exportable.
  */
 internal class AndroidProfileConfigController(
     context: Context,
@@ -40,40 +48,56 @@ internal class AndroidProfileConfigController(
     private val forcedUserProfile: String? = null,
     /** Editing sessions also pin the builtin source of the live controller. */
     private val forcedBuiltinRelease: String? = null,
+    /** Build identity compared against the one that wrote the overrides. */
+    private val buildIdentity: String = BuildConfig.BUILD_IDENTITY,
 ) : ProfileConfigController {
     private val appContext = context.applicationContext
     private val assetLoader = AssetConfigLoader(appContext)
     private val lock = Any()
-    private var cachedRelease: String? = null
-    private var cachedProfile: Profile? = null
 
     override suspend fun load(release: String, pair: CpuPair): ProfileConfig {
         val deviceRelease = release
-        val advanced = readAdvancedOverride(deviceRelease)
-        val full = resolveCurrent(deviceRelease, pair, advanced, includeImported = true)
+        val stored = readAdvancedOverride(deviceRelease).takeIf { it.isNotEmpty() }
+        val applied = effectiveOverrides(deviceRelease)
+        val resolution = resolveCurrent(deviceRelease, pair, applied, includeImported = true)
+        val full = resolution.profile
         if (full == null) {
-            cache(deviceRelease, null)
-            return ProfileConfig(release = deviceRelease, hasProfile = false)
+            return ProfileConfig(release = deviceRelease, hasProfile = false, pair = pair)
         }
-        val baseline = resolveCurrent(deviceRelease, pair, null, includeImported = false) ?: full
-        val route = routeNameOf(full)
-        val fallbackTo = fallbackTargetOf(full)
-        val invalidPaths = validateProfileFields(full, route, fallbackTo) +
-            ProfileResolver.validateMerged(full, route, fallbackTo).mapTo(mutableSetOf()) { it.fieldPath }
+        val appliedRoute = routeNameOf(full)
+        val appliedFallback = fallbackTargetOf(full)
+        val invalidPaths = validateProfileFields(full, appliedRoute, appliedFallback) +
+            ProfileResolver.validateMerged(full, appliedRoute, appliedFallback)
+                .mapTo(mutableSetOf()) { it.fieldPath }
+        /* The editor renders the *stored* layer even when the policy keeps it
+         * out of the run, so a disabled override is visible and saving it
+         * re-enables the layer instead of silently dropping values the user
+         * cannot see (§B.7). What runs is `full`. */
+        val view = if (stored != null && stored != applied) {
+            resolveCurrent(deviceRelease, pair, stored, includeImported = true).profile ?: full
+        } else {
+            full
+        }
+        val route = routeNameOf(view)
+        val fallbackTo = fallbackTargetOf(view)
         /* Invalid fields missing from the resolved document still get a row,
          * otherwise the run stays blocked with no red field to fix. */
-        materializeInvalidPaths(full, invalidPaths)
+        materializeInvalidPaths(view, invalidPaths)
         /* The editor shows every field of the active route plus the shared
          * geometry, so a field the profile did not carry appears as an
          * editable `null` row instead of being invisible. */
-        val complete = completeProfileFields(full, route, fallbackTo)
-        val roots = buildTree(complete, "", baseline, advanced)
-        cache(deviceRelease, buildNativeDocument(deviceRelease, full))
+        val complete = completeProfileFields(view, route, fallbackTo)
+        val baseline = resolveCurrent(deviceRelease, pair, null, includeImported = false).profile ?: full
+        val roots = buildTree(complete, "", baseline, stored ?: valueMapOf())
         return ProfileConfig(
             release = deviceRelease,
             hasProfile = true,
+            pair = pair,
+            layers = resolution.layers.copy(
+                uncarriedKeys = uncarriedRouteKeys(full, appliedRoute),
+            ),
             roots = roots,
-            general = generalFields(full, baseline, route, fallbackTo),
+            general = generalFields(view, baseline, route, fallbackTo),
             route = route,
             fallbackTo = fallbackTo,
             invalidPaths = invalidPaths,
@@ -327,7 +351,7 @@ internal class AndroidProfileConfigController(
         /* Rebuild the sparse override from scratch: only values that differ from
          * the baseline survive, so untouched fields (including stale entries
          * from older builds) can never stay highlighted. */
-        val baseline = resolveCurrent(release, pair, null, includeImported = true)
+        val baseline = resolveCurrent(release, pair, null, includeImported = true).profile
         if (baseline != null) {
             val rebuilt = valueMapOf()
             for ((path, value) in values) {
@@ -410,8 +434,8 @@ internal class AndroidProfileConfigController(
     /** Renders the resolved profile (built-in + imported + overrides) as HOCON. */
     fun renderResolved(release: String, pair: CpuPair): String? {
         val resolved = resolveCurrent(
-            release, pair, readAdvancedOverride(release), includeImported = true,
-        ) ?: return null
+            release, pair, effectiveOverrides(release), includeImported = true,
+        ).profile ?: return null
         val view = resolved.copyValue().asValueMap() ?: return null
         view["schema_version"] = 1
         view["release"] = release
@@ -425,8 +449,8 @@ internal class AndroidProfileConfigController(
     /** Renders the resolved profile verbatim (no trimming) for debug dumps. */
     fun renderResolvedForDebug(release: String, pair: CpuPair): String? {
         val resolved = resolveCurrent(
-            release, pair, readAdvancedOverride(release), includeImported = true,
-        ) ?: return null
+            release, pair, effectiveOverrides(release), includeImported = true,
+        ).profile ?: return null
         val view = resolved.copyValue().asValueMap() ?: return null
         return HoconSupport.render(view)
     }
@@ -437,9 +461,15 @@ internal class AndroidProfileConfigController(
         return runCatching { userProfiles.save(fileName, text) }.isSuccess
     }
 
-    /** Sparse overrides stored for [release]; seeds an editing session. */
+    /**
+     * Sparse overrides stored for [release], applied or not; seeds an editing
+     * session, which must show the stored values rather than the effective ones.
+     */
     fun overridesSnapshot(release: String): ValueMap =
         readAdvancedOverride(release).copyValue().asValueMap() ?: valueMapOf()
+
+    /** Build that wrote the stored overrides, for a session that seeds them. */
+    fun overridesBuildStamp(): String? = storedOverridesBuild()
 
     /** Replaces the sparse overrides stored for [release]. */
     fun replaceOverrides(release: String, override: ValueMap) {
@@ -502,8 +532,18 @@ internal class AndroidProfileConfigController(
         return load(deviceRelease, pair)
     }
 
+    /**
+     * Resolved on demand: a cached document was keyed on the release alone
+     * while the result also depends on the imported layer, the overrides and
+     * the CPU pair (PORT-PLAN Phase 8 §F). [ProfileConfig] carries the pair for
+     * exactly this reason.
+     */
     override fun nativeDocument(config: ProfileConfig): ByteArray? = synchronized(lock) {
-        if (cachedRelease == config.release) cachedProfile?.toBinary() else null
+        val resolved = resolveCurrent(
+            config.release, config.pair, effectiveOverrides(config.release),
+            includeImported = true,
+        ).profile ?: return@synchronized null
+        buildNativeDocument(config.release, resolved)?.toBinary()
     }
 
     /** Builds the single resolved authority native consumes at run time. */
@@ -519,13 +559,16 @@ internal class AndroidProfileConfigController(
 
     // ---- resolution (migrated from ProfileConfiguration) ----
 
+    /** One resolve: the merged document plus which layers went into it. */
+    private data class Resolution(val profile: ValueMap?, val layers: ProfileLayers)
+
     /** Resolves through the currently selected builtin release (if any). */
     private fun resolveCurrent(
         deviceRelease: String,
         pair: CpuPair,
         overrides: ValueMap?,
         includeImported: Boolean,
-    ): ValueMap? {
+    ): Resolution {
         val profileRelease = activeBuiltinRelease() ?: deviceRelease
         return resolve(deviceRelease, profileRelease, pair, overrides, includeImported)
     }
@@ -536,42 +579,107 @@ internal class AndroidProfileConfigController(
         pair: CpuPair,
         overrides: ValueMap?,
         includeImported: Boolean,
-    ): ValueMap? = runCatching {
-        val index = readIndex() ?: return@runCatching null
-        require((index["schema_version"] as? Number)?.toInt() == 1) { "unsupported profile schema" }
-        val builtinEntry = findProfile(index["profiles"].asValueList(), profileRelease)
-        val imported = if (includeImported) {
-            userProfiles.loadEntry(deviceRelease, activeUserProfile())
-        } else {
-            null
-        }
-        LegacyProfileConverter.convertValue(overrides)
-        if (builtinEntry == null && imported == null) return@runCatching null
-        val builtin = builtinEntry?.let { entry ->
-            val path = (entry["file"] as? String).orEmpty()
-            (HoconSupport.parseValue(readAsset("$BuiltinDirectory/$path")).asValueMap()
-                ?: error("profile is not an object"))
-                .also {
-                    require((it["schema_version"] as? Number)?.toInt() == 1) { "unsupported profile schema" }
-                    require(it["release"] == entry["release"]) {
-                        "profile index release mismatch"
+    ): Resolution {
+        val nothing = ProfileLayers(build = buildIdentity)
+        return runCatching {
+            val index = readIndex() ?: return@runCatching Resolution(null, nothing)
+            require((index["schema_version"] as? Number)?.toInt() == 1) {
+                "unsupported profile schema"
+            }
+            val profiles = index["profiles"].asValueList()
+            val builtinEntry = findProfile(profiles, profileRelease)
+            /* §B.5: a bundled profile for the device's own release is
+             * authoritative, so a loaded import does not shadow it. A builtin
+             * selected by hand (the escape hatch) is not the bundled match, and
+             * leaves the older behaviour in place. */
+            val selectedBuiltin = activeBuiltinRelease()
+            val bundledAuthoritative =
+                selectedBuiltin == null && findProfile(profiles, deviceRelease) != null
+            val importedName = activeUserProfile()
+            val importedApplied = includeImported && !bundledAuthoritative && importedName != null
+            val imported = if (importedApplied) {
+                userProfiles.loadEntry(deviceRelease, importedName)
+            } else {
+                null
+            }
+            val layers = ProfileLayers(
+                builtinRelease = builtinEntry?.get("release") as? String,
+                bundledAuthoritative = bundledAuthoritative,
+                builtinSelected = selectedBuiltin != null,
+                imported = importedName,
+                importedApplied = importedApplied,
+                overridesPresent = readAdvancedOverride(deviceRelease).isNotEmpty(),
+                overridesApplied = overrides != null,
+                overridesBuild = storedOverridesBuild()?.takeIf { it != buildIdentity },
+                build = buildIdentity,
+            )
+            LegacyProfileConverter.convertValue(overrides)
+            if (builtinEntry == null && imported == null) {
+                return@runCatching Resolution(null, layers)
+            }
+            val builtin = builtinEntry?.let { entry ->
+                val path = (entry["file"] as? String).orEmpty()
+                (HoconSupport.parseValue(readAsset("$BuiltinDirectory/$path")).asValueMap()
+                    ?: error("profile is not an object"))
+                    .also {
+                        require((it["schema_version"] as? Number)?.toInt() == 1) {
+                            "unsupported profile schema"
+                        }
+                        require(it["release"] == entry["release"]) {
+                            "profile index release mismatch"
+                        }
                     }
-                }
-        }
-        val tuningExecution = readExecutionTuning()?.get("execution").asValueMap()
-        val routePresets = ProfileConfig.Routes
-            .mapNotNull { route -> readExecutionRoute(route)?.let { route to it } }
-            .toMap()
-        ProfileMerger.resolveMerged(
-            deviceRelease = deviceRelease,
-            builtin = builtin,
-            imported = imported,
-            overrides = overrides,
-            tuningExecution = tuningExecution,
-            pair = CpuPairView(pair.primary, pair.consumer),
-            routePresets = routePresets,
-        )
-    }.getOrNull()
+            }
+            val tuningExecution = readExecutionTuning()?.get("execution").asValueMap()
+            val routePresets = ProfileConfig.Routes
+                .mapNotNull { route -> readExecutionRoute(route)?.let { route to it } }
+                .toMap()
+            Resolution(
+                ProfileMerger.resolveMerged(
+                    deviceRelease = deviceRelease,
+                    builtin = builtin,
+                    imported = imported,
+                    overrides = overrides,
+                    tuningExecution = tuningExecution,
+                    pair = CpuPairView(pair.primary, pair.consumer),
+                    routePresets = routePresets,
+                ),
+                layers,
+            )
+        }.getOrElse { Resolution(null, nothing) }
+    }
+
+    /**
+     * Keys the resolved profile states in its **active route branch** that no
+     * wire section declares: settings the profile asks for and the transport
+     * cannot deliver. This is the check that would have caught the lock anchor
+     * vanishing between the resolved document and the wire. The fallback branch
+     * is excluded on purpose — its geometry belongs to another route's section
+     * and never crosses the transport either way.
+     */
+    private fun uncarriedRouteKeys(profile: ValueMap, route: String?): List<String> {
+        val release = profile["release"] as? String ?: return emptyList()
+        val known = buildNativeDocument(release, profile)?.document?.wireKeys() ?: return emptyList()
+        val branch = route?.let { name -> profile["route"].asValueMap()?.get(name).asValueMap() }
+            ?: return emptyList()
+        return branch.keys.filterIsInstance<String>().filterNot { it in known }.sorted()
+    }
+
+    /**
+     * Sparse overrides as they apply to a run: the stored map, or null when a
+     * different build wrote it (§B.7). Any upgrade, downgrade or reinstall
+     * disables the layer; writing from the editor stamps the running build and
+     * re-enables it. Nothing is deleted, so the editor and the exported
+     * documents still carry the values.
+     */
+    private fun effectiveOverrides(release: String): ValueMap? {
+        val stored = readAdvancedOverride(release)
+        if (stored.isEmpty()) return null
+        return if (storedOverridesBuild() == buildIdentity) stored else null
+    }
+
+    private fun storedOverridesBuild(): String? =
+        preferences.getString(PrefOverridesBuildSha, null)?.takeIf { it.isNotEmpty() }
 
     /**
      * Native decodes one complete `execution.routes` object, while profiles only
@@ -792,11 +900,6 @@ internal class AndroidProfileConfigController(
 
     // ---- persistence ----
 
-    private fun cache(release: String, profile: Profile?) = synchronized(lock) {
-        cachedRelease = release
-        cachedProfile = profile
-    }
-
     private fun readDebugOverrides(): ValueMap {
         val raw = preferences.getString(PrefDebugProfileOverrides, null) ?: return valueMapOf()
         return runCatching { HoconSupport.parseValue(raw).asValueMap() ?: valueMapOf() }
@@ -810,7 +913,15 @@ internal class AndroidProfileConfigController(
     private fun writeAdvancedOverride(release: String, override: ValueMap) {
         val all = readDebugOverrides()
         if (override.isEmpty()) all.remove(release) else all[release] = override
-        preferences.edit { putString(PrefDebugProfileOverrides, HoconSupport.render(all)) }
+        preferences.edit {
+            putString(PrefDebugProfileOverrides, HoconSupport.render(all))
+            /* The stamp is what keeps an override alive across a restart and
+             * not across a rebuild: writing one re-enables the layer for the
+             * running build (§B.7). Nothing persists `versionCode` — it is
+             * always readable from the installed package (§D.14). */
+            if (all.isEmpty()) remove(PrefOverridesBuildSha)
+            else putString(PrefOverridesBuildSha, buildIdentity)
+        }
     }
 
     /* profile-export: the merged profile also lives as a plain HOCON file in the
@@ -818,8 +929,8 @@ internal class AndroidProfileConfigController(
     private fun persistSnapshot(release: String, pair: CpuPair) {
         runCatching {
             val resolved = resolveCurrent(
-                release, pair, readAdvancedOverride(release), includeImported = true,
-            ) ?: return
+                release, pair, effectiveOverrides(release), includeImported = true,
+            ).profile ?: return
             val exportView = resolved.copyValue().asValueMap() ?: return
             /* Renderer-side completeness: pull in the tuning of the selected
              * route and its fallback, then drop the groups that are not used. */
@@ -827,7 +938,6 @@ internal class AndroidProfileConfigController(
             trimRouteTuning(exportView)
             File(filesDir, snapshotName(release))
                 .writeText(HoconSupport.render(exportView), StandardCharsets.UTF_8)
-            cache(release, buildNativeDocument(release, resolved))
         }.onFailure {
             android.util.Log.e("GhostLock", "persistSnapshot failed for $release", it)
         }
@@ -888,5 +998,8 @@ internal class AndroidProfileConfigController(
         private const val PrefBuiltinRelease = "debug_builtin_release"
         private const val PrefActiveUserProfile = "active_user_profile"
         const val PrefDebugProfileOverrides = "debug_profile_overrides"
+
+        /** Build identity that wrote [PrefDebugProfileOverrides]; §B.7 gate. */
+        const val PrefOverridesBuildSha = "debug_profile_overrides_build"
     }
 }

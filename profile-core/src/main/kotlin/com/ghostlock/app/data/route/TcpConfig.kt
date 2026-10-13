@@ -15,6 +15,9 @@ data class TcpConfig(
         "post_receive_hold_iterations" to postReceiveHoldIterations.toULong(),
     )
 
+    /** Mirrors native `kRouteTcp`; all three are always written. */
+    override fun keys(): List<String> = SchemaKeys
+
     override fun apply(key: String, value: ULong): RouteConfig = when (key) {
         "attempts" -> copy(attempts = value.toUInt())
         "arm_sequence" -> copy(armSequence = value.toUInt())
@@ -23,6 +26,10 @@ data class TcpConfig(
     }
 
     companion object {
+        private val SchemaKeys = listOf(
+            "attempts", "arm_sequence", "post_receive_hold_iterations",
+        )
+
         val EMPTY = TcpConfig(0u, 0u, 0u)
 
         fun from(value: (String) -> Long?): TcpConfig = TcpConfig(
