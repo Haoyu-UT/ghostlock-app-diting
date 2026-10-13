@@ -10,6 +10,9 @@ data class MulticastConfig(
         geometry.lockOffset?.let { add("lock_offset" to it.toULong()) }
     }
 
+    /** Mirrors native `kRouteMulticast`; all four are optional. */
+    override fun keys(): List<String> = SchemaKeys
+
     override fun apply(key: String, value: ULong): RouteConfig = when (key) {
         "waiter_off" -> copy(geometry = geometry.copy(waiterOff = value.toLong().toInt()))
         "buffer_size" -> copy(geometry = geometry.copy(bufferSize = value.toUInt()))
@@ -19,6 +22,8 @@ data class MulticastConfig(
     }
 
     companion object {
+        private val SchemaKeys = listOf("waiter_off", "buffer_size", "task_offset", "lock_offset")
+
         val EMPTY = MulticastConfig(
             geometry = MulticastGeometry(null, null, null, null),
         )

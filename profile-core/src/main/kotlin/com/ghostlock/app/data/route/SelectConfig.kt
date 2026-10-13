@@ -38,6 +38,9 @@ data class SelectConfig(
         timeoutUs?.let { add("timeout_us" to it.toULong()) }
     }
 
+    /** Mirrors native `kRouteSelect`; the order is not significant. */
+    override fun keys(): List<String> = SchemaKeys
+
     override fun apply(key: String, value: ULong): RouteConfig = when (key) {
         "waiter_shift" -> copy(waiterShift = value.toLong().toInt())
         "compact_waiter" -> copy(compactWaiter = value.toUByte())
@@ -50,6 +53,11 @@ data class SelectConfig(
     }
 
     companion object {
+        private val SchemaKeys = listOf(
+            "waiter_shift", "compact_waiter", "lock_anchor_image", "lock_anchor_bytes",
+            "lock_anchor_stride", "enter_delay_us", "timeout_us",
+        )
+
         val EMPTY = SelectConfig(null, null, null, null)
 
         fun from(value: (String) -> Long?): SelectConfig = SelectConfig(

@@ -40,6 +40,7 @@ int main(int argc, char **argv) {
             static_cast<uint16_t>(runtime::BackendKind::Cve2026_43499),
             0,
         };
+        binary_profile::digests digests{};
 
         bool app_call = false;
         bool force_attack = false;
@@ -75,20 +76,37 @@ int main(int argc, char **argv) {
 
         int32_t loaded;
         if (prebuilt_path != nullptr) {
-            loaded = profile_entry::read_glk1_file(prebuilt_path, &decoded, release_buf.data(), release_buf.size(), &ids);
+            loaded = profile_entry::read_glk1_file(prebuilt_path, &decoded, release_buf.data(),
+                                                   release_buf.size(), &ids, &digests);
         } else if (app_call) {
             loaded = status_record
                          ? profile_entry::read_glk1_frame_stdin(
-                               &decoded, release_buf.data(), release_buf.size(), &ids)
+                               &decoded, release_buf.data(), release_buf.size(), &ids, &digests)
                          : profile_entry::read_glk1_stdin(
-                               &decoded, release_buf.data(), release_buf.size(), &ids);
+                               &decoded, release_buf.data(), release_buf.size(), &ids, &digests);
         } else {
             pr_error("no entrypoint: pass --ghostlock-app-call or --load-prebuilt-profile <bin>\n");
             return 1;
         }
+        if (loaded == binary_profile::kDigestMismatch) {
+            /* The app's schema and this build's disagree about which keys cross
+             * the transport (or the payload was corrupted); running on it would
+             * use defaults for whatever went missing. */
+            pr_error("profile digest mismatch: sent=0x%016llx computed=0x%016llx\n",
+                     static_cast<unsigned long long>(digests.transmitted.value_or(0)),
+                     static_cast<unsigned long long>(digests.computed));
+            throw FatalError{};
+        }
         if (loaded != 0) {
             pr_error("cannot load profile\n");
             throw FatalError{};
+        }
+        if (digests.transmitted) {
+            pr_info("profile digest=0x%016llx verified (recomputed 0x%016llx)\n",
+                    static_cast<unsigned long long>(*digests.transmitted),
+                    static_cast<unsigned long long>(digests.computed));
+        } else {
+            pr_info("profile digest: absent (app build predates it)\n");
         }
 
         auto &session = session::g_exploit_session;

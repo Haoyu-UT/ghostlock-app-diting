@@ -23,6 +23,7 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
         consumerCpu: Int,
         safeMode: Boolean,
         forceAttack: Boolean,
+        anchorTrusted: Boolean,
         profileBlob: ByteArray,
         debugDir: String?,
         callback: IGhostlockCallback,
@@ -92,6 +93,11 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
                         environment()["TMPDIR"] = workDir.absolutePath
                         environment()["HOME"] = workDir.absolutePath
                         environment()["GHOSTLOCK_KSU_LOG"] = ksuLog.absolutePath
+                        /* Computed by the app (this service cannot read the
+                         * package's install time); see InstallClock. */
+                        if (anchorTrusted) {
+                            environment()["GHOSTLOCK_ANCHOR_TRUSTED"] = "1"
+                        }
                     }
                     .start()
                     .let { process ->

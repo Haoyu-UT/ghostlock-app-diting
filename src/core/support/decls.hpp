@@ -13,6 +13,10 @@ namespace ghostlock::support {
 
     void log_startup_context(void);
 
+    /* Machine state at a stage boundary -- cores' actual speed, temperature,
+     * load and free memory. See the definition for why it is called rarely. */
+    void log_environment(const char *tag);
+
     void log_sync(void);
 
     [[noreturn]] void fail_stop_dirty_race(const char *reason,

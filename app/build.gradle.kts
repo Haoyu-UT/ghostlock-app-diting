@@ -25,6 +25,22 @@ val gitVersionCode = runCatching {
     1
 }
 
+/* Build identity for the profile layer policy (PORT-PLAN Phase 8 §D): the
+ * stored override layer applies only when the installed build wrote it, so this
+ * has to change on every build — `--dirty` is part of the identity, not noise.
+ * `versionCode` cannot do this job: it counts commits, so two builds of one
+ * commit (dirty and clean) would be indistinguishable.
+ * Like versionCode above, this is captured when Gradle configures the build, so
+ * a rebuild that reuses the configuration cache can carry the previous value. */
+val gitBuildIdentity = runCatching {
+    providers.exec {
+        commandLine("git", "describe", "--always", "--dirty")
+    }.standardOutput.asText.get().trim()
+}.getOrElse {
+    logger.warn("git describe failed (${it.message}); build identity falls back to unknown")
+    "unknown"
+}
+
 val buildInfoSrc = layout.buildDirectory.dir("generated/source/buildInfo")
 
 val generateBuildInfo = tasks.register("generateBuildInfo") {
@@ -69,6 +85,7 @@ android {
         targetSdk = 37
         versionCode = gitVersionCode
         versionName = appVersionName
+        buildConfigField("String", "BUILD_IDENTITY", "\"$gitBuildIdentity\"")
     }
     androidResources {
         localeFilters += listOf("en", "zh")

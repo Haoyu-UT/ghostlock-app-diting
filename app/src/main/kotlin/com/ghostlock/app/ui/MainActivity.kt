@@ -45,9 +45,11 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-    private val folderPicker = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
-        viewModel.onDebugExportLocationPicked(uri?.let(::documentTreeRelativePath))
-    }
+    /* The run log leaves the device as a zip the user names and places. */
+    private val runLogDocumentCreator =
+        registerForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri: Uri? ->
+            viewModel.onExportRunLogDocumentPicked(uri?.toString())
+        }
 
     private val profileDocumentCreator =
         /* octet-stream, not text/plain: SAF appends ".txt" to a text/plain
@@ -57,13 +59,6 @@ class MainActivity : ComponentActivity() {
             viewModel.onExportProfileDocumentPicked(uri?.toString())
         }
 
-    /** Maps a SAF tree URI to the external-storage-relative MediaStore path. */
-    private fun documentTreeRelativePath(uri: Uri): String? {
-        val documentId = runCatching { DocumentsContract.getTreeDocumentId(uri) }.getOrNull()
-            ?: return null
-        if (!documentId.startsWith("primary:")) return null
-        return documentId.substringAfter(':').trim('/').ifEmpty { null }
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -100,7 +95,8 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            GhostlockEffect.PickDebugFolder -> folderPicker.launch(null)
+            is GhostlockEffect.CreateRunLogDocument ->
+                runLogDocumentCreator.launch(effect.suggestedName)
 
             is GhostlockEffect.CreateProfileDocument ->
                 profileDocumentCreator.launch(effect.suggestedName)
@@ -208,8 +204,11 @@ private fun GhostlockRoute(
             override fun onCloseAdvanced() = viewModel.onCloseAdvanced()
             override fun onShowAbout() = viewModel.onShowAbout()
             override fun onCloseAbout() = viewModel.onCloseAbout()
-            override fun onDebugExportChanged(enabled: Boolean) = viewModel.onDebugExportChanged(enabled)
-            override fun onDebugExportLocationPick() = viewModel.onDebugExportLocationPick()
+            override fun onDialogExportLog() = viewModel.onDialogExportLog()
+            override fun onExportRunLog() = viewModel.onExportRunLog()
+            override fun onRunLogSelected(stamp: String) = viewModel.onRunLogSelected(stamp)
+            override fun onRunLogPickerDismiss() = viewModel.onRunLogPickerDismiss()
+            override fun onClearRunLogs() = viewModel.onClearRunLogs()
             override fun onDebugKernelLogChanged(enabled: Boolean) =
                 viewModel.onDebugKernelLogChanged(enabled)
 

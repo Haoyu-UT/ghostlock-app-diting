@@ -23,11 +23,16 @@
 #include <cstddef>
 #include <cstdint>
 
+#include <optional>
 #include <string_view>
 
 namespace ghostlock::binary_profile {
     inline constexpr uint32_t kMagic = 0x0D000721u;
     inline constexpr uint16_t kVersion = 2u;
+
+    /* parse() return codes: 0 ok, -1 malformed document, -2 the document's
+     * schema digest does not match the schema this build decodes. */
+    inline constexpr int32_t kDigestMismatch = -2;
     /* Known component ids. The full catalog is decoded here; an id that is
      * known but unavailable (UMH / cve_2026_64560) is accepted at decode time
      * and rejected by the orchestrator before the attack starts. */
@@ -54,10 +59,23 @@ namespace ghostlock::binary_profile {
         uint16_t middleware;
     };
 
-    /* Parse one binary document into the native transport struct. `ids`, when
-     * given, receives the decoded component selection. */
+    /* Schema digest as it crossed the transport, plus the one recomputed here.
+     * Transport metadata like component_ids, and kept out of kernel_offsets for
+     * the same reason: the attack codegen must not move because a check was
+     * added. `transmitted` is empty for a document from an app build that
+     * predates the digest, and then nothing can be verified. */
+    struct digests {
+        std::optional<uint64_t> transmitted;
+        uint64_t computed = 0;
+    };
+
+    /* Parse one binary document into the native transport struct. `ids` and
+     * `out_digests`, when given, receive the decoded component selection and the
+     * schema digest. A document whose digest does not match this build's schema
+     * is rejected with kDigestMismatch rather than decoded silently. */
     int32_t parse(std::string_view document, struct ghostlock::profile::kernel_offsets *out,
-              char *release_buf, size_t release_buf_cap, component_ids *ids = nullptr);
+              char *release_buf, size_t release_buf_cap, component_ids *ids = nullptr,
+              digests *out_digests = nullptr);
 
     /* Serialize the same layout (host tests and tooling). */
     int32_t serialize(const struct ghostlock::profile::kernel_offsets *in, char *buffer, size_t capacity);

@@ -7,6 +7,7 @@ import com.ghostlock.app.domain.model.OffsetCandidate
 import com.ghostlock.app.domain.model.OffsetImportResult
 import com.ghostlock.app.domain.model.ParseResult
 import com.ghostlock.app.domain.model.ProfileConfig
+import com.ghostlock.app.domain.model.RunLogEntry
 import com.ghostlock.app.domain.model.UserProfileFile
 
 interface GhostlockRepository {
@@ -18,6 +19,17 @@ interface GhostlockRepository {
 
     /** Skip the pre-attack KernelSU check and run the exploit as a test. */
     fun setForceAttackTest(enabled: Boolean)
+
+    /**
+     * Build identity whose "layers were disabled" start-up notice the user has
+     * already seen; null when none. The notice fires once per build, because a
+     * new build is what disables the layers and the user has to be told once,
+     * not every launch (PORT-PLAN Phase 8 §C.12a/12b).
+     */
+    fun layerNoticeAcknowledged(): String?
+
+    /** Records that the start-up notice for [build] has been shown. */
+    fun acknowledgeLayerNotice(build: String)
 
     fun setShizukuEnabled(enabled: Boolean)
 
@@ -102,11 +114,21 @@ interface GhostlockRepository {
 
     suspend fun debugSettings(): DebugSettings
 
-    fun setDebugExportEnabled(enabled: Boolean)
-
-    fun setDebugExportLocation(location: String)
-
     fun setDebugKernelLogEnabled(enabled: Boolean)
+
+    /** Runs retained on the device, newest first, an unfinished one ahead of the rest. */
+    suspend fun listRunLogs(): List<RunLogEntry>
+
+    /** Streams one retained run into a document the user picked; false if it failed. */
+    suspend fun exportRunLog(stamp: String, documentUri: String): Boolean
+
+    suspend fun clearRunLogs()
+
+    /**
+     * Marks every run still recorded as running when the app starts: it was
+     * killed with the device. Returns how many. See `RunLogStore`.
+     */
+    suspend fun markInterruptedRunLogs(): Int
 
     suspend fun runExploit(pair: CpuPair, onLog: (String) -> Unit): Int
 

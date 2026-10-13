@@ -1,0 +1,128 @@
+name: Run failed / 运行失败
+description: A run fails, the phone freezes or reboots, or the app says the device is not supported · 运行失败、卡死、重启，或提示不支持
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This build is bound to **one exact kernel**. A different kernel is not a bug — it is a device this
+        port was never derived for; see [supported devices](https://github.com/Haoyu-UT/ghostlock-app-diting#supported-devices).
+
+        本构建只绑定**一个精确内核**。内核不同不是 bug，而是本移植从未为其推导过的设备；
+        参见[支持的设备](https://github.com/Haoyu-UT/ghostlock-app-diting#supported-devices)。
+
+  - type: textarea
+    id: device
+    attributes:
+      label: Device & ROM / 机型与 ROM
+      description: |
+        **Settings → About phone → 全部参数与信息** (the detailed-specs row), then **scroll down** — the OS
+        and kernel lines sit below the first screen. Attach one screenshot (drag it into this box, or into
+        the issue right after creating it) and it carries everything we need.
+
+        The kernel line **wraps onto a second line** on screen — please don't retype it by hand. If you
+        cannot attach a picture, paste the lines as text instead.
+
+        Whether the OS version line has a **`by xiaomi.eu`** line under it is what tells us your ROM
+        channel; the version number alone reads the same on China and Xiaomi.eu ROMs.
+
+        **设置 → 关于手机 → 全部参数与信息**，然后**向下滚动**：OS 版本与内核版本都在首屏之下。
+        截一张图附在本 issue 里（直接拖入即可），这一张图就够了。
+
+        屏幕上的内核版本会**折成两行**（第一行以 `…ab1431328` 结尾）——请勿手抄。
+        若无法附图，请改为粘贴下面几行文本。
+
+        OS 版本下方**是否有 `by xiaomi.eu` 一行**，正是它告诉我们你的 ROM 渠道；
+        仅看版本号，国行与 Xiaomi.eu 是一样的。
+      placeholder: |
+        Redmi K50 Ultra · 认证型号 22081212G
+        OS 版本 3.0.1.0.VLFCNXM by xiaomi.eu
+        Android 版本 15 AQ3A.250226.002 | Android 安全更新 2026-01-01
+        内核版本 5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284
+    validations:
+      required: true
+
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Where it stopped / 失败阶段
+      description: |
+        The stage named in the run log, if it got that far.
+        若日志里已写出阶段名，请照填。
+      options:
+        - Never starts / 从未开始
+        - App says the device is not supported / 应用提示不支持
+        - W1 — SELinux
+        - W2 — credential / W2 — 凭据覆写
+        - W3 — seccomp
+        - Handoff — KernelSU did not load / 交接阶段 —— KernelSU 未加载
+        - Other, or not sure / 其他或不确定
+    validations:
+      required: true
+
+  - type: dropdown
+    id: symptom
+    attributes:
+      label: Symptom / 现象
+      description: |
+        A **soft reset** goes straight to the lock screen — no boot logo, no boot animation — and the run
+        has already finished by then. That one is expected: it is the KernelSU late-load restarting
+        userspace, not a crash. A **reboot** shows the boot logo, and that one is a failure.
+
+        **软重启**直接回到锁屏 —— 没有开机 logo、没有开机动画，而且此时运行已经结束。
+        这是预期行为，是 KernelSU 延迟加载在重启用户空间，不是崩溃。
+        **重启**会显示开机 logo，那才是故障。
+      options:
+        - App stopped with an error; system fine / 应用报错停止，系统正常
+        - App closed to the home screen / 应用崩溃退出
+        - Screen froze, then the phone rebooted by itself after ~20 s / 屏幕卡死，约 20 秒后自动重启
+        - Phone rebooted immediately, no frozen period / 立即重启，没有卡死过程
+        - Screen froze and stayed frozen / 屏幕卡死且不重启
+        - Soft-reset at the end of the run — expected / 运行结束时软重启（预期行为）
+        - App says the device is not supported / 应用提示不支持
+        - Other / 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: observed
+    attributes:
+      label: What you saw / 停止前的最后几行
+      description: |
+        The last lines the app printed before it stopped, or what the screen showed. The log is timestamped
+        `T+…ms`, so roughly how long it ran before dying is worth including — it narrows the stage down even
+        when the log stops mid-line.
+
+        应用停止前打印的最后几行，或屏幕上的提示。日志带 `T+…ms` 时间戳，
+        所以「运行了多久才死」也请一并写上 —— 即使日志断在行中，它也能缩小范围。
+      placeholder: |
+        [+] SELinux permissive
+        [*] [T+5750ms] Write 1 complete
+        [*] W2: cred attempt 1/15
+        (then the screen froze)
+    validations:
+      required: true
+
+  - type: textarea
+    id: run_log
+    attributes:
+      label: Run log / 运行日志
+      description: |
+        Runs are kept on the device, not in a folder you browse to. Tap **Export log & report** on the main
+        screen, choose the run (an interrupted one is listed first), and save the zip through the
+        system dialog — attach that zip. It carries the `profile.conf` / `profile.bin` that were
+        actually in force as well as the log.
+
+        运行日志保存在应用内部，而非文件管理器中的文件夹。请点主界面的 **导出日志**，选择要报告的那一次
+        （中断的那次会排在最前面），用系统对话框保存 zip 并附上。zip 中同时包含当时实际生效的
+        `profile.conf` / `profile.bin`。
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else / 补充
+      description: |
+        Anything that does not fit above — Shizuku in use, a profile or overrides imported, a reboot since
+        installing, another app fighting for the phone.
+
+        其他任何信息 —— 是否使用 Shizuku、是否导入过配置或保存过参数覆盖、安装后是否重启过、
+        是否有其他应用在抢手机。
