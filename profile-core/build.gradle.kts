@@ -27,6 +27,15 @@ tasks.register<JavaExec>("exportKernelProfiles") {
     val profilesDir = rootProject.layout.projectDirectory.dir("app/src/main/assets/kernel_profiles")
     val outputDir = rootProject.layout.buildDirectory.dir("kernel-profiles")
     inputs.dir(profilesDir)
+    /* The exporter's output depends on this module's compiled code as much as on
+     * the assets. Without the classpath in `inputs`, a Kotlin change leaves the
+     * previous .bin files marked up-to-date -- and the exporter-agreement test
+     * then compares fresh app documents against stale exporter output, which is
+     * the exact drift that test exists to catch. Measured 2026-10-14 on the
+     * merge that first ran it with a changed profile-core. */
+    inputs.files(sourceSets["main"].runtimeClasspath)
+        .withPropertyName("exporterClasspath")
+        .withNormalizer(org.gradle.api.tasks.ClasspathNormalizer::class)
     outputs.dir(outputDir)
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.ghostlock.app.data.profile.ProfileExporter")

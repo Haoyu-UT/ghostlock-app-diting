@@ -60,7 +60,7 @@ class NativeDocumentEquivalenceTest {
             javaClass.classLoader?.getResourceAsStream("native-doc-golden.sha256"),
         ).bufferedReader().use { it.readText() }
         return text.lineSequence()
-            .filter { it.isNotBlank() }
+            .filter { it.isNotBlank() && !it.trimStart().startsWith("#") }
             .associate { line ->
                 val parts = line.trim().split(' ')
                 parts[0] to parts[1]

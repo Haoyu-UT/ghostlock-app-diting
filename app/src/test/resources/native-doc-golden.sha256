@@ -1,4 +1,8 @@
-5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284 2f5acd0ff8d4fcfd1f1fac0308ceb5909900c6e651306467318f37d399be8fc2
+# 5.10.236 differs on this branch only: its bundled profile is the
+# test-only sigreturn-route variant (the shipped select-stack document is
+# on the dev line). Do not land this entry -- nor that profile -- with the
+# era work; both are branch-local.
+5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284 45f410f6285cae391e8a9ab4df7683d48a68815c181ed2cfdc6becd321ca7f23
 5.15.189-android13-8-00016-g51bba4309aac-ab14546557 9249a8115ed65c1a985f5d18abe1f598d4b6ec849477b444cc460c0e39ea3557
 6.1.115-android14-11-ga2521ca27699-ab13294383 9f2811bd326026027af3887888661b9d4b483e440b6087e79b2e11015b5d7003
 6.1.118-android14-11-ga3b9c44908dd-ab13320413 fc0407e53978896cbb05abaaef418ec16947fe7be6a68a35582f09abca79282d
