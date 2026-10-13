@@ -29,8 +29,15 @@ object ProfileMerger {
         pair: CpuPairView,
         routePresets: Map<String, ValueMap>,
     ): ValueMap {
+        /* The caller's tuning map is shared by every profile it resolves (the
+         * Gradle exporter resolves a whole index in one process), and the merge
+         * below writes into the maps it is handed. Alias it and the *first*
+         * profile's values leak into every later one -- measured 2026-10-14:
+         * with the diting profile listed first in index.conf, an unrelated 6.x
+         * profile inherited its route_wait_ms (30 instead of the tuning's 1000),
+         * and the exporter and the app disagreed. Copy before merging. */
         val defaults = valueMapOf("release" to deviceRelease).apply {
-            if (tuningExecution != null) put("execution", tuningExecution)
+            if (tuningExecution != null) put("execution", tuningExecution.copyValue().asValueMap())
         }
         val resolved = mergeSource(
             mergeSource(
@@ -62,7 +69,9 @@ object ProfileMerger {
             val defaults = routePresets[route] ?: continue
             val existing = routes[route].asValueMap()
             if (existing == null) {
-                routes[route] = defaults
+                /* Same sharing hazard as the tuning map above: hand the profile
+                 * its own copy, never the preset object itself. */
+                routes[route] = defaults.copyValue()
                 continue
             }
             for ((key, value) in defaults) {
