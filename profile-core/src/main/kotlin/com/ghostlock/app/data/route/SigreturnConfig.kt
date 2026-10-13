@@ -30,6 +30,9 @@ data class SigreturnConfig(
         lockAnchorStride?.let { add("lock_anchor_stride" to it) }
     }
 
+    /** Mirrors native `kRouteSigreturn`; the order is not significant. */
+    override fun keys(): List<String> = SchemaKeys
+
     override fun apply(key: String, value: ULong): RouteConfig = when (key) {
         "waiter_off_sve" -> copy(waiterOffSve = value)
         "waiter_off_plain" -> copy(waiterOffPlain = value)
@@ -40,6 +43,11 @@ data class SigreturnConfig(
     }
 
     companion object {
+        private val SchemaKeys = listOf(
+            "waiter_off_sve", "waiter_off_plain", "lock_anchor_image", "lock_anchor_bytes",
+            "lock_anchor_stride",
+        )
+
         val EMPTY = SigreturnConfig(null, null)
 
         fun from(value: (String) -> Long?): SigreturnConfig = SigreturnConfig(
