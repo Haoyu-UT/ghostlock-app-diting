@@ -2,11 +2,12 @@
 
 > English version: [SUPPORTED_DEVICES.md](SUPPORTED_DEVICES.md)
 
-> **本仓库是 `diting` fork，其支持内核列表比
-> [上游](https://github.com/YuKongA/ghostlock-app/blob/main/docs/kernel_profiles/SUPPORTED_DEVICES_ZH.md)更短。**
-> 本 fork 会破坏内置的 5.15 与 6.1 配置，因此这些行在此处被移除，并在文末单独列出。
-> **上游不受影响**——缺陷在本 fork，而非 GhostLock；上游对这些机型的支持一切正常。分析与修复计划见
-> [`../analysis/waiter-layout-family-gating-plan.md`](../analysis/waiter-layout-family-gating-plan.md)。
+> **本仓库是 `diting` fork。** 其列表为
+> [上游](https://github.com/YuKongA/ghostlock-app/blob/main/docs/kernel_profiles/SUPPORTED_DEVICES_ZH.md)
+> 列表加上本 fork 自有的 5.10 内核。r5 及更早版本曾因 fork 自身的缺陷下架 24 个上游 5.15/6.1
+> 内核；**r6 已恢复**——修复与门禁见
+> [`../analysis/waiter-layout-family-gating-plan.md`](../analysis/waiter-layout-family-gating-plan.md)，
+> 恢复行的来源说明见文末。
 
 > 联发科（MediaTek）机型跑不通（没有匹配的 profile，或 `W1: target 0x0`）？
 > 请先 root 设备，再按 [MEDIATEK_ZH.md](MEDIATEK_ZH.md) 取得两个物理地址
@@ -31,12 +32,15 @@ W3 seccomp bypass，即使并非必需，也能节省时间。
 | `5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284`  | Redmi K50 Ultra（`diting`）—— Global `OS2.0.206.0`–`OS3.0.6.0`；已端到端验证 |
 | `5.10.226-android12-9-00064-gea4a6f067d3f-ab12969919`  | 同上 —— Global `OS2.0.3.0`–`OS2.0.205.0`；已端到端验证（2026-10-10） |
 | `5.10.209-android12-9-00019-g4ea09a298bb4-ab12292661`  | 同上 —— Global `OS1.0.11.0`、`OS1.0.12.0`、`OS2.0.1.0`、`OS2.0.2.0`；已端到端验证（2026-10-10） |
+| `5.10.81-android12-9-00001-g6cd504626bae-ab8485363`    | 同上 —— Global `V13.0.3.0.SLFMIXM` / `V13.0.4.0.SLFMIXM`（出厂 ROM，Android 12）；已端到端验证 —— 经由 **sigreturn** 路线交付，500 µs 间隔下 5 次中完成 4 次（2026-10-14） |
 
 上游没有 5.10 内核族：既没有内置配置，偏移提取器也没有 5.10 条目。在本 fork 中，配置以
 **内置资源**形式随包分发（`app/src/main/assets/kernel_profiles/<精确 uname -r>.conf`，
 登记在 `index.conf` 中），因此精确匹配上述内核的设备无需导入 —— 且内置配置对其 release 具有权威性。
 后两款各经过一次完整 gate 与一次 3 连发序列（`5.10.226` 完成 1/3、`5.10.209` 完成 2/3），
-「已端到端验证」指至少一次完整跑通。
+「已端到端验证」指至少一次完整跑通。`5.10.81` 是出厂内核：其 `do_futex` 帧更浅，select-stack
+的 waiter 够不到，因此改由 **sigreturn** 路线交付，速率来自一次五连发序列（完成 4/5，一次 hang
+形态；`5.10.101` 尚未实跑）。
 
 ## 可能支持 —— 未经验证
 
@@ -61,7 +65,31 @@ W3 seccomp bypass，即使并非必需，也能节省时间。
 
 | Kernel                                                 | Devices                                                          |
 |--------------------------------------------------------|------------------------------------------------------------------|
+| `5.15.41-android13-8-g8dc4c75ab7d8-ab1673212412`       | MEIZU 20 Pro · 推荐Shizuku                                        |
+| `5.15.119-android13-8-g6ff5097ee32a-ab1764665171`      | MEIZU 21 Note                                                    |
+| `5.15.167-android13-8-00017-gb1f32b310a30-ab12826353`  | Red Magic 8 Pro                                                  |
+| `5.15.189-android13-8-00016-g51bba4309aac-ab14546557`  | Sony Xperia 1 V                                                  |
+| `5.15.189-android13-8-00004-g1c3825f8ac0a-ab14110541`  | Sony Xperia 1 V                                                  |
 | `6.1.25-android14-11-maybe-dirty`                      | MEIZU 21                                                         |
+| `6.1.115-android14-11-ga2521ca27699-ab13294383`        | POCO X6 Pro                                                      |
+| `6.1.118-android14-11-ga3b9c44908dd-ab13320413`        | Redmi Note 15 Pro+                                               |
+| `6.1.118-android14-11-gca0ef6d17716-ab13624819`        | Xiaomi 14                                                        |
+| `6.1.138-android14-11-g0c3d559bcd85-ab14529422`        | Xiaomi 14                                                        |
+| `6.1.138-android14-11-g151cf2b6bfbe-ab13719792`        | Lenovo Xiaoxin Pad Pro 12.7 (TB375FC)                            |
+| `6.1.138-android14-11-g6ab8c9a86a33-ab14396278`        | POCO X6 Pro                                                      |
+| `6.1.138-android14-11-g44bda9e8f6e9-ab13792638`        | POCO X6 Pro                                                      |
+| `6.1.138-android14-11-g965475777129-mi`                | REDMI K80                                                        |
+| `6.1.138-android14-11-g2ecae636cf9b-ab14676408`        | Lenovo Yoga Tab Plus (TB520FU)                                   |
+| `6.1.145-android14-11-g09f1c0074ad7-ab14226177`        | Infinix Note 50s 5G, Infinix GT 30 (X6876)                       |
+| `6.1.145-android14-11-g11c274d0441f-ab14259673`        | RedMagic 9(S) Pro (REDMAGICOS11.0.5MR1_GB)                       |
+| `6.1.145-android14-11-g74d1702dab4d-ab14669069`        | vivo T4, IQOO 12                                                 |
+| `6.1.145-android14-11-geaa643a2c0ee-ab14763719`        | Motorola Razr 50 Ultra / Motorola Razr+ 2024                     |
+| `6.1.145-android14-11-g9b69cc399ae1-ab14819715`        | Motorola Edge 60 Fusion                                          |
+| `6.1.157-android14-11-ga8b0b542991e-ab15601211`        | Infinix GT 30 Pro (X6873)                                        |
+| `6.1.157-android14-11-gbd23337e42e7-ab14791245`        | Google Pixel 9a (Tensor G4), Google Pixel 7 (Tensor G2)          |
+| `6.1.162-android14-11-gce140c0e5bf5-ab15450923`        | Zenfone 11 Ultra                                                 |
+| `6.1.162-android14-11-g752d9c17787d-ab15574904`        | Google Pixel 9 Pro / 9 Pro Fold (Tensor G4)                      |
+| `6.1.162-android14-11-g5e8b0cffebd1-ab15202165`        | Google Pixel 9a (Tensor G4)                                      |
 | `6.6.30-android15-8-g54dcbfbef792-ab12368803-4k`       | Red Magic Tablet 3 Pro                                           |
 | `6.6.77-android15-8-g4a507830d890-ab13636293-4k`       | Xiaomi Civi 5 Pro, REDMI K90 / 4 Turbo, POCO F7                  |
 | `6.6.77-android15-8-g63ce7556864c-ab13994517-4k`       | Xiaomi 15                                                        |
@@ -101,17 +129,13 @@ W3 seccomp bypass，即使并非必需，也能节省时间。
 | `6.12.38-android16-5-g74ad46052215-ab14494108-4k`      | Lenovo Legion Y700 Wuji                                          |
 | `6.12.38-android16-5-g844001fb8721-ab14552068-4k`      | OnePlus 15T                                                      |
 
-## 本 fork 中已下架（24 个内核）
+## r6 已恢复（2026-10-14）：r5 下架的 24 个内核
 
-因为本 fork 的 compact waiter 改动，这些内核上构造出的 waiter 其 `prio` 读作 0（最高优先级），
-故从上表中移除。**它们在上游是正常工作的**；此处列出是为了让移除可见，而不是静默消失：
+r1–r5 曾下架 24 个上游内核（5 个 5.15、19 个 6.1），因为本 fork 的 compact waiter 改动
+使这些内核上构造出的 waiter 其 `prio` 读作 0（最高优先级）。内核族门控
+（[`../analysis/waiter-layout-family-gating-plan.md`](../analysis/waiter-layout-family-gating-plan.md)）
+已实现，相关行已回到上表。
 
-| 内核族 | 内核数 | 受影响机型 |
-|---|---|---|
-| 5.15 | 5 | MEIZU 20 Pro · MEIZU 21 Note · Red Magic 8 Pro · Sony Xperia 1 V |
-| 6.1 | 19 | POCO X6 Pro · Xiaomi 14 · REDMI K80 · Redmi Note 15 Pro+ · Lenovo Xiaoxin Pad Pro 12.7 · Lenovo Yoga Tab Plus · Infinix Note 50s 5G / GT 30 / GT 30 Pro · RedMagic 9(S) Pro · vivo T4 / IQOO 12 · Motorola Razr 50 Ultra · Motorola Edge 60 Fusion · Zenfone 11 Ultra · Google Pixel 9a / 9 Pro / 9 Pro Fold / Pixel 7 |
-
-注意这是**文档层面**的下架：内置配置仍存在于 `app/src/main/assets/kernel_profiles/`，也仍然登记在
-`index.conf` 中，因此应用依然会接受它们。待
-[`../analysis/waiter-layout-family-gating-plan.md`](../analysis/waiter-layout-family-gating-plan.md)
-实现后，预期会重新上架。
+恢复行的来源，如实说明：修复按内核族重建 waiter 的 `prio` 字（5.10 输出逐字节不变，
+经 `cmp_disasm` 核验），单元测试覆盖两种字型，5.10 一侧通过了设备门禁。**本移植没有可用的
+5.15/6.1 设备**，因此这些行依据的是上游的支持与上述离线门禁，而非此处的实机运行。

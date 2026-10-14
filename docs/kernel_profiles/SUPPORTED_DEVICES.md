@@ -2,12 +2,12 @@
 
 > 中文版本：[SUPPORTED_DEVICES_ZH.md](SUPPORTED_DEVICES_ZH.md)
 
-> **This is the `diting` fork, and its list of supported kernels is shorter than
-> [upstream](https://github.com/YuKongA/ghostlock-app/blob/main/docs/kernel_profiles/SUPPORTED_DEVICES.md)'s.**
-> This fork breaks the built-in 5.15 and 6.1 profiles, so those rows are removed here and listed
-> separately at the bottom. **Upstream is unaffected** — the defect is in the fork, not in
-> GhostLock, and upstream supports those devices normally. Analysis and the planned fix:
-> [`../analysis/waiter-layout-family-gating-plan.md`](../analysis/waiter-layout-family-gating-plan.md).
+> **This is the `diting` fork.** Its list is
+> [upstream](https://github.com/YuKongA/ghostlock-app/blob/main/docs/kernel_profiles/SUPPORTED_DEVICES.md)'s
+> plus this fork's own 5.10 kernels. r5 and earlier delisted the 24 upstream 5.15/6.1 kernels over
+> a fork-local defect; **r6 restored them** — the fix and its gates are
+> [`../analysis/waiter-layout-family-gating-plan.md`](../analysis/waiter-layout-family-gating-plan.md),
+> and the note at the bottom of this file states the provenance of the restored rows.
 
 > MediaTek device not working (no matching profile, or `W1: target 0x0`)?
 > Root the device first, then follow [MEDIATEK.md](MEDIATEK.md) to obtain the
@@ -35,6 +35,7 @@ bypass there as well, so it saves time even where it isn't required.
 | `5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284`  | Redmi K50 Ultra (`diting`) — Global `OS2.0.206.0`–`OS3.0.6.0`; tested end to end |
 | `5.10.226-android12-9-00064-gea4a6f067d3f-ab12969919`  | same device — Global `OS2.0.3.0`–`OS2.0.205.0`; tested end to end (2026-10-10) |
 | `5.10.209-android12-9-00019-g4ea09a298bb4-ab12292661`  | same device — Global `OS1.0.11.0`, `OS1.0.12.0`, `OS2.0.1.0`, `OS2.0.2.0`; tested end to end (2026-10-10) |
+| `5.10.81-android12-9-00001-g6cd504626bae-ab8485363`    | same device — Global `V13.0.3.0.SLFMIXM` / `V13.0.4.0.SLFMIXM` (the launch ROM, Android 12); tested end to end — delivers through the **sigreturn** route, 4/5 completed at the 500 µs interval (2026-10-14) |
 
 Upstream has no 5.10 family — no built-in profile for it, and no 5.10 entry in the offset
 extractor. In this fork the profiles ship as **built-in assets**
@@ -42,6 +43,9 @@ extractor. In this fork the profiles ship as **built-in assets**
 device on one of those exact kernels needs no import — and a bundled profile is authoritative for
 its release. The two newer builds were each verified by one full gate run plus a 3-run series
 (`5.10.226` completed 1/3, `5.10.209` 2/3), so "tested end to end" means at least one full pass.
+`5.10.81` is the launch kernel: the select-stack waiter does not reach its shallower `do_futex`
+frame, so it delivers through the **sigreturn** route instead, and its rate was measured over a
+five-boot series (4/5 completed, one hang shape; `5.10.101` has not been run).
 
 ## Possibly supported — untested
 
@@ -68,7 +72,31 @@ kernel build — and with it, the struct offsets this profile carries.
 
 | Kernel                                                 | Devices                                                          |
 |--------------------------------------------------------|------------------------------------------------------------------|
+| `5.15.41-android13-8-g8dc4c75ab7d8-ab1673212412`       | MEIZU 20 Pro · Shizuku recommended                               |
+| `5.15.119-android13-8-g6ff5097ee32a-ab1764665171`      | MEIZU 21 Note                                                    |
+| `5.15.167-android13-8-00017-gb1f32b310a30-ab12826353`  | Red Magic 8 Pro                                                  |
+| `5.15.189-android13-8-00016-g51bba4309aac-ab14546557`  | Sony Xperia 1 V                                                  |
+| `5.15.189-android13-8-00004-g1c3825f8ac0a-ab14110541`  | Sony Xperia 1 V                                                  |
 | `6.1.25-android14-11-maybe-dirty`                      | MEIZU 21                                                         |
+| `6.1.115-android14-11-ga2521ca27699-ab13294383`        | POCO X6 Pro                                                      |
+| `6.1.118-android14-11-ga3b9c44908dd-ab13320413`        | Redmi Note 15 Pro+                                               |
+| `6.1.118-android14-11-gca0ef6d17716-ab13624819`        | Xiaomi 14                                                        |
+| `6.1.138-android14-11-g0c3d559bcd85-ab14529422`        | Xiaomi 14                                                        |
+| `6.1.138-android14-11-g151cf2b6bfbe-ab13719792`        | Lenovo Xiaoxin Pad Pro 12.7 (TB375FC)                            |
+| `6.1.138-android14-11-g6ab8c9a86a33-ab14396278`        | POCO X6 Pro                                                      |
+| `6.1.138-android14-11-g44bda9e8f6e9-ab13792638`        | POCO X6 Pro                                                      |
+| `6.1.138-android14-11-g965475777129-mi`                | REDMI K80                                                        |
+| `6.1.138-android14-11-g2ecae636cf9b-ab14676408`        | Lenovo Yoga Tab Plus (TB520FU)                                   |
+| `6.1.145-android14-11-g09f1c0074ad7-ab14226177`        | Infinix Note 50s 5G, Infinix GT 30 (X6876)                       |
+| `6.1.145-android14-11-g11c274d0441f-ab14259673`        | RedMagic 9(S) Pro (REDMAGICOS11.0.5MR1_GB)                       |
+| `6.1.145-android14-11-g74d1702dab4d-ab14669069`        | vivo T4, IQOO 12                                                 |
+| `6.1.145-android14-11-geaa643a2c0ee-ab14763719`        | Motorola Razr 50 Ultra / Motorola Razr+ 2024                     |
+| `6.1.145-android14-11-g9b69cc399ae1-ab14819715`        | Motorola Edge 60 Fusion                                          |
+| `6.1.157-android14-11-ga8b0b542991e-ab15601211`        | Infinix GT 30 Pro (X6873)                                        |
+| `6.1.157-android14-11-gbd23337e42e7-ab14791245`        | Google Pixel 9a (Tensor G4), Google Pixel 7 (Tensor G2)          |
+| `6.1.162-android14-11-gce140c0e5bf5-ab15450923`        | Zenfone 11 Ultra                                                 |
+| `6.1.162-android14-11-g752d9c17787d-ab15574904`        | Google Pixel 9 Pro / 9 Pro Fold (Tensor G4)                      |
+| `6.1.162-android14-11-g5e8b0cffebd1-ab15202165`        | Google Pixel 9a (Tensor G4)                                      |
 | `6.6.30-android15-8-g54dcbfbef792-ab12368803-4k`       | Red Magic Tablet 3 Pro                                           |
 | `6.6.77-android15-8-g4a507830d890-ab13636293-4k`       | Xiaomi Civi 5 Pro, REDMI K90 / 4 Turbo, POCO F7                  |
 | `6.6.77-android15-8-g63ce7556864c-ab13994517-4k`       | Xiaomi 15                                                        |
@@ -108,19 +136,14 @@ kernel build — and with it, the struct offsets this profile carries.
 | `6.12.38-android16-5-g74ad46052215-ab14494108-4k`      | Lenovo Legion Y700 Wuji                                          |
 | `6.12.38-android16-5-g844001fb8721-ab14552068-4k`      | OnePlus 15T                                                      |
 
-## Delisted in this fork (24 kernels)
+## Restored in r6 (2026-10-14): the 24 kernels r5 had delisted
 
-Removed from the table above because this fork's compact-waiter change leaves them building a
-waiter with `prio = 0` (highest) on their kernels. **They work upstream**; they are listed here
-so the removal is visible rather than silent:
+r1–r5 delisted 24 upstream kernels (5 × 5.15, 19 × 6.1) because this fork's compact-waiter change
+left them building a waiter with `prio = 0` (highest) on their kernels. The family gate
+([`../analysis/waiter-layout-family-gating-plan.md`](../analysis/waiter-layout-family-gating-plan.md))
+is implemented and the rows are back in the table above.
 
-| Family | Kernels | Devices affected |
-|---|---|---|
-| 5.15 | 5 | MEIZU 20 Pro · MEIZU 21 Note · Red Magic 8 Pro · Sony Xperia 1 V |
-| 6.1 | 19 | POCO X6 Pro · Xiaomi 14 · REDMI K80 · Redmi Note 15 Pro+ · Lenovo Xiaoxin Pad Pro 12.7 · Lenovo Yoga Tab Plus · Infinix Note 50s 5G / GT 30 / GT 30 Pro · RedMagic 9(S) Pro · vivo T4 / IQOO 12 · Motorola Razr 50 Ultra · Motorola Edge 60 Fusion · Zenfone 11 Ultra · Google Pixel 9a / 9 Pro / 9 Pro Fold / Pixel 7 |
-
-Note that this is a **documentation-level** delisting: the built-in profiles are still present in
-`app/src/main/assets/kernel_profiles/` and still listed in `index.conf`, so the app will still
-accept them. Re-listing is the expected outcome once
-[`../analysis/waiter-layout-family-gating-plan.md`](../analysis/waiter-layout-family-gating-plan.md)
-is implemented.
+Provenance of the restored rows, stated plainly: the fix rebuilds the waiter's `prio` word per
+kernel family (5.10 output byte-identical, checked by `cmp_disasm`), the unit tests cover both
+word pairs, and the 5.10 side passed its device gates. **No 5.15/6.1 device was available to this
+port**, so these rows rest on upstream's support plus that offline gate — not on a run from here.
