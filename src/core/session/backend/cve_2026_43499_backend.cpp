@@ -286,47 +286,6 @@ namespace ghostlock::session::backend {
             if (!exact_target) {
                 support::run_state::enter("w3a");
 
-                /* LOCAL DIAGNOSTIC (not for upstream): watch the child's comm
-                 * from the parent while the stage runs.
-                 *
-                 * W3-0 is a leaf-direction probe: it zeroes `child->comm` and
-                 * checks it changed. verify_leaf_dir_stage() does observe that --
-                 * but it runs AFTER the route, and the route is exactly where the
-                 * run dies (run 6, and it wedges rather than oopsing), so the
-                 * observation has never once been recorded. /proc/<pid>/comm is
-                 * readable by the parent, so poll it here and log only changes:
-                 * the host-side log stream survives the wedge, so the last line
-                 * tells us whether the write landed.
-                 *
-                 * Reads only, no pipe traffic, so it cannot interfere with the
-                 * stage's own "M"/report handshake. ~8 s at 20 ms, then it exits.
-                 * See docs/analysis/w3-post-descent-wedge-plan.md. */
-                const int32_t watch_pid = pipes.child();
-                std::thread([watch_pid] {
-                    char path[64];
-                    snprintf(path, sizeof(path), "/proc/%d/comm", watch_pid);
-                    char last[64] = {0};
-                    for (int32_t i = 0; i < 400; i++) {
-                        char buf[64] = {0};
-                        int fd = open(path, O_RDONLY | O_CLOEXEC);
-                        if (fd >= 0) {
-                            ssize_t n = read(fd, buf, sizeof(buf) - 1);
-                            close(fd);
-                            if (n > 0) {
-                                buf[n] = '\0';
-                                for (ssize_t k = 0; k < n; k++) {
-                                    if (buf[k] == '\n') buf[k] = '\0';
-                                }
-                                if (strcmp(buf, last) != 0) {
-                                    pr_info("leaf watch: comm=\"%s\"\n", buf);
-                                    snprintf(last, sizeof(last), "%s", buf);
-                                }
-                            }
-                        }
-                        usleep(20000);
-                    }
-                }).detach();
-
                 /* leaf = 0 on purpose, even though this stage writes to a
                  * char array a zero would clear. The probe only has to learn
                  * *where* the pselect erase stores -- [target] or [target+8] --
