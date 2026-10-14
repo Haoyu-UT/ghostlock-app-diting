@@ -94,7 +94,7 @@ inside one boot can hand out a slot the other already used. It also makes 11c's 
 unsound on the Shizuku path (its "no file + install predates the boot ⇒ region is zeroed" assumes
 the file is the sole record).
 
-Shape of the fix (same as PORT-PLAN 11d records): **one state file, chosen by the app and passed to
+Shape of the fix (one state file for both launch paths, as the two-state-file note records): **one state file, chosen by the app and passed to
 both paths** — `GHOSTLOCK_ANCHOR_STATE=<path>` in the environment, defaulting to the current
 `files/.ghostlock_anchor` when unset. The Shizuku service passes the same value it would use
 directly. Until that lands, the conservative interim is to stop passing

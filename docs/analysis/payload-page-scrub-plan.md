@@ -1,7 +1,7 @@
 # The payload page's residue after destroy() — audit and plan (2026-10-12)
 
 Level: **L** (attack-critical: the payload page's lifecycle, and what a later `fork()` may inherit).
-Status: **audit complete, no code changed.** Owed by PORT-PLAN item 10; the identity plan defers it
+Status: **audit complete, no code changed.** Owed by `PORT-PLAN.md`, the scrub item; the identity plan defers it
 explicitly ("不动 reap / quarantine（Wall 2 残留另立计划）").
 
 ## The defect

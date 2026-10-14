@@ -1,8 +1,8 @@
 # Bundling the diting profile — and stopping a stale one from running
 
-Status: **rationale record, implemented 2026-10-09.** The binding specification is `PORT-PLAN.md`
-Phase 8 in the project root — **read that first**, and its *Implementation status* for what landed;
-this file explains why the design is shaped the way it is. Its "Steps" section and the G1/G2/G3
+Status: **rationale record, implemented 2026-10-09 and shipped (r3 onward).** The specification is
+the shipped behaviour itself — the app's profile layers, the digest and the start-up notice, all
+device-verified; this file explains why the design is shaped the way it is. Its "Steps" section and the G1/G2/G3
 sketch below are the **pre-implementation** design and are kept only as the reasoning trail; two
 things in them turned out differently, and both are corrected in place below. L-level: it touches
 the asset→Kotlin→wire profile contract.
@@ -118,9 +118,9 @@ screen shows a banner for each inactive layer. That banner turned out to be **to
 only surface**: the user it exists for — someone who just upgraded with an import and overrides in
 place — has no reason to open that screen, so in practice they never learn that their settings
 stopped applying. So on the first start after the layers go inactive the app raises a **dialog with
-one confirm button** naming what was disabled and why (PORT-PLAN §C.12a).
+one confirm button** naming what was disabled and why.
 
-**Why it is a report and not a promise (§C.12b).** The dialog is built from the `ProfileLayers`
+**Why it is a report and not a promise.** The dialog is built from the `ProfileLayers`
 object of the *resolution that just ran* — the same object the run path and the editor read — rather
 than from a second predicate the UI evaluates for itself. Two properties follow, and both are
 tested: what the dialog says is exactly what a run would do at that moment (the layers are already
