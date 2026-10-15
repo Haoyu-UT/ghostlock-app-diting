@@ -45,6 +45,21 @@ static void *fake_consumer(void *arg) {
     return nullptr;
 }
 
+/* The "call returns late" case for wait_consumer_idle: clears the in-flight
+ * flag after a delay the drain must wait out rather than time out on. */
+struct LateClearer {
+    ghostlock::race::PiRace *race;
+    std::atomic<int32_t> *cleared;
+};
+
+static void *late_clearer_entry(void *arg) {
+    auto *state = static_cast<LateClearer *>(arg);
+    usleep(30000);
+    state->race->consumer_inflight.store(0);
+    state->cleared->store(1);
+    return nullptr;
+}
+
 int32_t main(void) {
     ghostlock::race::PiRace race;
     assert(race.reset(12345, 2, 3));
@@ -118,6 +133,32 @@ int32_t main(void) {
     assert(race.consumer_owner.state() == ghostlock::support::PthreadOwner::State::Joined);
     assert(race.join() == 0);
     assert(race.waiter_owner.state() == ghostlock::support::PthreadOwner::State::Joined);
+
+    /* wait_consumer_idle: closes the sequence, returns 0 when nothing is in
+     * flight, reports a late call's elapsed time, and -1 at the deadline. The
+     * routes gate their retry on it, so a false 0 (a call believed returned
+     * while it is still walking) and a false -1 (a healthy call declared stuck)
+     * are both behaviour changes, not cosmetics. */
+    assert(race.reset(5, 0, 1));
+    race.consumer_go.store(7);
+    assert(race.wait_consumer_idle(ghostlock::race::PiRace::kConsumerDrainMs) == 0);
+    assert(race.consumer_go.load() == 0);
+
+    /* A call that returns after ~30 ms is waited for, and its time is reported. */
+    std::atomic<int32_t> clear_now{0};
+    LateClearer late{&race, &clear_now};
+    race.consumer_inflight.store(1);
+    pthread_t late_thread{};
+    assert(pthread_create(&late_thread, nullptr, late_clearer_entry, &late) == 0);
+    const int32_t waited = race.wait_consumer_idle(ghostlock::race::PiRace::kConsumerDrainMs);
+    assert(waited >= 20);
+    assert(pthread_join(late_thread, nullptr) == 0);
+    assert(clear_now.load() == 1);
+
+    /* A call that never comes back hits the deadline instead of spinning. */
+    race.consumer_inflight.store(1);
+    assert(race.wait_consumer_idle(20) == -1);
+    race.consumer_inflight.store(0);
 
     /* Outcome merge: Ok without a winning consumer call degrades to Retryable,
    * everything else is passed through untouched. */

@@ -178,3 +178,125 @@ risk is our own within-attempt timing, which neither addresses.
 **Gates:** `make -C src ghostlock` (0 warnings) + lint-tidy (exit 0). Judged next run by: the
 `[route] lock anchor:` line differing per attempt (image offset stepping by 0x80), no stamp
 warnings, W1 still landing, and whether the `+0x3f0` oops recurs.
+
+## Addendum 2026-10-14 — the surviving trigger is our own nice rotation, and the disarm is the lever
+
+Three more deaths at the same pc on 236, two of them with full kernel text. They move the
+priority from "ambient walk" (what the P1 guard and the rotation cannot cover) to **our own
+`sched_setattr`, on the waiter thread, mid-run** — the 2026-10-09 run-4 trigger, now the
+dominant one.
+
+**The evidence** (this repo's port archive, `external/port/`):
+
+1. `rate-500us/run-3/oops.txt` — `rcub/0` (PID 16), the RCU boost kthread; `x27 = x24 =
+   0xb604e9328d1d9d00`. An unrelated kernel thread inherited the polluted PI chain and died.
+   This is the ambient shape the plan already predicted; it is not the common one.
+2. `cpuset-guard/run-1/oops.txt` and `cpuset-guard/run-7/oops.txt` — `CPU: 5 PID: … Comm:
+   libghostlock.so`, i.e. **the exploit's own process**, right after
+   `[*] sigreturn post-stamp attempt=1/4 stamps=1 copies=60/61 misses=0` (W1's first route
+   call, ~T+7 s). Trace, identical in both:
+
+   ```
+   pc : rt_mutex_adjust_prio_chain+0x188/0x1948
+   x28: ffffffc04f70bc30      ; the waiter — a kernel STACK address
+   x27: 000000000000000c      ; waiter->lock (+0x38) — the faulting read (run-1: 0x11)
+   Call trace:
+     rt_mutex_adjust_prio_chain+0x188
+     rt_mutex_adjust_pi+0x174
+     __sched_setscheduler+0xee8
+     __do_sys_sched_setattr+0x25c
+   ```
+
+   So the walk is `threads.cpp`'s consumer, `sched_setattr_tid(waiter_tid, consumer_nice)`:
+   `__sched_setscheduler` → `rt_mutex_adjust_pi(waiter_task)` → the chain from
+   `waiter_task->pi_blocked_on`. The P1 guard does not cover it by design — the call is the
+   dance's own nice rotation, needed every burst — and `waiter->lock` holding a small
+   integer (`0xc`, `0x11`) is a reused pselect frame, exactly the model in this plan.
+
+**What clearing exists today, and its window.** The only mechanism is the per-race *ghost
+disarm* (`race/threads.cpp:56-67`, `route::route_needs_ghost_disarm()` is true for every 5.x
+profile): a `FUTEX_LOCK_PI` on the dummy word `0x80000000 | getpid()` with an expired timeout,
+run once, after `controller.execute()` returns. Every archived run that reaches it logs
+`mcast ghost disarm ret=-1 errno=110` (ETIMEDOUT — the expected return of the blocking path,
+47 of 58 archived logs). Two things follow:
+
+- The disarm is **per race, not per attempt**, and the route runs up to four pselect attempts
+  per call, several calls per run. The stale `pi_blocked_on` lives for that whole span, which
+  is the span in which the consumer's bursts walk it. The recorded crashes sit inside it.
+- **It does clear the field — settled in source, with the ETIMEDOUT as the confirming
+  signature.** The disarm's timeout forces the slow path, and stock 5.10
+  (`external/kernel-bsp/kernel/locking/rtmutex.c`) is unambiguous: `rt_mutex_slowlock`
+  overwrites it on the way in (`task_blocks_on_rt_mutex`: `task->pi_blocked_on = waiter`,
+  :962) and the expired timer's `-ETIMEDOUT` reaches `if (unlikely(ret)) remove_waiter(lock,
+  &waiter);` (:1271) whose first act is `current->pi_blocked_on = NULL` (:1077). The observed
+  `errno=110` is the proof the path was taken: the fast path would have returned 0. (The one
+  caveat: 5.10.81 vendor source vs the 5.10.236 GKI the device runs — the PI core is stock
+  upstream and unchanged across the line, but that is an inference, not a measurement.)
+  So the remaining defect is **when** the disarm runs, not whether it works.
+
+**Optional confirmation (harness-side, no product code).** If a device measurement is wanted
+before the change, one probe expresses the whole claim —
+`p:gl_rma rt_mutex_adjust_pi pi_blocked=+2200(%x0):x64 pid=+1800(%x0):x32` (`0x898`/`0x708`
+from this profile): during a run, a walk on the waiter thread whose `pi_blocked_on` is a stack
+address that is *not* the live attempt's frame is the stale state caught live. Register-test
+and falsify it first (`renice` on a PI-blocked pid; a fresh probe that never fires proves
+nothing — see the pitfalls in `CLAUDE.md`). Not required to pick between A and B.
+
+**Candidate A — hoist the disarm to per attempt (small, L) — recommended.** In
+`SelectStackRoute::execute()`'s attempt loop, right after the post-stamp accounting and before
+the next attempt rebuilds: run the same dummy-futex `FUTEX_LOCK_PI`. Extract today's inline
+block into one helper both call sites share — and it belongs in `support/`, not `race/`:
+`route/` cannot include `race/` (race already includes route; `route_policy.hpp` is included by
+`threads.cpp`), so `support::ghost_disarm()` next to the other syscall helpers keeps the
+dependency direction intact. The attempt's frame is dead weight by then; the window in which a
+consumer burst can walk a reclaimed frame closes to the pselect-return→disarm gap. Cost: one
+syscall per attempt, no route call, no anchor slot. Kept alongside it: today's per-race disarm
+(it still covers the last attempt and any path that skips the loop), and the
+`[!] pselect consumer still inflight` bail-out path stays as it is.
+
+**Candidate B — clear with the write vehicle (the plan's option 1, larger, L).** A
+`*(task + 0x898) = 0` write per stage through the existing W-vehicle. Durable in the strongest
+sense — after it, no walk can find a waiter at all — but each clear costs a route call and an
+anchor slot, roughly doubling a run's exposure, and it clears only what it remembers to clear.
+
+**Not proposed:** gating the consumer's `sched_setattr` on an attempt-live flag. It is the
+plan's option-2 shape again — a race reduction with the same check-to-syscall gap — and the
+measured trigger is now precisely that call.
+
+**Judged by**, after either: `make -C src ghostlock` (0 warnings) + `lint-tidy` (exit 0); then a
+236 series (5 runs, one per boot, guard on) where the `+0x188` class does not recur, against
+the current record — 3 deaths in 5 uninjected driven runs on 2026-10-14 (this session's
+`external/port/cpuset-guard/run-1`, `run-3`, `run-7`), plus `rate-500us/run-3` earlier the same
+day.
+
+## RESULT (2026-10-14, `../port/stale-waiter-disarm/`) — the class does not recur
+
+**Candidate A landed** (working tree, uncommitted): `support::ghost_disarm(why, &err_out)` — the
+dummy-futex disarm extracted from `race/threads.cpp`, with the two silent-failure paths now
+reported (fast path taken; non-timeout errno) — called after **every** attempt's stamp window in
+`SigreturnRoute::execute()` and `SelectStackRoute::execute()`, before the post-stamp `pr_info`
+write runs over the frame, plus the unchanged per-race call and its historical log line.
+
+**Judged on the 236 rig** (the same build the strip gate ran as baseline; the rig's test
+sigreturn profile restored for the build): five runs, one per boot, cpuset guard on —
+**zero `+0x188` oopses, zero kernel-text deaths**, against a same-day pre-change base of 3 such
+deaths in 5 uninjected runs. Three runs finished (`KernelSU ready`); the two failures are
+*different* classes, both seen before the change: the `step=38` dirty race at the last stage
+(6 archived instances) and the post-spray wedge with no oops text.
+
+**Gates.** `make -C src ghostlock` 0 warnings, `lint-tidy` rc=0, and `cmp_disasm` with every
+difference accounted for (`../port/stale-waiter-disarm/cmp_disasm.txt`); the baseline binary is
+byte-identical to the strip gate's, and the candidate carries exactly three `ghost_disarm` call
+sites (race end + both routes).
+
+**What stays open.** The per-attempt disarm is not counted per attempt (its anomaly logs would
+have fired; the optional `remove_waiter` kprobe stays unrun); n=5 has power against today's
+rate, not against the historical ~1/9; the select route's call site is structural only (the rig
+runs sigreturn).
+
+**The clearing rationale, restated after the source read.** The disarm works because the kernel
+rewrites the field itself on the block path (`task_blocks_on_rt_mutex`, `rtmutex.c:962`) and
+nulls it on the expired-timeout path (`remove_waiter`, `:1077`); ETIMEDOUT is its success
+signature, and the dummy word's "owned by tid == getpid()" encoding makes the block path the
+one always taken. The write-vehicle variant (candidate B) remains unimplemented by choice —
+per attempt it would cost a route call and an anchor slot each time.

@@ -57,6 +57,32 @@ namespace ghostlock::race {
         [[nodiscard]] static ghostlock::route::RouteStatus outcome_with_counters(
             const ghostlock::route::RouteStatus &outcome, int32_t calls, int32_t success) noexcept;
 
+        /* How long a route gives the consumer's call to come back before it
+         * treats the walk as wedged. The measured call is 100-230 ms on the
+         * device (era-rate/run-3 records `dur_us=226661`) against a 30 ms stamp
+         * window, so this is ~4x the worst measurement; a route that times out
+         * stops retrying, and the lifecycle's 2 s disarm still runs afterwards
+         * as the last-resort check. */
+        static constexpr uint32_t kConsumerDrainMs = 1000;
+
+        /* Close this handshake sequence and wait for the consumer's call to
+         * return: the elapsed milliseconds (0 when nothing was in flight), or
+         * -1 when the deadline passed with the call still in the kernel.
+         *
+         * The attempt protocols call this after every stamp window, before they
+         * touch this thread's kernel stack again -- the disarm, the post-stamp
+         * print and the next attempt's respray all write over the region the
+         * in-flight walk reads its fake waiter from
+         * (docs/analysis/consumer-stuck-attempt-protocol-plan.md).
+         *
+         * Userspace only, on purpose: `usleep`/`nanosleep` nests through
+         * schedule() -> __switch_to, i.e. exactly the depth that overwrites that
+         * region. Closing the sequence is part of the primitive rather than the
+         * caller's job: the consumer's `go != seq` tests then stop it from
+         * starting a new call, so "inflight == 0" is a settled state and not a
+         * gap between two calls. */
+        [[nodiscard]] int32_t wait_consumer_idle(uint32_t deadline_ms) noexcept;
+
         /* C atomics cannot carry initializers in C++; static instances are
          * zero-initialized and every dynamic path calls reset() first.
          * Memory order: the hot-path stores/loads keep the original default

@@ -65,6 +65,11 @@ namespace ghostlock::route::tcp_zerocopy {
         std::atomic<int32_t> punch_phase;
         std::atomic<int32_t> punch_failed;
         int32_t route_won = 0;
+        /* A consumer call that never came back within the drain deadline: the
+         * walk is still reading the punched mapping, so destroy() retains every
+         * resource instead of freeing a page under it
+         * (docs/analysis/consumer-stuck-attempt-protocol-plan.md). */
+        int32_t consumer_stuck = 0;
         ghostlock::route::RouteStatus status{};
 
     private:

@@ -30,6 +30,20 @@ namespace ghostlock::support {
         uint32_t *uaddr, int32_t op, uint32_t val,
         const void *timeout_or_value, uint32_t *uaddr2, uint32_t val3);
 
+    /* Force the kernel to clear *this thread's* dangling task->pi_blocked_on.
+     *
+     * A PI-futex block whose timeout expires makes the kernel rewrite the field
+     * itself: task_blocks_on_rt_mutex() sets it to the new waiter (on this
+     * call's own live frame), and the -ETIMEDOUT path's remove_waiter() nulls
+     * it. That is the only clearing the kernel offers, and it must run on the
+     * thread that owns the dangling pointer. The dummy word says "owned by
+     * tid == getpid()", so the blocking path is the one always taken; the fast
+     * path would clear nothing and is reported.
+     *
+     * Returns the futex call's return value, *err_out its errno. The timeout
+     * path's signature is ret=-1 errno=ETIMEDOUT. */
+    long ghost_disarm(const char *why, int32_t *err_out);
+
     long sched_setattr_tid(int32_t tid, int32_t nice_value);
 
     void put64(unsigned char *p, size_t off, uint64_t value);

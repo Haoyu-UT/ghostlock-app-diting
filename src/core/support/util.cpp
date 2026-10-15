@@ -263,6 +263,30 @@ namespace ghostlock::support {
         return syscall(SYS_futex, uaddr, op, val, timeout_or_value, uaddr2, val3);
     }
 
+    long ghost_disarm(const char *why, int32_t *err_out) {
+        /* The dummy word encodes "owned by tid == getpid()" (FUTEX_WAITERS set,
+         * TID field = this process's main thread, which exists for the whole
+         * run), so futex_lock_pi takes the blocking path: the fast path would
+         * clear nothing, and only blocking reaches task_blocks_on_rt_mutex() /
+         * remove_waiter(), which is what rewrites task->pi_blocked_on. */
+        uint32_t dummy_word = 0x80000000U | static_cast<uint32_t>(getpid());
+        struct timespec expired = {.tv_sec = 0, .tv_nsec = 0};
+        errno = 0;
+        long ret = futex_op(&dummy_word, FUTEX_LOCK_PI, 0, &expired, nullptr, 0);
+        const int32_t saved = errno;
+        if (err_out) *err_out = saved;
+        if (ret == 0) {
+            /* Took the lock instead of blocking: nothing was cleared. Release
+             * it so a later call is not blocked by this one. */
+            (void) futex_op(&dummy_word, FUTEX_UNLOCK_PI, 0, nullptr, nullptr, 0);
+            pr_warning("ghost disarm (%s) took the fast path; pi_blocked_on NOT cleared\n", why);
+        } else if (saved != ETIMEDOUT) {
+            pr_warning("ghost disarm (%s) ret=%ld errno=%d; not the timeout path\n",
+                       why, ret, saved);
+        }
+        return ret;
+    }
+
     long sched_setattr_tid(int32_t tid, int32_t nice_value) {
         kernel::local_sched_attr attr;
         memset(&attr, 0, sizeof(attr));

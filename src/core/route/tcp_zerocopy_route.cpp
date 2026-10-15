@@ -40,17 +40,25 @@ namespace ghostlock::route::tcp_zerocopy {
     }
 
     void TcpZerocopyRoute::disarm() noexcept {
-        race->consumer_go.store(0);
         punch_go.store(0);
         punch_stop.store(1);
-        while (race->consumer_inflight.load()) {
-            __asm__ volatile (
-
-
-            "yield"
-            ::: "memory");
+        /* Bounded since 2026-10-14 (it used to be an open spin): a call that
+         * never comes back is reported instead of waited on forever, and
+         * destroy() then retains the resources rather than freeing the page a
+         * live walk may still be reading. wait_consumer_idle() closes the
+         * sequence itself, and a call the attempt loop already found stuck is
+         * not waited on twice
+         * (docs/analysis/consumer-stuck-attempt-protocol-plan.md). */
+        const int32_t drain_ms = consumer_stuck
+                                     ? -1
+                                     : race->wait_consumer_idle(
+                                           ghostlock::race::PiRace::kConsumerDrainMs);
+        status.kernel_disarmed = (drain_ms >= 0) ? 1 : 0;
+        if (drain_ms < 0 && !consumer_stuck) {
+            consumer_stuck = 1;
+            (void) fail(49, 0);
+            status.code = ROUTE_DIRTY_FAILURE;
         }
-        status.kernel_disarmed = 1;
     }
 
     void TcpZerocopyRoute::retain_for_process_lifetime() noexcept {
@@ -62,6 +70,21 @@ namespace ghostlock::route::tcp_zerocopy {
     }
 
     void TcpZerocopyRoute::destroy() noexcept {
+        if (consumer_stuck) {
+            /* A wedged walk is still reading the punched mapping, so nothing may
+             * be freed under it: same policy as the failed join below, and the
+             * one the select route applies to its fds ("leaking route fds",
+             * step 34). The run is void from here either way.
+             *
+             * The puncher is deliberately not joined here, even though disarm()
+             * asked it to stop: an unbounded join is the one thing this path
+             * must not do, and its owner is released with the rest of the
+             * resources for process lifetime. */
+            (void) fail(49, 0);
+            status.code = ROUTE_DIRTY_FAILURE;
+            retain_for_process_lifetime();
+            return;
+        }
         if (punch_worker.joinable()) {
             const int32_t join_error = punch_worker.join();
             if (join_error != 0) {
@@ -100,17 +123,6 @@ namespace ghostlock::route {
  * zc words overlap the stale waiter; zc[0x28] is waiter->task, zc[0x30]
  * waiter->lock. */
 #define TCP_PUNCH_SHMEM_LEN (16 * 1024 * 1024)
-
-    static void tcp_wait_for_consumer_idle(tcp_zerocopy::TcpZerocopyRoute *context) {
-        context->race->consumer_go.store(0);
-        while (context->race->consumer_inflight.load()) {
-            __asm__ volatile (
-
-
-            "yield"
-            ::: "memory");
-        }
-    }
 
     static int32_t tcp_make_pair(tcp_zerocopy::TcpZerocopyRoute *context) {
         support::UniqueFd listener(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
@@ -335,7 +347,20 @@ namespace ghostlock::route::tcp_zerocopy {
                     "yield"
                     ::: "memory");
                 }
-                route::tcp_wait_for_consumer_idle(this);
+                /* The release above is what starts the walk, and the walk reads
+                 * its fake waiter out of the punched mapping and this thread's
+                 * stack. Wait for the call to come back before the next
+                 * iteration's send()/getsockopt() runs over either, and give up
+                 * (rather than spin forever as this used to) when it does not
+                 * (docs/analysis/consumer-stuck-attempt-protocol-plan.md). */
+                const int32_t drain_ms =
+                        race->wait_consumer_idle(ghostlock::race::PiRace::kConsumerDrainMs);
+                if (drain_ms < 0) {
+                    consumer_stuck = 1;
+                    (void) fail(49, 0);
+                    status.code = ROUTE_DIRTY_FAILURE;
+                    break;
+                }
             }
 
             int32_t calls = race->consumer_calls.load();
