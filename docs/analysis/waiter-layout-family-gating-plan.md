@@ -288,7 +288,10 @@ Gates run: `make -C src ghostlock` 0 warnings; `make -C src lint-tidy` exit 0; h
 `payload_builder_test`, `target_constants_test`, `select_stack_route_test`, `sigreturn_route_test`,
 `profile_test` all pass; `tools/cmp_disasm.py` against the pre-change 581 binary (record:
 `external/port/pr/` in the root repo). The 5.10 no-regression device run is the same sigreturn
-route the port already gates on diting.
+route the port already gates on diting. The 5.15/6.1 claim now has device evidence on one kernel:
+on `6.1.138-android14-11-g44bda9e8f6e9-ab13792638` (POCO X6 Pro 5G) the chain completed in 5 of 10
+fresh-boot runs on r6 and in 3 of 5 on the dev-line build 638 (2026-10-18). The other 18 6.1
+kernels, and 5.15 itself, remain backed by upstream support plus the offline gate.
 
 Not done here, still open from this document: the `futex_lock_pi` guard scope, the W3-0
 `leaf 1 → 0` justification, and the three `LOCAL DIAGNOSTIC` blocks — all of them are

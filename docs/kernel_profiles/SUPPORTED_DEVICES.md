@@ -145,5 +145,8 @@ is implemented and the rows are back in the table above.
 
 Provenance of the restored rows, stated plainly: the fix rebuilds the waiter's `prio` word per
 kernel family (5.10 output byte-identical, checked by `cmp_disasm`), the unit tests cover both
-word pairs, and the 5.10 side passed its device gates. **No 5.15/6.1 device was available to this
-port**, so these rows rest on upstream's support plus that offline gate — not on a run from here.
+word pairs, and the 5.10 side passed its device gates. The 6.1 side now has one measured kernel:
+on `6.1.138-android14-11-g44bda9e8f6e9-ab13792638` (POCO X6 Pro 5G, `duchamp`) the chain completed
+on **r6 in 5 of 10 fresh-boot runs (3/5 with Android's phantom-process trimmer off)** and on the
+dev-line build 638 in **3 of 5** (2026-10-18). The other 18 6.1 kernels — and 5.15 entirely — still
+rest on upstream's support plus that offline gate, not on a run from here.
