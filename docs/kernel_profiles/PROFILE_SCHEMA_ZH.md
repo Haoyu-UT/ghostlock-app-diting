@@ -103,14 +103,15 @@ route { multicast_waiter { waiter_off = 96, buffer_size = 264 } }
 
 ### 必填矩阵
 
-| 字段组 | tcp_zerocopy | select_stack | multicast_waiter |
-|---|:---:|:---:|:---:|
-| `offset.init_task` / `offset.init_cred` / `offset.root_task_group` / `offset.selinux_enforcing` | 必填 | 必填 | 必填 |
-| `task_struct.prio` / `task_struct.pi_lock` / `task_struct.pi_waiters` / `task_struct.pi_blocked_on` / `task_struct.cred` / `task_struct.seccomp` | 必填 | 必填 | 必填 |
-| `kernel_major` ∈ {5,6}、`cred.copy_size`、`cred.caps_count` 及凭据模板边界 | 必填 | 必填 | 必填 |
-| `route.tcp_zerocopy.compact_waiter` / `route.multicast_waiter.compact_waiter` | 必填 | | 必填 |
-| `route.select_stack.waiter_shift` | | 必填（0 合法） | |
-| `route.multicast_waiter.waiter_off`（>0）、`route.multicast_waiter.buffer_size`、`route.multicast_waiter.task_offset`、`route.multicast_waiter.lock_offset`、`offset.empty_zero_page`、`kernelsnitch.mm_struct_sz`、`cred.ref_count`（>0） | | | 必填 |
+| 字段组 | tcp_zerocopy | select_stack | multicast_waiter | sigreturn |
+|---|:---:|:---:|:---:|:---:|
+| `offset.init_task` / `offset.init_cred` / `offset.root_task_group` / `offset.selinux_enforcing` | 必填 | 必填 | 必填 | 必填 |
+| `task_struct.prio` / `task_struct.pi_lock` / `task_struct.pi_waiters` / `task_struct.pi_blocked_on` / `task_struct.cred` / `task_struct.seccomp` | 必填 | 必填 | 必填 | 必填 |
+| `kernel_major` ∈ {5,6}、`cred.copy_size`、`cred.caps_count` 及凭据模板边界 | 必填 | 必填 | 必填 | 必填 |
+| `route.tcp_zerocopy.compact_waiter` / `route.multicast_waiter.compact_waiter` | 必填 | | 必填 | |
+| `route.select_stack.waiter_shift` | | 必填（0 合法） | | |
+| `route.multicast_waiter.waiter_off`（>0）、`route.multicast_waiter.buffer_size`、`route.multicast_waiter.task_offset`、`route.multicast_waiter.lock_offset`、`offset.empty_zero_page`、`kernelsnitch.mm_struct_sz`、`cred.ref_count`（>0） | | | 必填 | |
+| `route.sigreturn.waiter_off_sve`、`route.sigreturn.waiter_off_plain`（8 字节对齐、>0） | | | | 必填 |
 
 凭据模板边界（通用）：`cred.usage_offset + 4 ≤ cred.copy_size`；`cred.caps_offset + cred.caps_count × 8 ≤ cred.copy_size`；`cred.ref_count ≤ 4`；每个 `cred.refN_image` 非零、`cred.refN_offset + 8 ≤ cred.copy_size`。`multicast_waiter` 还要求 `cred_copy_size ≥ 0xa0` 且 `route.multicast_waiter.waiter_off + route.multicast_waiter.lock_offset + 8 ≤ route.multicast_waiter.buffer_size`。
 
@@ -203,6 +204,13 @@ cred
 | `route.multicast_waiter.task_offset` / `route.multicast_waiter.lock_offset` | 缓冲区中任务 / 锁字段偏移 |
 | `offset.empty_zero_page` | `empty_zero_page` 偏移 |
 
+### 4.5.1 sigreturn 路由字段（`route.sigreturn`）
+
+| 字段 | 含义 |
+|---|---|
+| `route.sigreturn.waiter_off_sve` / `route.sigreturn.waiter_off_plain` | waiter 字节 0 在 0x200 字节 fpsimd 拷贝中的位置，分别对应 SVE 与普通恢复路径。随构建而定，8 字节对齐、非零；两者必填，缺失或不可用时路由在 `prepare()` 拒绝 |
+| `route.sigreturn.lock_anchor_image` / `lock_anchor_bytes` / `lock_anchor_stride` | 与 select 路由相同的 lock anchor 三键。文档不会跨路由合并 section，因此选择 sigreturn 的 profile 在本节声明 |
+
 ### 4.6 KernelSnitch 参数（`kernelsnitch`）
 
 所有路由通用（KernelSnitch 用于 `mm_struct` 泄漏搜索），不随路由取舍：
@@ -220,7 +228,7 @@ cred
 - `heap`：KernelSnitch 搜索的尝试次数与超时
 - `race`：路由竞态等待/稳定/轮询间隔
 - `stages`：W1/W2/W3 尝试次数与稳定时间
-- `routes.tcp_zerocopy` / `routes.select_stack` / `routes.multicast_waiter`：各路由的重试与等待参数，分别位于 `execution-tcp-zerocopy.conf` / `execution-select-stack.conf` / `execution-multicast-waiter.conf`；Kotlin 在合成 native 文档时会为缺失的路由组补默认值，因此 native 始终收到完整 `routes`
+- `routes.tcp_zerocopy` / `routes.select_stack` / `routes.multicast_waiter` / `routes.sigreturn`：各路由的重试与等待参数，分别位于 `execution-tcp-zerocopy.conf` / `execution-select-stack.conf` / `execution-multicast-waiter.conf` / `execution-sigreturn.conf`；Kotlin 在合成 native 文档时会为缺失的路由组补默认值，因此 native 始终收到完整 `routes`
 - `handoff`：root 交接与 KernelSU 加载轮询
 
 ## 6. 校验与反馈

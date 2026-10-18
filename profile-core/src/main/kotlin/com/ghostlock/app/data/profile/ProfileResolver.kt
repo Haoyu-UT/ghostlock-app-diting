@@ -51,6 +51,8 @@ object ProfileResolver {
             "lock_anchor_image" -> "lock_anchor_image"
             "lock_anchor_bytes" -> "lock_anchor_bytes"
             "lock_anchor_stride" -> "lock_anchor_stride"
+            "sig.waiter_off_sve" -> "waiter_off_sve"
+            "sig.waiter_off_plain" -> "waiter_off_plain"
             else -> null
         }
         if (branchField != null) {

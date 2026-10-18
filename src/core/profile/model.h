@@ -42,6 +42,7 @@ namespace ghostlock::profile {
         TcpZerocopy = 1,
         SelectStack = 2,
         MulticastWaiter = 3,
+        Sigreturn = 4,
     };
 
     /* Wire values for the v2 binary transport and the v1 JSON converter. */
@@ -52,6 +53,8 @@ namespace ghostlock::profile {
             std::to_underlying(RouteKind::SelectStack);
     inline constexpr uint8_t kRouteMulticastWaiter =
             std::to_underlying(RouteKind::MulticastWaiter);
+    inline constexpr uint8_t kRouteSigreturn =
+            std::to_underlying(RouteKind::Sigreturn);
 
     /* Single native route catalog: token <-> wire value. Adding a route means
      * one entry here plus its RoutePolicy / procedure. */
@@ -64,6 +67,7 @@ namespace ghostlock::profile {
         {"tcp_zerocopy", kRouteTcpZerocopy},
         {"select_stack", kRouteSelectStack},
         {"multicast_waiter", kRouteMulticastWaiter},
+        {"sigreturn", kRouteSigreturn},
     };
 
     [[nodiscard]] inline uint8_t route_kind_from_string(std::string_view name) {
@@ -131,6 +135,9 @@ namespace ghostlock::profile {
         /* Region length and slot stride (per-build). */
         std::optional<uint64_t> select_lock_anchor_bytes;
         std::optional<uint64_t> select_lock_anchor_stride;
+        /* Waiter byte 0 inside rt_sigreturn's 0x200-byte fpsimd copy. */
+        std::optional<uint64_t> sig_waiter_off_sve;
+        std::optional<uint64_t> sig_waiter_off_plain;
     };
 
     /* Native transport representation of one Kotlin-resolved profile. */
@@ -169,6 +176,15 @@ namespace ghostlock::profile {
 
     struct TcpZerocopyLayout {
         std::optional<uint8_t> compact_waiter;
+    };
+
+    /* The anchor keys repeat because a document never merges route sections. */
+    struct SigreturnLayout {
+        std::optional<uint64_t> waiter_off_sve;
+        std::optional<uint64_t> waiter_off_plain;
+        std::optional<uint64_t> lock_anchor_image;
+        std::optional<uint64_t> lock_anchor_bytes;
+        std::optional<uint64_t> lock_anchor_stride;
     };
 
 
@@ -336,6 +352,18 @@ namespace ghostlock::profile {
 
         [[nodiscard]] TcpZerocopyLayout tcp_zerocopy_layout() const noexcept {
             return (TcpZerocopyLayout){.compact_waiter = values_.misc.compact_waiter};
+        }
+
+        [[nodiscard]] SigreturnLayout sigreturn_layout() const noexcept {
+            return loaded_
+                       ? (SigreturnLayout){
+                           .waiter_off_sve = values_.geometry.sig_waiter_off_sve,
+                           .waiter_off_plain = values_.geometry.sig_waiter_off_plain,
+                           .lock_anchor_image = values_.geometry.select_lock_anchor_image,
+                           .lock_anchor_bytes = values_.geometry.select_lock_anchor_bytes,
+                           .lock_anchor_stride = values_.geometry.select_lock_anchor_stride,
+                       }
+                       : SigreturnLayout{};
         }
 
         [[nodiscard]] uint32_t or_default(uint32_t value, uint32_t fallback)

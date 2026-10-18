@@ -24,6 +24,8 @@ namespace ghostlock::route {
     RouteStatus do_tcp_fake_lock_route(const ghostlock::memory::WriteRequest *request);
 
     RouteStatus do_kernel5_fake_lock_route(const ghostlock::memory::WriteRequest *request);
+
+    RouteStatus do_sigreturn_fake_lock_route(const ghostlock::memory::WriteRequest *request);
 } // namespace ghostlock::route
 
 #endif

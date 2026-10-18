@@ -67,6 +67,51 @@ namespace ghostlock::memory {
     /* Fixed payload fragment sizes shared by the encoders and their callers. */
     inline constexpr std::size_t kCompactWaiterBytes = 0x30;
 
+    /* The eleven words of the 5.x rt_mutex_waiter; both stack-stamp routes
+     * build their strip from this one definition. */
+    inline constexpr std::size_t kWaiterBytes = 0x58;
+    inline constexpr std::size_t kWaiterWords =
+            kWaiterBytes / sizeof(std::uint64_t);
+
+    struct WaiterWords final {
+        std::uintptr_t tree_pc = 0;
+        std::uintptr_t tree_right = 0;
+        std::uintptr_t tree_left = 0;
+        std::uintptr_t pi_pc = 0;
+        std::uintptr_t pi_right = 0;
+        std::uintptr_t pi_left = 0;
+        std::uintptr_t task = 0;
+        std::uintptr_t lock = 0;
+        std::uint64_t prio = 0;
+        std::uint64_t deadline = 0;
+        std::uint64_t ww_ctx = 0;
+    };
+
+    /* The pi triple parks at zero: a zero pi node stays out of every descent. */
+    [[nodiscard]] inline WaiterWords waiter_words(
+        const PayloadWriteLayout &layout, std::uintptr_t fake_task,
+        std::uintptr_t lock_word, std::uint64_t prio) noexcept {
+        const WaiterTreeStamp stamp = waiter_tree_stamp(layout);
+        return WaiterWords{
+            .tree_pc = stamp.pc,
+            .tree_right = stamp.right,
+            .tree_left = stamp.left,
+            .pi_pc = 0,
+            .pi_right = 0,
+            .pi_left = 0,
+            .task = fake_task,
+            .lock = lock_word,
+            .prio = prio,
+            .deadline = 0,
+            .ww_ctx = 0,
+        };
+    }
+
+    /* Word i lands at offset + 8*i; every other byte is left untouched. */
+    [[nodiscard]] bool encode_waiter_words(
+        std::span<std::byte> buffer, std::size_t offset,
+        const WaiterWords &words) noexcept;
+
     /* Bounds-checked encoders. They return false without modifying memory when
  * the destination cannot contain every field required by the layout. */
     [[nodiscard]] bool encode_compact_waiter(

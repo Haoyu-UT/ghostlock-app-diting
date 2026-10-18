@@ -33,4 +33,9 @@ namespace ghostlock::route {
         (void) request;
         return RouteStatus{};
     }
+
+    RouteStatus do_sigreturn_fake_lock_route(const ghostlock::memory::WriteRequest *request) {
+        (void) request;
+        return RouteStatus{};
+    }
 } // namespace ghostlock::route

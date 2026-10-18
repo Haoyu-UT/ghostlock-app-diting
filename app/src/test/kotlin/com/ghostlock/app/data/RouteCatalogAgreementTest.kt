@@ -16,6 +16,7 @@ class RouteCatalogAgreementTest {
             "tcp_zerocopy" to 1u,
             "select_stack" to 2u,
             "multicast_waiter" to 3u,
+            "sigreturn" to 4u,
         )
         assertEquals(expected, RouteKind.values().map { it.token to it.wire })
     }

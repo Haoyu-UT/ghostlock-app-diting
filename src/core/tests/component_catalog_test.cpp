@@ -23,7 +23,7 @@ int32_t main(void) {
     assert(!runtime::backend_available(BackendKind::Cve2026_64560));
 
     for (MiddlewareKind kind : {MiddlewareKind::TcpZerocopy, MiddlewareKind::SelectStack,
-                                MiddlewareKind::MulticastWaiter}) {
+                                MiddlewareKind::MulticastWaiter, MiddlewareKind::Sigreturn}) {
         assert(runtime::middleware_available(kind));
     }
     assert(!runtime::middleware_available(MiddlewareKind::Auto));
@@ -40,11 +40,12 @@ int32_t main(void) {
 
     /* combination_supported is THE dispatch authority. Every admitted tuple
      * must also pass the per-id pre-check, and the current catalogue admits
-     * exactly root_child x cve_2026_43499 x {tcp, select, multicast}. */
+     * exactly root_child x cve_2026_43499 x {tcp, select, multicast, sigreturn}. */
     const FrontendKind frontends[] = {FrontendKind::RootChild, FrontendKind::UmhForward};
     const BackendKind backends[] = {BackendKind::Cve2026_43499, BackendKind::Cve2026_64560};
     const MiddlewareKind middlewares[] = {MiddlewareKind::TcpZerocopy, MiddlewareKind::SelectStack,
-                                          MiddlewareKind::MulticastWaiter, MiddlewareKind::Auto};
+                                          MiddlewareKind::MulticastWaiter, MiddlewareKind::Sigreturn,
+                                          MiddlewareKind::Auto};
     int32_t catalogued = 0;
     for (FrontendKind f : frontends) {
         for (BackendKind b : backends) {
@@ -57,13 +58,15 @@ int32_t main(void) {
             }
         }
     }
-    assert(catalogued == 3);
+    assert(catalogued == 4);
     assert(runtime::combination_supported(
         {FrontendKind::RootChild, BackendKind::Cve2026_43499, MiddlewareKind::TcpZerocopy}));
     assert(runtime::combination_supported(
         {FrontendKind::RootChild, BackendKind::Cve2026_43499, MiddlewareKind::SelectStack}));
     assert(runtime::combination_supported(
         {FrontendKind::RootChild, BackendKind::Cve2026_43499, MiddlewareKind::MulticastWaiter}));
+    assert(runtime::combination_supported(
+        {FrontendKind::RootChild, BackendKind::Cve2026_43499, MiddlewareKind::Sigreturn}));
     assert(!runtime::combination_supported(
         {FrontendKind::RootChild, BackendKind::Cve2026_43499, MiddlewareKind::Auto}));
     assert(!runtime::combination_supported(
@@ -97,6 +100,10 @@ int32_t main(void) {
            runtime::DispatchTarget::RootChild_Cve43499_MulticastWaiter);
     assert(runtime::dispatch_target(
                {FrontendKind::RootChild, BackendKind::Cve2026_43499,
+                MiddlewareKind::Sigreturn}) ==
+           runtime::DispatchTarget::RootChild_Cve43499_Sigreturn);
+    assert(runtime::dispatch_target(
+               {FrontendKind::RootChild, BackendKind::Cve2026_43499,
                 MiddlewareKind::Auto}) == runtime::DispatchTarget::None);
     assert(runtime::dispatch_target(
                {FrontendKind::UmhForward, BackendKind::Cve2026_43499,
@@ -121,6 +128,10 @@ int32_t main(void) {
                   runtime::DispatchTarget::RootChild_Cve43499_MulticastWaiter);
     static_assert(runtime::dispatch_target_of(
                       FrontendKind::RootChild, BackendKind::Cve2026_43499,
+                      MiddlewareKind::Sigreturn) ==
+                  runtime::DispatchTarget::RootChild_Cve43499_Sigreturn);
+    static_assert(runtime::dispatch_target_of(
+                      FrontendKind::RootChild, BackendKind::Cve2026_43499,
                       MiddlewareKind::Auto) == runtime::DispatchTarget::None);
     static_assert(runtime::dispatch_target_of(
                       FrontendKind::UmhForward, BackendKind::Cve2026_43499,
@@ -133,6 +144,7 @@ int32_t main(void) {
     assert(runtime::frontend_name(FrontendKind::RootChild) == "root_child");
     assert(runtime::backend_name(BackendKind::Cve2026_43499) == "cve_2026_43499");
     assert(runtime::middleware_name(MiddlewareKind::MulticastWaiter) == "multicast_waiter");
+    assert(runtime::middleware_name(MiddlewareKind::Sigreturn) == "sigreturn");
     assert(runtime::middleware_name(MiddlewareKind::Auto) == "auto");
 
     puts("component_catalog_test: ok");

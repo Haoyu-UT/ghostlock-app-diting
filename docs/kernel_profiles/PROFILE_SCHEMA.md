@@ -130,14 +130,15 @@ route { multicast_waiter { waiter_off = 96, buffer_size = 264 } }
 
 ### Required-field matrix
 
-| Field group | tcp_zerocopy | select_stack | multicast_waiter |
-|---|:---:|:---:|:---:|
-| `offset.init_task` / `offset.init_cred` / `offset.root_task_group` / `offset.selinux_enforcing` | required | required | required |
-| `task_struct.prio` / `task_struct.pi_lock` / `task_struct.pi_waiters` / `task_struct.pi_blocked_on` / `task_struct.cred` / `task_struct.seccomp` | required | required | required |
-| `kernel_major` ∈ {5,6}, `cred.copy_size`, `cred.caps_count`, and the credential-template bounds | required | required | required |
-| `route.tcp_zerocopy.compact_waiter` / `route.multicast_waiter.compact_waiter` | required | | required |
-| `route.select_stack.waiter_shift` | | required (0 is valid) | |
-| `route.multicast_waiter.waiter_off` (>0), `route.multicast_waiter.buffer_size`, `route.multicast_waiter.task_offset`, `route.multicast_waiter.lock_offset`, `offset.empty_zero_page`, `kernelsnitch.mm_struct_sz`, `cred.ref_count` (>0) | | | required |
+| Field group | tcp_zerocopy | select_stack | multicast_waiter | sigreturn |
+|---|:---:|:---:|:---:|:---:|
+| `offset.init_task` / `offset.init_cred` / `offset.root_task_group` / `offset.selinux_enforcing` | required | required | required | required |
+| `task_struct.prio` / `task_struct.pi_lock` / `task_struct.pi_waiters` / `task_struct.pi_blocked_on` / `task_struct.cred` / `task_struct.seccomp` | required | required | required | required |
+| `kernel_major` ∈ {5,6}, `cred.copy_size`, `cred.caps_count`, and the credential-template bounds | required | required | required | required |
+| `route.tcp_zerocopy.compact_waiter` / `route.multicast_waiter.compact_waiter` | required | | required | |
+| `route.select_stack.waiter_shift` | | required (0 is valid) | | |
+| `route.multicast_waiter.waiter_off` (>0), `route.multicast_waiter.buffer_size`, `route.multicast_waiter.task_offset`, `route.multicast_waiter.lock_offset`, `offset.empty_zero_page`, `kernelsnitch.mm_struct_sz`, `cred.ref_count` (>0) | | | required | |
+| `route.sigreturn.waiter_off_sve`, `route.sigreturn.waiter_off_plain` (8-aligned, >0) | | | | required |
 
 Credential-template bounds (general): `cred.usage_offset + 4 ≤ cred.copy_size`;
 `cred.caps_offset + cred.caps_count × 8 ≤ cred.copy_size`; `cred.ref_count ≤ 4`;
@@ -239,6 +240,13 @@ addresses.
 | `route.multicast_waiter.task_offset` / `route.multicast_waiter.lock_offset` | Task / lock field offsets in the buffer |
 | `offset.empty_zero_page` | `empty_zero_page` offset |
 
+### 4.5.1 sigreturn route fields (`route.sigreturn`)
+
+| Field | Meaning |
+|---|---|
+| `route.sigreturn.waiter_off_sve` / `route.sigreturn.waiter_off_plain` | Where waiter byte 0 sits inside the 0x200-byte fpsimd copy, for the SVE and plain restore paths. Per build, 8-aligned, non-zero; both are required and the route refuses at `prepare()` if either is absent or unusable |
+| `route.sigreturn.lock_anchor_image` / `lock_anchor_bytes` / `lock_anchor_stride` | The same lock-anchor trio the select route carries. A document never merges another route's section, so a profile selecting sigreturn states it here |
+
 ### 4.6 KernelSnitch values (`kernelsnitch`)
 
 Shared by every route (KernelSnitch drives the `mm_struct` leak search), not
@@ -263,9 +271,11 @@ load these presets directly, so device profiles no longer `include` them:
 - `heap`: KernelSnitch search attempt counts and timeouts
 - `race`: route race wait / settle / poll intervals
 - `stages`: W1/W2/W3 attempt counts and settle times
-- `routes.tcp_zerocopy` / `routes.select_stack` / `routes.multicast_waiter`:
+- `routes.tcp_zerocopy` / `routes.select_stack` / `routes.multicast_waiter` /
+  `routes.sigreturn`:
   per-route retry and wait parameters, in `execution-tcp-zerocopy.conf` /
-  `execution-select-stack.conf` / `execution-multicast-waiter.conf`. When
+  `execution-select-stack.conf` / `execution-multicast-waiter.conf` /
+  `execution-sigreturn.conf`. When
   composing the native document, Kotlin fills in missing route groups with the
   defaults, so native always receives a complete `routes` object
 - `handoff`: root handoff and KernelSU load polling
