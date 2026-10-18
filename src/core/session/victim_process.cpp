@@ -167,10 +167,8 @@ namespace ghostlock::session::victim {
         park_child_process_forever();
     }
 
-    /* The select route rebinds every fd < PSELECT_ROUTE_NFDS whose bit is set
-     * in the poisoned fd_sets: move the parent-held ends out of that range.
-     * A failure fails the spawn -- fork() needs no descriptor, so the child
-     * would otherwise run with an endpoint the route can rebind. */
+    /* The route rebinds fds below PSELECT_ROUTE_NFDS: keep the parent-held ends
+     * above it, or the child runs with an endpoint the route can clobber. */
     static bool move_fd_above_route_range(support::UniqueFd &fd) {
         if (!fd.valid()) return true;
         const int32_t high = fcntl(fd.get(), F_DUPFD_CLOEXEC,

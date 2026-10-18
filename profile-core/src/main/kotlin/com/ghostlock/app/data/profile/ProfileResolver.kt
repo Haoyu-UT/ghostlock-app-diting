@@ -48,6 +48,9 @@ object ProfileResolver {
         val branchField = when (path) {
             "compact_waiter" -> "compact_waiter"
             "pselect_waiter_shift" -> "waiter_shift"
+            "lock_anchor_image" -> "lock_anchor_image"
+            "lock_anchor_bytes" -> "lock_anchor_bytes"
+            "lock_anchor_stride" -> "lock_anchor_stride"
             else -> null
         }
         if (branchField != null) {

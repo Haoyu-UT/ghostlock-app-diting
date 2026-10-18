@@ -57,6 +57,16 @@ namespace ghostlock::race {
         [[nodiscard]] static ghostlock::route::RouteStatus outcome_with_counters(
             const ghostlock::route::RouteStatus &outcome, int32_t calls, int32_t success) noexcept;
 
+        /* How long a route gives the consumer's call to come back before it
+         * treats the walk as wedged: generous against the 30 ms stamp window.
+         * On timeout the route stops retrying; the lifecycle's 2 s disarm
+         * still runs afterwards. */
+        static constexpr uint32_t kConsumerDrainMs = 1000;
+
+        /* Close the handshake and wait for the consumer's call: elapsed ms, or
+         * -1 on deadline. Userspace only; "inflight == 0" is then settled. */
+        [[nodiscard]] int32_t wait_consumer_idle(uint32_t deadline_ms) noexcept;
+
         /* C atomics cannot carry initializers in C++; static instances are
          * zero-initialized and every dynamic path calls reset() first.
          * Memory order: the hot-path stores/loads keep the original default
@@ -79,6 +89,7 @@ namespace ghostlock::race {
         std::atomic<int32_t> consumer_inflight;
         std::atomic<uint32_t> route_delay_usec;
         std::atomic<int32_t> fast_repair;
+
         int32_t main_cpu = 0;
         int32_t consumer_cpu = 0;
         ghostlock::support::PthreadOwner waiter_owner;

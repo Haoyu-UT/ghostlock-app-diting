@@ -40,17 +40,21 @@ namespace ghostlock::route::tcp_zerocopy {
     }
 
     void TcpZerocopyRoute::disarm() noexcept {
-        race->consumer_go.store(0);
         punch_go.store(0);
         punch_stop.store(1);
-        while (race->consumer_inflight.load()) {
-            __asm__ volatile (
-
-
-            "yield"
-            ::: "memory");
+        /* Bounded drain: report a call that never comes back instead of
+         * spinning on it, and destroy() then retains the page. A call the
+         * attempt loop already found stuck is not waited on twice. */
+        const int32_t drain_ms = consumer_stuck
+                                     ? -1
+                                     : race->wait_consumer_idle(
+                                           ghostlock::race::PiRace::kConsumerDrainMs);
+        status.kernel_disarmed = (drain_ms >= 0) ? 1 : 0;
+        if (drain_ms < 0 && !consumer_stuck) {
+            consumer_stuck = 1;
+            (void) fail(49, 0);
+            status.code = ROUTE_DIRTY_FAILURE;
         }
-        status.kernel_disarmed = 1;
     }
 
     void TcpZerocopyRoute::retain_for_process_lifetime() noexcept {
@@ -62,6 +66,14 @@ namespace ghostlock::route::tcp_zerocopy {
     }
 
     void TcpZerocopyRoute::destroy() noexcept {
+        if (consumer_stuck) {
+            /* A wedged walk still reads the punched mapping: free nothing under
+             * it, and never join the puncher. */
+            (void) fail(49, 0);
+            status.code = ROUTE_DIRTY_FAILURE;
+            retain_for_process_lifetime();
+            return;
+        }
         if (punch_worker.joinable()) {
             const int32_t join_error = punch_worker.join();
             if (join_error != 0) {
@@ -100,17 +112,6 @@ namespace ghostlock::route {
  * zc words overlap the stale waiter; zc[0x28] is waiter->task, zc[0x30]
  * waiter->lock. */
 #define TCP_PUNCH_SHMEM_LEN (16 * 1024 * 1024)
-
-    static void tcp_wait_for_consumer_idle(tcp_zerocopy::TcpZerocopyRoute *context) {
-        context->race->consumer_go.store(0);
-        while (context->race->consumer_inflight.load()) {
-            __asm__ volatile (
-
-
-            "yield"
-            ::: "memory");
-        }
-    }
 
     static int32_t tcp_make_pair(tcp_zerocopy::TcpZerocopyRoute *context) {
         support::UniqueFd listener(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
@@ -335,7 +336,17 @@ namespace ghostlock::route::tcp_zerocopy {
                     "yield"
                     ::: "memory");
                 }
-                route::tcp_wait_for_consumer_idle(this);
+                /* The release above starts the walk, which reads its fake waiter
+                 * out of the punched mapping and this stack; wait for the call
+                 * to return before the next iteration touches either. */
+                const int32_t drain_ms =
+                        race->wait_consumer_idle(ghostlock::race::PiRace::kConsumerDrainMs);
+                if (drain_ms < 0) {
+                    consumer_stuck = 1;
+                    (void) fail(49, 0);
+                    status.code = ROUTE_DIRTY_FAILURE;
+                    break;
+                }
             }
 
             int32_t calls = race->consumer_calls.load();

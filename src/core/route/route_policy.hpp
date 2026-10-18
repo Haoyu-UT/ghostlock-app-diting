@@ -267,9 +267,11 @@ namespace ghostlock::route {
         return result;
     }
 
-    /* True when the resolved policy needs the post-race ghost disarm. */
+    /* The 5.x PI primitive leaves the ghost on every route, so every 5.x race
+     * disarms; multicast stays as an OR. */
     [[nodiscard]] inline bool route_needs_ghost_disarm(
         const profile::TargetProfile &profile) noexcept {
+        if (profile.kernel_major() == 5) return true;
         return route_capability(profile, [](auto policy) {
             return std::decay_t<decltype(policy)>::multicast;
         });

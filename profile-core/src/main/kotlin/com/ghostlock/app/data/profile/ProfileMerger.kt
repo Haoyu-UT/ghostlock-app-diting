@@ -29,8 +29,11 @@ object ProfileMerger {
         pair: CpuPairView,
         routePresets: Map<String, ValueMap>,
     ): ValueMap {
+        /* The caller's tuning map is shared by every profile it resolves, and
+         * the merge writes into the maps it is handed. Copy first, or the first
+         * profile's values leak into every later one. */
         val defaults = valueMapOf("release" to deviceRelease).apply {
-            if (tuningExecution != null) put("execution", tuningExecution)
+            if (tuningExecution != null) put("execution", tuningExecution.copyValue().asValueMap())
         }
         val resolved = mergeSource(
             mergeSource(
@@ -62,7 +65,9 @@ object ProfileMerger {
             val defaults = routePresets[route] ?: continue
             val existing = routes[route].asValueMap()
             if (existing == null) {
-                routes[route] = defaults
+                /* Same sharing hazard as the tuning map above: hand the profile
+                 * its own copy, never the preset object itself. */
+                routes[route] = defaults.copyValue()
                 continue
             }
             for ((key, value) in defaults) {

@@ -30,6 +30,15 @@ int32_t main(void) {
     assert(script.size() <=
            config::kRootScriptPathCapacity - 1);
 
+    /* Same truncation as the root script: a long home dir must not produce a
+     * path open() rejects. */
+    assert(config::anchor_state_file("/data/local/tmp") ==
+           "/data/local/tmp/.ghostlock_anchor");
+    assert(config::anchor_state_file("") == "/.ghostlock_anchor");
+    const std::string anchor = config::anchor_state_file(normalized);
+    assert(anchor.size() == normalized.size() + 18);
+    assert(anchor.size() <= config::kAnchorStatePathCapacity - 1);
+
     puts("runtime_paths_test: ok");
     return 0;
 }

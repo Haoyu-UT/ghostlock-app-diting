@@ -1,5 +1,7 @@
 #include "kernel/target.h"
 
+#include "kernel/constants.hpp"
+
 using namespace ghostlock;
 
 #include <cassert>
@@ -121,3 +123,11 @@ int32_t main() {
     assert(!near_end.checked_add(2));
     return 0;
 }
+
+static_assert(ghostlock::kernel::waiter_prio_word(ghostlock::kernel::FAKE_WAITER_PRIO, false) ==
+              static_cast<std::uint64_t>(ghostlock::kernel::FAKE_WAITER_PRIO));
+static_assert(ghostlock::kernel::waiter_prio_word(ghostlock::kernel::FAKE_WAITER_PRIO, true) ==
+              ((static_cast<std::uint64_t>(ghostlock::kernel::FAKE_WAITER_PRIO) << 32) |
+               ghostlock::kernel::FAKE_WAITER_WAKE_STATE));
+static_assert(ghostlock::kernel::waiter_prio_word(140, true) == 0x0000008c00000003ULL);
+static_assert(ghostlock::kernel::waiter_prio_word(140, false) == 0x000000000000008cULL);

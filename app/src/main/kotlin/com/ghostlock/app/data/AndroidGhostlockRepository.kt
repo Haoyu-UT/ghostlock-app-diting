@@ -654,6 +654,10 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     environment()["TMPDIR"] = workDir.absolutePath
                     environment()["HOME"] = workDir.absolutePath
                     environment()["GHOSTLOCK_KSU_LOG"] = ksuLog.absolutePath
+                    /* Trust the anchor only when the install predates the boot. */
+                    if (InstallClock.installPredatesBoot(appContext)) {
+                        environment()["GHOSTLOCK_ANCHOR_TRUSTED"] = "1"
+                    }
                 }
             onLog("<b> starting native: ${binary.absolutePath}")
             resetRunState()
