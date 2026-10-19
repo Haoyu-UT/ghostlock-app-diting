@@ -383,3 +383,84 @@ pub fn size_of(code: SizeCode) -> u8 {
         SizeCode::X => 8,
     }
 }
+
+/// Image section bounds, in the same convention `--anchor-scan` uses.
+pub fn bounds_from(rel: &BTreeMap<String, BTreeSet<u64>>) -> Bounds {
+    let g = |name: &str| -> u64 {
+        rel.get(name)
+            .and_then(|offs| offs.iter().next().copied())
+            .unwrap_or(0)
+    };
+    Bounds {
+        text_start: g("_text"),
+        text_end: g("_etext"),
+        init_start: g("_sinittext"),
+        init_end: g("_einittext"),
+        bss_start: g("__bss_start"),
+        bss_end: g("__bss_stop"),
+        ro_after_init_end: g("__end_ro_after_init"),
+    }
+}
+
+/// A named symbol's candidate, regardless of the extent filter.
+pub fn named_candidate(
+    rel: &BTreeMap<String, BTreeSet<u64>>,
+    bounds: &Bounds,
+    name: &str,
+) -> Option<Candidate> {
+    let mut all: Vec<(u64, String)> = Vec::new();
+    for (symbol, offsets) in rel {
+        for offset in offsets {
+            all.push((*offset, symbol.clone()));
+        }
+    }
+    all.sort();
+    let (index, (offset, _)) = all
+        .iter()
+        .enumerate()
+        .find(|(_, (_, symbol))| symbol == name)?;
+    let extent = all
+        .get(index + 1)
+        .map(|(next, _)| next.saturating_sub(*offset))
+        .unwrap_or(bounds.bss_end.saturating_sub(*offset));
+    Some(Candidate {
+        name: name.to_string(),
+        offset: *offset,
+        extent,
+    })
+}
+
+/// Assess one named symbol; `None` when it is not in kallsyms.
+pub fn assess_named(
+    rel: &BTreeMap<String, BTreeSet<u64>>,
+    kernel: &[u8],
+    name: &str,
+) -> Option<Assessment> {
+    let bounds = bounds_from(rel);
+    let candidate = named_candidate(rel, &bounds, name)?;
+    let refs = scan_references(kernel, &bounds);
+    Some(assess(&candidate, &refs, rel, &bounds))
+}
+
+/// Pick the region a generated profile should carry: the named preference when
+/// it exists, else the largest non-unsafe candidate that fits at least one lock
+/// slot. The named path is how the diting line is validated (`dump_skip.zeroes`);
+/// the ranked path is the fallback for a build whose symbol set moved.
+pub fn best_candidate(
+    kernel: &[u8],
+    rel: &BTreeMap<String, BTreeSet<u64>>,
+    prefer: Option<&str>,
+) -> Option<Assessment> {
+    let bounds = bounds_from(rel);
+    let refs = scan_references(kernel, &bounds);
+    if let Some(name) = prefer {
+        if let Some(candidate) = named_candidate(rel, &bounds, name) {
+            return Some(assess(&candidate, &refs, rel, &bounds));
+        }
+    }
+    candidates(rel, &bounds, 256)
+        .into_iter()
+        .map(|candidate| assess(&candidate, &refs, rel, &bounds))
+        .filter(|a| a.verdict != Verdict::Unsafe && a.safe_len >= 32)
+        .max_by_key(|a| a.safe_len)
+}

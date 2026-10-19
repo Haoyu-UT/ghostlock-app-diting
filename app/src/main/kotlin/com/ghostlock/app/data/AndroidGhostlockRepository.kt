@@ -364,7 +364,19 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 /* --format conf: the extractor output is already the flattened
                  * profile (no includes, credential template inlined), so the
                  * stored document needs no legacy conversion. */
-                addAll(listOf("--format", "conf", "--out", parsedFile.absolutePath, "--work-dir", filesDir.absolutePath))
+                /* --anchor: the diting 5.10 line gets its lock-anchor triple
+                 * derived from the image; other families warn and ignore it. */
+                addAll(
+                    listOf(
+                        "--format",
+                        "conf",
+                        "--anchor",
+                        "--out",
+                        parsedFile.absolutePath,
+                        "--work-dir",
+                        filesDir.absolutePath,
+                    ),
+                )
             }
             onLog("<k> extract: $effectiveInput")
             val code = runProcess(

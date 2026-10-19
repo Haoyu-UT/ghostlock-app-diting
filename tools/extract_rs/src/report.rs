@@ -98,6 +98,7 @@ const CONF_TASK_FIELDS: &[(&str, &str)] = &[
 const CONF_ROUTE_FIELDS: &[(&str, &[&str])] = &[
     ("tcp_zerocopy", &["compact_waiter"]),
     ("select_stack", &["waiter_shift"]),
+    ("sigreturn", &["waiter_off_sve", "waiter_off_plain"]),
     (
         "multicast_waiter",
         &[
@@ -211,6 +212,26 @@ pub fn conf_route_geometry(
         .split('.')
         .next()
         .and_then(|part| part.parse::<u32>().ok());
+    // The diting 5.10 line has no BTF, so its route geometry cannot be derived
+    // from the pselect layout; the frame-depth rule selects the route and the
+    // family supplies the constants.
+    if crate::family::matches(release) {
+        match route {
+            "select_stack" => {
+                return vec![
+                    ("waiter_shift", crate::family::SELECT_WAITER_SHIFT),
+                    ("compact_waiter", crate::family::SELECT_COMPACT_WAITER),
+                ];
+            }
+            "sigreturn" => {
+                return vec![
+                    ("waiter_off_sve", crate::family::SIGRETURN_OFF_SVE),
+                    ("waiter_off_plain", crate::family::SIGRETURN_OFF_PLAIN),
+                ];
+            }
+            _ => {}
+        }
+    }
     match route {
         "select_stack" => pselect_shift
             .map(|shift| vec![("waiter_shift", shift)])
@@ -330,22 +351,25 @@ pub fn render_conf(input: &ConfInputs<'_>) -> String {
         // and the missing fields surface as invalid paths on the Kotlin side.
         lines.push("route {".to_string());
         lines.push(format!("  {route} {{"));
-        match CONF_ROUTE_FIELDS.iter().find(|(name, _)| *name == route) {
-            Some((_, fields)) => {
-                for field in *fields {
-                    let value = input
-                        .route_geometry
-                        .iter()
-                        .find(|(key, _)| key == field)
-                        .map(|(_, value)| value.to_string())
-                        .unwrap_or_else(|| "null".to_string());
-                    lines.push(format!("    {field} = {value}"));
-                }
+        let mut written: Vec<&str> = Vec::new();
+        if let Some((_, fields)) = CONF_ROUTE_FIELDS.iter().find(|(name, _)| *name == route) {
+            for field in *fields {
+                let value = input
+                    .route_geometry
+                    .iter()
+                    .find(|(key, _)| key == field)
+                    .map(|(_, value)| value.to_string())
+                    .unwrap_or_else(|| "null".to_string());
+                lines.push(format!("    {field} = {value}"));
+                written.push(*field);
             }
-            None => {
-                for (key, value) in input.route_geometry {
-                    lines.push(format!("    {key} = {value}"));
-                }
+        }
+        // Geometry outside the route's fixed universe (the family's
+        // compact_waiter, the derived lock anchor) is emitted as-is; keys the
+        // universe marks absent stay `null`.
+        for (key, value) in input.route_geometry {
+            if !written.contains(key) {
+                lines.push(format!("    {key} = {value}"));
             }
         }
         lines.push("  }".to_string());
@@ -356,6 +380,37 @@ pub fn render_conf(input: &ConfInputs<'_>) -> String {
         "fallback",
         &[("to".to_string(), "\"none\"".to_string())],
     );
+
+    // The diting 5.10 execution block is identical in all eight bundled
+    // profiles (selected_cpus 4/5, the Batch-E race knobs, the 5 ms first
+    // walk). It is device behaviour, not image layout, but a profile without
+    // it runs on the upstream defaults, which are not the measured ones.
+    if crate::family::matches(release) {
+        lines.push("execution {".to_string());
+        lines.push("  selected_cpus {".to_string());
+        lines.push(format!("    main = {}", crate::family::SELECTED_CPUS.0));
+        lines.push(format!("    consumer = {}", crate::family::SELECTED_CPUS.1));
+        lines.push("  }".to_string());
+        lines.push("  race {".to_string());
+        lines.push(format!(
+            "    route_wait_ms = {}",
+            crate::family::ROUTE_WAIT_MS
+        ));
+        lines.push(format!(
+            "    setup_settle_us = {}",
+            crate::family::SETUP_SETTLE_US
+        ));
+        lines.push("  }".to_string());
+        lines.push("  routes {".to_string());
+        lines.push("    select_stack {".to_string());
+        lines.push(format!(
+            "      enter_delay_us = {}",
+            crate::family::SELECT_ENTER_DELAY_US
+        ));
+        lines.push("    }".to_string());
+        lines.push("  }".to_string());
+        lines.push("}".to_string());
+    }
 
     // KernelSnitch: full universe. `collisions` is emitted for a verified
     // train (and every 5.x kernel); `mm_struct_sz` only where it applies. An
@@ -373,9 +428,15 @@ pub fn render_conf(input: &ConfInputs<'_>) -> String {
                 }
             }
             Some(5) => {
-                // android13-5.15 measured defaults (bundled 5.15 profile).
                 snitch.push(("collisions".to_string(), "8".to_string()));
-                snitch.push(("mm_struct_sz".to_string(), "1024".to_string()));
+                // The diting 5.10 line's slab stride is 960; 1024 is the
+                // template default (and the measured 5.15 value).
+                let mm_struct_sz = if crate::family::matches(release) {
+                    crate::family::MM_STRUCT_SZ
+                } else {
+                    1024
+                };
+                snitch.push(("mm_struct_sz".to_string(), mm_struct_sz.to_string()));
             }
             _ => {}
         }
