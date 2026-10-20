@@ -43,6 +43,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     private companion object {
         const val OffsetsFileName = "offsets.conf"
         const val LegacyOffsetsFileName = "offsets.json"
+        const val FeasibleReportFileName = "offsets_feasible.json"
         const val UserProfilesDirectoryName = "user_profiles"
         const val EditSessionPreferences = "ghostlock_edit_session"
         const val ExtractBinaryName = "libextract.so"
@@ -310,9 +311,11 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         uefiPath: String?,
         vendorBootPath: String?,
         overwrite: Boolean,
+        route: String?,
         onLog: (String) -> Unit,
     ): ParseResult {
         val parsedFile = File(filesDir, "offsets_parse.tmp")
+        val feasibleFile = File(filesDir, FeasibleReportFileName)
         var tempBootFile: File? = null
         var tempXblFile: File? = null
         return try {
@@ -322,7 +325,13 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     pendingParsedDocument = null
                     dropReplacedDocuments(pending.releases)
                     userProfileStore.save(pending.name, pending.text)
-                    return ParseResult.Parsed(pending.releases, pending.missing, pending.name)
+                    return ParseResult.Parsed(
+                        pending.releases,
+                        pending.missing,
+                        pending.name,
+                        pending.route,
+                        pending.anchor,
+                    )
                 }
             }
             val binary = File(appContext.applicationInfo.nativeLibraryDir, ExtractBinaryName)
@@ -347,6 +356,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             }
 
             parsedFile.delete()
+            feasibleFile.delete()
             val args = buildList {
                 add(effectiveInput)
                 if (effectiveXblPath != null) {
@@ -366,6 +376,8 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                  * stored document needs no legacy conversion. */
                 /* --anchor: the diting 5.10 line gets its lock-anchor triple
                  * derived from the image; other families warn and ignore it. */
+                /* --feasible-out: written before an ambiguity exit, so the app
+                 * can offer the routes the image actually supports. */
                 addAll(
                     listOf(
                         "--format",
@@ -375,20 +387,63 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                         parsedFile.absolutePath,
                         "--work-dir",
                         filesDir.absolutePath,
+                        "--feasible-out",
+                        feasibleFile.absolutePath,
                     ),
                 )
+                if (route != null) {
+                    add("--route")
+                    add(route)
+                }
             }
-            onLog("<k> extract: $effectiveInput")
-            val code = runProcess(
-                ProcessBuilder(listOf(binary.absolutePath) + args).directory(filesDir).redirectErrorStream(true).apply {
-                        environment()["GHOSTLOCK_HOME"] = filesDir.absolutePath
-                        environment()["TMPDIR"] = filesDir.absolutePath
-                        environment()["HOME"] = filesDir.absolutePath
-                    },
-                onLog = onLog,
-                timeoutSeconds = 1800,
-            )
-            onLog("<k> extract exit code=$code")
+            val captured = mutableListOf<String>()
+            /* One generation log per extractor pass: the stderr decision lines,
+             * the verdict JSON and a meta summary land in the app's crash-safe
+             * run store and are exportable from the log screen. Exit 7 is a
+             * completed pass (the choice moves to the user), not a failure. */
+            val code = withDebugAttackLog("parse", onLog, completedCodes = setOf(0, 7)) {
+                    archivedLog, _, writeSidecar ->
+                val tee: (String) -> Unit = { line ->
+                    captured += line
+                    archivedLog(line)
+                }
+                tee("<k> extract: $effectiveInput")
+                val exit = runProcess(
+                    ProcessBuilder(listOf(binary.absolutePath) + args).directory(filesDir).redirectErrorStream(true).apply {
+                            environment()["GHOSTLOCK_HOME"] = filesDir.absolutePath
+                            environment()["TMPDIR"] = filesDir.absolutePath
+                            environment()["HOME"] = filesDir.absolutePath
+                        },
+                    onLog = tee,
+                    timeoutSeconds = 1800,
+                )
+                tee("<k> extract exit code=$exit")
+                val reportText = feasibleFile.takeIf { it.isFile }?.readText()
+                val report = reportText?.let(FeasibleReport::parse)
+                if (reportText != null) {
+                    writeSidecar("generation.json", reportText.toByteArray(StandardCharsets.UTF_8))
+                }
+                writeSidecar(
+                    "generation.meta",
+                    generationMeta(
+                        input = input,
+                        effectiveInput = effectiveInput,
+                        requestedRoute = route,
+                        exit = exit,
+                        report = report,
+                        captured = captured,
+                    ).toByteArray(StandardCharsets.UTF_8),
+                )
+                exit
+            }
+            val report = feasibleFile.takeIf { it.isFile }?.readText()?.let(FeasibleReport::parse)
+            if (code == 7) {
+                val routes = report?.routes.orEmpty()
+                if (routes.none { it.verdict == FeasibleReport.VerdictFeasible }) {
+                    return ParseResult.Failed(7, "route ambiguity without a feasible-route report")
+                }
+                return ParseResult.Ambiguous(routes)
+            }
             if (code != 0 || !parsedFile.isFile) return ParseResult.Failed(code)
             val document = parsedFile.readText()
             val fresh = parseEntries(document) ?: return ParseResult.Failed(code, "invalid extractor output")
@@ -402,22 +457,115 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             val overlaps = releases.filter { userProfileStore.containsRelease(it) }
             val name = parsedDocumentName(releases)
             if (!overwrite && overlaps.isNotEmpty()) {
-                pendingParsedDocument = PendingParsedDocument(name, document, releases, missing)
+                pendingParsedDocument = PendingParsedDocument(
+                    name,
+                    document,
+                    releases,
+                    missing,
+                    report?.chosen ?: route,
+                    anchorLine(captured),
+                )
                 return ParseResult.RequiresOverwrite(overlaps, missing)
             }
             dropReplacedDocuments(releases)
             userProfileStore.save(name, document)
-            ParseResult.Parsed(releases, missing, name)
+            ParseResult.Parsed(
+                releases = releases,
+                missing = missing,
+                documentName = name,
+                route = report?.chosen ?: route,
+                anchor = anchorLine(captured),
+            )
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
             ParseResult.Failed(1, error.message)
         } finally {
             parsedFile.delete()
+            feasibleFile.delete()
             tempBootFile?.delete()
             tempXblFile?.delete()
         }
     }
+
+    /** The extractor's first anchor decision line, or null when none ran. */
+    private fun anchorLine(lines: List<String>): String? = lines.firstOrNull {
+        it.contains("lock anchor") && (it.startsWith("info:") || it.startsWith("warning:"))
+    }
+
+    /**
+     * The generation record design 10 asks for: what the image is, which series
+     * tier filled the shared fields, every route verdict, the route and why it
+     * was chosen, the anchor verdict and how the pass ended. The raw stderr
+     * (including every heuristic warning) is the log file itself; the lines
+     * about heuristic values are copied here so the meta alone is enough to
+     * see that a profile is not fully image-derived.
+     */
+    private fun generationMeta(
+        input: String,
+        effectiveInput: String,
+        requestedRoute: String?,
+        exit: Int,
+        report: FeasibleReport?,
+        captured: List<String>,
+    ): String = buildString {
+        val state = when (exit) {
+            0 -> "completed"
+            7 -> "ambiguous"
+            3 -> "infeasible"
+            -1 -> "timeout"
+            else -> "failed"
+        }
+        appendLine("state=$state")
+        appendLine("exit=$exit")
+        appendLine("release=${report?.release.orEmpty()}")
+        appendLine("input=$input")
+        appendLine("input_sha256=${sha256Of(File(effectiveInput)) ?: "unavailable"}")
+        appendLine("series=${captured.firstOrNull { it.contains("series ") }?.substringAfter("series ")?.trim() ?: "unknown"}")
+        appendLine("route=${report?.chosen ?: requestedRoute.orEmpty()}")
+        /* The extractor's own selection line distinguishes a derived choice
+         * from the zero-feasible frame-rule fallback; the report alone cannot. */
+        val selection = captured.firstOrNull {
+            it.startsWith("info: route ") && it.contains(" selected (")
+        }
+        appendLine(
+            "route_basis=" + when {
+                requestedRoute != null -> "forced"
+                selection?.contains("(Fallback)") == true -> "fallback"
+                selection != null -> "derived"
+                exit == 7 -> "ambiguous"
+                else -> "none"
+            },
+        )
+        appendLine("route_selection=${selection ?: "none"}")
+        appendLine("feasible=${report?.feasible.orEmpty().joinToString(",") { it.route }}")
+        report?.routes.orEmpty().forEach { verdict ->
+            val numbers = if (verdict.numbers.isEmpty()) {
+                ""
+            } else {
+                "; " + verdict.numbers.entries.joinToString(", ") { (key, value) -> "$key=$value" }
+            }
+            appendLine("verdict.${verdict.route}=${verdict.verdict}: ${verdict.reason}$numbers")
+        }
+        appendLine("anchor=${anchorLine(captured) ?: "none"}")
+        val heuristics = captured.filter { it.contains("heuristic", ignoreCase = true) }
+        appendLine("heuristic_count=${heuristics.size}")
+        heuristics.forEachIndexed { index, line -> appendLine("heuristic.$index=$line") }
+    }
+
+    private fun sha256Of(file: File): String? = runCatching {
+        if (!file.isFile) return@runCatching null
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { stream ->
+            val buffer = ByteArray(1 shl 20)
+            while (true) {
+                val read = stream.read(buffer)
+                if (read < 0) break
+                digest.update(buffer, 0, read)
+            }
+        }
+        digest.digest().joinToString("") { "%02x".format(it) }
+    }.getOrNull()
 
     override suspend fun runExploit(pair: CpuPair, onLog: (String) -> Unit): Int =
         withDebugAttackLog("direct", onLog) { archivedLog, debugDir, writeSidecar ->
@@ -535,6 +683,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     private suspend fun withDebugAttackLog(
         entry: String,
         onLog: (String) -> Unit,
+        /** Exit codes that mean the pass ended cleanly for its kind (7 is the
+         * ambiguity hand-off, not a failure). */
+        completedCodes: Set<Int> = setOf(0),
         run: suspend ((String) -> Unit, String?, (String, ByteArray) -> Boolean) -> Int,
     ): Int {
         val settings = debugSettings()
@@ -570,7 +721,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             )
             /* Recorded before the descriptor closes: a run that ends without a
              * terminal state reads as interrupted at the next start. */
-            archive.finish(if (code == 0) RunLogState.COMPLETED else RunLogState.FAILED)
+            archive.finish(if (code in completedCodes) RunLogState.COMPLETED else RunLogState.FAILED)
             code
         } finally {
             runCatching { archive.close() }
@@ -988,6 +1139,8 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         val text: String,
         val releases: List<String>,
         val missing: Set<String>,
+        val route: String? = null,
+        val anchor: String? = null,
     )
 
     /**

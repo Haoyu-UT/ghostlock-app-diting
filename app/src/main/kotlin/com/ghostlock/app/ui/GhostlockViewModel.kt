@@ -13,6 +13,7 @@ import com.ghostlock.app.domain.model.ParseResult
 import com.ghostlock.app.domain.model.ProfileConfig
 import com.ghostlock.app.domain.model.RunLogEntry
 import com.ghostlock.app.domain.model.ProfileFieldNode
+import com.ghostlock.app.domain.model.RouteVerdict
 import com.ghostlock.app.domain.model.ShizukuStatus
 import com.ghostlock.app.domain.repository.GhostlockRepository
 import com.ghostlock.app.domain.repository.ProfileConfigController
@@ -55,7 +56,7 @@ enum class DocumentRequest { ImportOffsetsHocon, ImportOffsetsJson, BootImage, X
  * only ever added to that list for MediaTek devices */
 private enum class AttachOption { NONE, XBL, UEFI, XBL_UEFI, VENDOR_BOOT }
 
-private enum class ParseDialogStage { Mode, Attach }
+private enum class ParseDialogStage { Mode, Attach, Route }
 
 class GhostlockViewModel(
     private val repository: GhostlockRepository,
@@ -87,6 +88,9 @@ class GhostlockViewModel(
     private var pendingAttachOptions: List<AttachOption> = emptyList()
     private var parseDialogStage = ParseDialogStage.Mode
     private var pendingConfirmation: PendingConfirmation? = null
+    /** Inputs of the pass that reported Ambiguous, re-run with the picked route. */
+    private var pendingRouteParse: PendingRouteParse? = null
+    private var pendingRouteChoices: List<RouteVerdict> = emptyList()
 
     /** The layer notice is decided once per process, from the first resolution. */
     private var layerNoticeChecked = false
@@ -1088,6 +1092,27 @@ class GhostlockViewModel(
                 AttachOption.VENDOR_BOOT -> pickBoot(withXbl = false, withUefi = false, withVendorBoot = true)
                 null -> Unit
             }
+
+            ParseDialogStage.Route -> {
+                val parse = pendingRouteParse
+                val route = pendingRouteChoices.getOrNull(index)?.route
+                pendingRouteParse = null
+                pendingRouteChoices = emptyList()
+                parseDialogStage = ParseDialogStage.Mode
+                if (parse != null && route != null) {
+                    appendLog("route chosen: $route")
+                    viewModelScope.launch(Dispatchers.IO) {
+                        runParse(
+                            input = parse.input,
+                            xblPath = parse.xblPath,
+                            uefiPath = parse.uefiPath,
+                            vendorBootPath = parse.vendorBootPath,
+                            overwrite = parse.overwrite,
+                            route = route,
+                        )
+                    }
+                }
+            }
         }
     }
 
@@ -1105,7 +1130,15 @@ class GhostlockViewModel(
         }
     }
 
-    fun onDialogDismiss() = dismissDialog()
+    fun onDialogDismiss() {
+        if (parseDialogStage == ParseDialogStage.Route) {
+            pendingRouteParse = null
+            pendingRouteChoices = emptyList()
+            parseDialogStage = ParseDialogStage.Mode
+            appendLog("result: route choice cancelled")
+        }
+        dismissDialog()
+    }
 
     /** "Export log & report" from the failed-run notice: dismiss, then the picker. */
     fun onDialogExportLog() {
@@ -1395,23 +1428,67 @@ class GhostlockViewModel(
         uefiPath: String? = null,
         vendorBootPath: String? = null,
         overwrite: Boolean = false,
+        route: String? = null,
     ) {
         if (!beginOperation()) return
         try {
             when (
                 val result = parseSourceUseCase(
-                    input, xblPath, uefiPath, vendorBootPath, overwrite, ::appendLog,
+                    input, xblPath, uefiPath, vendorBootPath, overwrite, route, ::appendLog,
                 )
             ) {
                 is ParseResult.RequiresOverwrite -> {
                     pendingConfirmation =
-                        PendingConfirmation.Parse(input, xblPath, uefiPath, vendorBootPath)
+                        PendingConfirmation.Parse(input, xblPath, uefiPath, vendorBootPath, route)
                     showOverwriteDialog(result.releases)
+                }
+
+                is ParseResult.Ambiguous -> {
+                    val feasible = result.routes.filter { it.verdict == "feasible" }
+                    appendLog(
+                        "result: ${feasible.size} feasible routes: " +
+                            feasible.joinToString(", ") { it.route },
+                    )
+                    if (feasible.isEmpty()) {
+                        appendLog("result: route ambiguity without a usable route")
+                        showNotice(R.string.parse_result_title, R.string.parse_failed)
+                    } else {
+                        /* The choice is the user's: both routes are derived from
+                         * the image, and which one runs is a device fact. The
+                         * second pass forces the pick with --route. */
+                        pendingRouteParse = PendingRouteParse(
+                            input, xblPath, uefiPath, vendorBootPath, overwrite,
+                        )
+                        pendingRouteChoices = feasible
+                        parseDialogStage = ParseDialogStage.Route
+                        mutableState.update {
+                            it.copy(
+                                dialogVisible = true,
+                                dialogType = DialogType.LIST,
+                                dialogTitleRes = R.string.parse_route_title,
+                                dialogItems = feasible.map { choice ->
+                                    "${choice.route} — ${choice.reason}"
+                                },
+                                dialogItemResIds = emptyList(),
+                                dialogCurrentItemIndex = -1,
+                                /* The picker must be the only overlay on
+                                 * screen; a log sheet behind it would swallow
+                                 * its taps (same rule as the overwrite dialog). */
+                                executionSheetVisible = false,
+                            )
+                        }
+                    }
                 }
 
                 is ParseResult.Parsed -> {
                     refreshSnapshot()
                     refreshUserProfiles()
+                    result.route?.let { appendLog("route: $it") }
+                    result.anchor?.let {
+                        appendLog(
+                            "anchor: " + it.removePrefix("info: ").removePrefix("warning: "),
+                        )
+                    }
                     appendLog("offsets exported: ${result.releases.joinToString()}")
                     appendLog("result: offsets parsed successfully")
                     /* Auto-load the just-saved document so the parsed profile
@@ -1500,6 +1577,7 @@ class GhostlockViewModel(
                     confirmation.uefiPath,
                     confirmation.vendorBootPath,
                     overwrite = true,
+                    route = confirmation.route,
                 )
             }
         }
@@ -1624,6 +1702,18 @@ class GhostlockViewModel(
             val xblPath: String?,
             val uefiPath: String?,
             val vendorBootPath: String? = null,
+            /** Kept across the overwrite confirmation, so the retry does not
+             * fall back into the ambiguity picker. */
+            val route: String? = null,
         ) : PendingConfirmation
     }
+
+    /** Inputs of the pass that exited 7, replayed with the user's route. */
+    private data class PendingRouteParse(
+        val input: String,
+        val xblPath: String?,
+        val uefiPath: String?,
+        val vendorBootPath: String?,
+        val overwrite: Boolean,
+    )
 }

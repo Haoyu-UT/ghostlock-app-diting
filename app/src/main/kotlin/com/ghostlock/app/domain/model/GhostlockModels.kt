@@ -242,6 +242,15 @@ sealed interface OffsetImportResult {
     data class Failed(val reason: String) : OffsetImportResult
 }
 
+/** One route verdict from the extractor's `--feasible-out` report. */
+data class RouteVerdict(
+    val route: String,
+    /** `feasible`, `infeasible` or `unknown`, as the extractor labels it. */
+    val verdict: String,
+    val reason: String,
+    val numbers: Map<String, Long> = emptyMap(),
+)
+
 sealed interface ParseResult {
     /** Fields only an xbl_config/uefi sidecar can supply (e.g.
      * `kernel_phys_load`) that the parsed profile is still missing. */
@@ -250,7 +259,18 @@ sealed interface ParseResult {
         val missing: Set<String> = emptySet(),
         /** Name of the stored document, so the caller can auto-load it. */
         val documentName: String? = null,
+        /** Route the extractor emitted, when its report names one. */
+        val route: String? = null,
+        /** The extractor's lock-anchor line (verdict and reason), if any. */
+        val anchor: String? = null,
     ) : ParseResult
+
+    /**
+     * More than one route is Feasible on this image. The extractor wrote the
+     * verdicts and exited 7 without a profile; the caller asks the user which
+     * route to generate and calls [parseSource] again with that route.
+     */
+    data class Ambiguous(val routes: List<RouteVerdict>) : ParseResult
 
     data class RequiresOverwrite(
         val releases: List<String>,

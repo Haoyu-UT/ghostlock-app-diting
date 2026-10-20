@@ -2,6 +2,7 @@ package com.ghostlock.app.data
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.os.Build
 import androidx.core.content.edit
 import androidx.core.net.toUri
 import com.ghostlock.app.BuildConfig
@@ -50,6 +51,13 @@ internal class AndroidProfileConfigController(
     private val forcedBuiltinRelease: String? = null,
     /** Build identity compared against the one that wrote the overrides. */
     private val buildIdentity: String = BuildConfig.BUILD_IDENTITY,
+    /**
+     * Device codename for the device-tuning preset. The measured route timing
+     * is a property of this phone, not of the kernel image, so a generated
+     * profile must not carry it; the app merges it here instead. Injectable so
+     * the host tests can pin it.
+     */
+    private val deviceCodename: String? = Build.DEVICE,
 ) : ProfileConfigController {
     private val appContext = context.applicationContext
     private val assetLoader = AssetConfigLoader(appContext)
@@ -630,7 +638,7 @@ internal class AndroidProfileConfigController(
                         }
                     }
             }
-            val tuningExecution = readExecutionTuning()?.get("execution").asValueMap()
+            val tuningExecution = readExecutionTuning()
             val routePresets = ProfileConfig.Routes
                 .mapNotNull { route -> readExecutionRoute(route)?.let { route to it } }
                 .toMap()
@@ -711,10 +719,32 @@ internal class AndroidProfileConfigController(
 
     private fun readAsset(path: String): String = assetLoader.load(path)
 
-    /** Shared execution tuning every profile includes ("execution-tuning.conf"). */
-    private fun readExecutionTuning(): ValueMap? = runCatching {
-        HoconSupport.parseValue(readAsset("$BuiltinDirectory/execution-tuning.conf")).asValueMap()
+    /**
+     * Shared execution tuning every profile includes ("execution-tuning.conf"),
+     * with the device preset merged under it on a diting. The preset exists
+     * because the extractor no longer emits `execution`: a generated profile
+     * must still run with the measured 30/10000/5000 values rather than the
+     * shared 1000/50000/50000 defaults.
+     */
+    internal fun readExecutionTuning(): ValueMap? = runCatching {
+        val common = HoconSupport.parseValue(readAsset("$BuiltinDirectory/execution-tuning.conf"))
+            .asValueMap()?.get("execution").asValueMap()
+        val devicePreset = if (isDitingDevice()) {
+            HoconSupport.parseValue(readAsset("$BuiltinDirectory/execution-diting.conf"))
+                .asValueMap()?.get("execution").asValueMap()
+        } else {
+            null
+        }
+        when {
+            common == null -> devicePreset
+            devicePreset == null -> common
+            else -> deepMergeValues(common, devicePreset)
+        }
     }.getOrNull()
+
+    /** The measured route timing belongs to this phone, not to a kernel. */
+    private fun isDitingDevice(): Boolean =
+        deviceCodename.equals("diting", ignoreCase = true)
 
     /** Creates null placeholders for invalid fields the document does not carry. */
     private fun materializeInvalidPaths(profile: ValueMap, invalidPaths: Set<String>) {

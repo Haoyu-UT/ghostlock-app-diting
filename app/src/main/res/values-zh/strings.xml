@@ -50,6 +50,7 @@
     <string name="parse_missing_phys_hint">缺少 kernel_phys_load，附加 xbl_config.img 或 uefi.img 后重新解析可补齐</string>
     <string name="parse_missing_phys_mediatek">缺少 kernel_phys_load / kernel_phys_offset。联发科镜像没有 xbl_config 或 BTF，提取器无法仅从 boot.img 推导，运行时回退会在 W1 失败。最简单的办法：重新解析并附加 vendor_boot.img。如果被拒绝（对齐模式无法识别），请改为在已 root 的设备上运行单独的 tools/mtk-phys 提取器，再把两个值填入高级参数覆盖。</string>
     <string name="parse_result_title">解析结果</string>
+    <string name="parse_route_title">两条路线均可用，请选择一条</string>
     <string name="import_result_title">导入结果</string>
     <string name="parse_timeout">解析超时</string>
     <string name="cancel">取消</string>

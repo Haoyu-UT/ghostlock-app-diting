@@ -50,6 +50,7 @@
     <string name="parse_missing_phys_hint">Missing kernel_phys_load; attach xbl_config.img or uefi.img and parse again to fill it</string>
     <string name="parse_missing_phys_mediatek">Missing kernel_phys_load / kernel_phys_offset. MediaTek images carry no xbl_config or BTF, so the extractor cannot derive them from boot.img alone and the runtime fallback fails at W1. Easiest fix: parse again and attach vendor_boot.img. If that is refused (an unrecognized alignment pattern), run the separate tools/mtk-phys extractor on a rooted device instead, then set both in advanced overrides.</string>
     <string name="parse_result_title">Extraction result</string>
+    <string name="parse_route_title">Both routes are supported — choose one</string>
     <string name="import_result_title">Import result</string>
     <string name="parse_timeout">Parse timed out</string>
     <string name="cancel">Cancel</string>

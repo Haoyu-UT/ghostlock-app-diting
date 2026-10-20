@@ -23,8 +23,9 @@ class ParseSourceUseCase(private val repository: GhostlockRepository) {
         uefiPath: String? = null,
         vendorBootPath: String? = null,
         overwrite: Boolean = false,
+        route: String? = null,
         onLog: (String) -> Unit = {},
-    ) = repository.parseSource(input, xblPath, uefiPath, vendorBootPath, overwrite, onLog)
+    ) = repository.parseSource(input, xblPath, uefiPath, vendorBootPath, overwrite, route, onLog)
 }
 
 class RunExploitUseCase(private val repository: GhostlockRepository) {

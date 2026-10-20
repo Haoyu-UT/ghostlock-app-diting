@@ -50,6 +50,9 @@ interface GhostlockRepository {
          * kernel_phys_offset from its header. */
         vendorBootPath: String? = null,
         overwrite: Boolean = false,
+        /** Selects one route explicitly; null lets the extractor decide and
+         * returns [ParseResult.Ambiguous] when more than one is Feasible. */
+        route: String? = null,
         onLog: (String) -> Unit = {},
     ): ParseResult
 

@@ -7,6 +7,7 @@ import com.ghostlock.app.domain.model.ProfileFieldNode
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -28,25 +29,29 @@ class ControllerInternalsTest {
     private val release = "6.1.118-android14-11-ga3b9c44908dd-ab13320413"
     private val pair = CpuPair(primary = 0, consumer = 1)
 
-    private fun withController(name: String, block: suspend (AndroidProfileConfigController) -> Unit) =
-        runBlocking {
-            val root = Files.createTempDirectory(name).toFile()
-            try {
-                val controller = AndroidProfileConfigController(
-                    context = context,
-                    filesDir = root,
-                    userProfiles = UserProfileStore(
-                        directory = root.resolve("user_profiles"),
-                        assetLoader = AssetConfigLoader(context),
-                    ),
-                    preferences = context.getSharedPreferences(name, 0)
-                        .also { it.edit().clear().commit() },
-                )
-                block(controller)
-            } finally {
-                root.deleteRecursively()
-            }
+    private fun withController(
+        name: String,
+        device: String? = null,
+        block: suspend (AndroidProfileConfigController) -> Unit,
+    ) = runBlocking {
+        val root = Files.createTempDirectory(name).toFile()
+        try {
+            val controller = AndroidProfileConfigController(
+                context = context,
+                filesDir = root,
+                userProfiles = UserProfileStore(
+                    directory = root.resolve("user_profiles"),
+                    assetLoader = AssetConfigLoader(context),
+                ),
+                preferences = context.getSharedPreferences(name, 0)
+                    .also { it.edit().clear().commit() },
+                deviceCodename = device,
+            )
+            block(controller)
+        } finally {
+            root.deleteRecursively()
         }
+    }
 
     private fun flatten(nodes: List<ProfileFieldNode>): List<ProfileFieldNode> =
         nodes.flatMap { if (it.isGroup) flatten(it.children) else listOf(it) }
@@ -95,5 +100,29 @@ class ControllerInternalsTest {
             val branches = snapshot["route"].asValueMap()?.keys.orEmpty()
             assertEquals(listOf("multicast_waiter"), branches.toList())
             assertFalse(snapshot["fallback"].asValueMap()?.containsKey("route") == true)
+        }
+
+    @Test
+    fun `the diting preset supplies the measured timing under the shared tuning`() =
+        withController("controller-diting-tuning", device = "diting") { controller ->
+            val execution = requireNotNull(controller.readExecutionTuning())
+            fun value(path: String) =
+                (execution.getValueAt(path) as? Number)?.toLong()
+            assertEquals(30L, value("race.route_wait_ms"))
+            assertEquals(10000L, value("race.setup_settle_us"))
+            assertEquals(5000L, value("routes.select_stack.enter_delay_us"))
+            // The common tuning is still underneath, not replaced.
+            assertEquals(4L, value("heap.prepare_max_attempts"))
+        }
+
+    @Test
+    fun `another device keeps the shared timing defaults`() =
+        withController("controller-other-tuning", device = "duchamp") { controller ->
+            val execution = requireNotNull(controller.readExecutionTuning())
+            fun value(path: String) =
+                (execution.getValueAt(path) as? Number)?.toLong()
+            assertEquals(1000L, value("race.route_wait_ms"))
+            assertEquals(50000L, value("race.setup_settle_us"))
+            assertNull(execution.getValueAt("routes.select_stack.enter_delay_us"))
         }
 }
