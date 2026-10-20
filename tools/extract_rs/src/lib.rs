@@ -8,6 +8,7 @@ pub mod error;
 pub mod family;
 pub mod fdt;
 pub mod iomem;
+pub mod ikconfig;
 pub mod kallsyms;
 pub mod kallsyms_finder;
 pub mod payload;

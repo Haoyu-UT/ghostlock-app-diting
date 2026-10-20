@@ -442,25 +442,58 @@ pub fn assess_named(
     Some(assess(&candidate, &refs, rel, &bounds))
 }
 
+/// The result of choosing an anchor. `refused` is a named preference that
+/// exists but is unsafe; the caller must say why it was omitted rather than
+/// silently falling back to another region.
+#[derive(Debug, Clone)]
+pub struct AnchorPick {
+    pub selected: Option<Assessment>,
+    pub refused: Option<Assessment>,
+}
+
 /// Pick the region a generated profile should carry: the named preference when
-/// it exists, else the largest non-unsafe candidate that fits at least one lock
-/// slot. The named path is how the diting line is validated (`dump_skip.zeroes`);
-/// the ranked path is the fallback for a build whose symbol set moved.
+/// it exists and is not unsafe, else the largest non-unsafe ranked candidate
+/// that fits at least one lock slot. The named path is how the diting line is
+/// validated (`dump_skip.zeroes`); the ranked path is the fallback for a build
+/// whose symbol set moved. An unsafe named region is refused, never emitted.
+pub fn select_candidate(
+    kernel: &[u8],
+    rel: &BTreeMap<String, BTreeSet<u64>>,
+    prefer: Option<&str>,
+) -> AnchorPick {
+    let bounds = bounds_from(rel);
+    let refs = scan_references(kernel, &bounds);
+    if let Some(name) = prefer {
+        if let Some(candidate) = named_candidate(rel, &bounds, name) {
+            let assessment = assess(&candidate, &refs, rel, &bounds);
+            if assessment.verdict == Verdict::Unsafe {
+                return AnchorPick {
+                    selected: None,
+                    refused: Some(assessment),
+                };
+            }
+            return AnchorPick {
+                selected: Some(assessment),
+                refused: None,
+            };
+        }
+    }
+    let selected = candidates(rel, &bounds, 256)
+        .into_iter()
+        .map(|candidate| assess(&candidate, &refs, rel, &bounds))
+        .filter(|a| a.verdict != Verdict::Unsafe && a.safe_len >= 32)
+        .max_by_key(|a| a.safe_len);
+    AnchorPick {
+        selected,
+        refused: None,
+    }
+}
+
+/// Compatibility wrapper: the selected assessment, if any.
 pub fn best_candidate(
     kernel: &[u8],
     rel: &BTreeMap<String, BTreeSet<u64>>,
     prefer: Option<&str>,
 ) -> Option<Assessment> {
-    let bounds = bounds_from(rel);
-    let refs = scan_references(kernel, &bounds);
-    if let Some(name) = prefer {
-        if let Some(candidate) = named_candidate(rel, &bounds, name) {
-            return Some(assess(&candidate, &refs, rel, &bounds));
-        }
-    }
-    candidates(rel, &bounds, 256)
-        .into_iter()
-        .map(|candidate| assess(&candidate, &refs, rel, &bounds))
-        .filter(|a| a.verdict != Verdict::Unsafe && a.safe_len >= 32)
-        .max_by_key(|a| a.safe_len)
+    select_candidate(kernel, rel, prefer).selected
 }
