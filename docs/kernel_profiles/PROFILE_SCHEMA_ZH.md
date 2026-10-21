@@ -202,6 +202,8 @@ cred
 | `route.multicast_waiter.waiter_off` | 多播缓冲区中 waiter 的偏移（必须 > 0） |
 | `route.multicast_waiter.buffer_size` | 伪造缓冲区大小 |
 | `route.multicast_waiter.task_offset` / `route.multicast_waiter.lock_offset` | 缓冲区中任务 / 锁字段偏移 |
+| `route.multicast_waiter.lock_anchor_image` | 可选。以镜像相对偏移给出的、内容为零且无人写入的内核区域，用作 walk 的假 `rt_mutex`（替代回收页），使 walk 的 descent 不论该页内容如何都必定在第一次判断退出。缺省 ⇒ 仍用回收页（旧行为）。此时锚点的 `lock` 字取自该区域而非该页。按设备与内核构建选择；填错会导致内核崩溃 |
+| `route.multicast_waiter.lock_anchor_bytes` / `route.multicast_waiter.lock_anchor_stride` | 可选。该区域已验证安全部分的长度，以及其中槽位的步长（槽位数为 `bytes / stride`）。带锚点的路由要求**三项齐全**：没有可继承的默认值，不得把 diting 的网格（4096 / 32）套用到其他内核。native 会拒绝 `bytes` 非零但不是 `stride` 整数倍的几何，或 `stride` 小于假 `rt_mutex` 自身大小的几何。这三项写在本节而不是借用 `route.select_stack`，因为文档从不跨路由合并 |
 | `offset.empty_zero_page` | `empty_zero_page` 偏移 |
 
 ### 4.6 KernelSnitch 参数（`kernelsnitch`）

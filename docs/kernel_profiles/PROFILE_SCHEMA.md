@@ -238,6 +238,8 @@ addresses.
 | `route.multicast_waiter.waiter_off` | Offset of the waiter in the multicast buffer (must be > 0) |
 | `route.multicast_waiter.buffer_size` | Forged buffer size |
 | `route.multicast_waiter.task_offset` / `route.multicast_waiter.lock_offset` | Task / lock field offsets in the buffer |
+| `route.multicast_waiter.lock_anchor_image` | Optional. Image-relative offset of a zero, writable, reference-free kernel region used as the walk's fake `rt_mutex` instead of the reclaimed payload page, so the walk's descent exits on its first test regardless of what that page holds. Absent => the reclaimed page is used (previous behaviour). The anchor's `lock` word then comes from this region, not from the page. Device- and build-specific; a wrong value is a kernel crash |
+| `route.multicast_waiter.lock_anchor_bytes` / `route.multicast_waiter.lock_anchor_stride` | Optional. Length of the verified-safe part of that region and the slot stride within it (a slot grid of `bytes / stride` slots). The anchored route requires **all three** keys: there is no inherited default, and the diting grid (4096 / 32) must not be assumed for another kernel. Native refuses a `bytes` that is not a non-zero multiple of `stride`, or a `stride` below the fake `rt_mutex`'s own size. They are stated in this section rather than borrowed from `route.select_stack` because a document never merges another route's section |
 | `offset.empty_zero_page` | `empty_zero_page` offset |
 
 ### 4.6 KernelSnitch values (`kernelsnitch`)

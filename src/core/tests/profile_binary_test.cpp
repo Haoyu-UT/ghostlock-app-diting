@@ -195,6 +195,23 @@ int32_t main(void) {
         assert(!parsed.geometry.select_lock_anchor_bytes.has_value());
         assert(!parsed.geometry.select_lock_anchor_stride.has_value());
 
+        /* The multicast route states the same anchor trio through its own
+         * section; native keeps one shared storage for every route. The values
+         * here are a synthetic transport vector, not a device's approved
+         * anchor -- a real one is per-build profile data. */
+        profile::kernel_offsets mcast_anchored = {};
+        mcast_anchored.uname_r = "mcast-anchored";
+        mcast_anchored.route = ghostlock::profile::kRouteMulticastWaiter;
+        mcast_anchored.geometry.mcast_waiter_off = 48;
+        mcast_anchored.geometry.select_lock_anchor_image = 0x400000;
+        mcast_anchored.geometry.select_lock_anchor_bytes = 0x600;
+        mcast_anchored.geometry.select_lock_anchor_stride = 0x20;
+        assert(round_trip(mcast_anchored, &parsed, release, sizeof(release)) == 0);
+        assert(parsed.geometry.mcast_waiter_off.value_or(0) == 48);
+        assert(parsed.geometry.select_lock_anchor_image.value_or(0) == 0x400000);
+        assert(parsed.geometry.select_lock_anchor_bytes.value_or(0) == 0x600);
+        assert(parsed.geometry.select_lock_anchor_stride.value_or(0) == 0x20);
+
         /* An absent optional stays absent after the round trip. */
         profile::kernel_offsets absent = {};
         absent.uname_r = "absent";
@@ -295,10 +312,32 @@ int32_t main(void) {
         assert(!parsed.geometry.sig_waiter_off_sve.has_value());
         assert(!parsed.geometry.sig_waiter_off_plain.has_value());
 
+        /* The multicast route's own section carries the anchor trio by wire
+         * name (a profile never merges another route's section). */
+        doc = build_doc(ghostlock::profile::kRouteMulticastWaiter, "mcast-anchor",
+                        {{"route.multicast_waiter",
+                          {{"lock_anchor_image", 0x400000},
+                           {"lock_anchor_bytes", 0x600},
+                           {"lock_anchor_stride", 0x20}}}});
+        assert(parse_doc(doc, &parsed, release, sizeof(release)) == 0);
+        assert(parsed.geometry.select_lock_anchor_image.value_or(0) == 0x400000);
+        assert(parsed.geometry.select_lock_anchor_bytes.value_or(0) == 0x600);
+        assert(parsed.geometry.select_lock_anchor_stride.value_or(0) == 0x20);
+
+        /* The select route's key of the same name is a different section and
+         * must not be picked up by a multicast document. */
+        doc = build_doc(ghostlock::profile::kRouteMulticastWaiter, "mcast-foreign",
+                        {{"route.select_stack", {{"lock_anchor_image", 0x400000}}}});
+        assert(parse_doc(doc, &parsed, release, sizeof(release)) == 0);
+        assert(!parsed.geometry.select_lock_anchor_image.has_value());
+
         /* An empty document body is valid (everything stays default/absent). */
         doc = build_doc(ghostlock::profile::kRouteMulticastWaiter, "empty", {});
         assert(parse_doc(doc, &parsed, release, sizeof(release)) == 0);
         assert(!parsed.geometry.mcast_waiter_off.has_value());
+        assert(!parsed.geometry.select_lock_anchor_image.has_value());
+        assert(!parsed.geometry.select_lock_anchor_bytes.has_value());
+        assert(!parsed.geometry.select_lock_anchor_stride.has_value());
     }
 
     /* ---- White box: truncations and lying counts. ---- */
