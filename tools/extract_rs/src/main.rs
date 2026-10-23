@@ -333,8 +333,12 @@ fn run(cli: &Cli) -> Result<i32> {
         return Err(ExtractError::new("_text/_head is not unique in kallsyms"));
     };
 
+    /* The image's release scopes the series template/IKCONFIG predicate below. */
+    let release = boot.release();
     // DRAM base / linear-map offset, and (with the kallsyms delta) the kernel
-    // physical load, from /proc/iomem when available (rooted device or --iomem).
+    // physical load, from /proc/iomem when it is actually readable (rooted
+    // analysis or --iomem). A fresh unprivileged device gets nothing here; both
+    // stay unset and the native's compiled P0 defaults apply.
     let mut kernel_phys_offset: Option<u64> = vendor_boot_phys_offset;
     let iomem_info = match iomem::load(cli.iomem.as_deref()) {
         Ok(info) => info,
@@ -389,7 +393,6 @@ fn run(cli: &Cli) -> Result<i32> {
         );
     }
 
-    let release = boot.release();
     // The shared template's scope is the series that produced it. The image's
     // own embedded IKCONFIG is authoritative; the patch range is only the
     // lowest-priority fallback for a blob-less image.
