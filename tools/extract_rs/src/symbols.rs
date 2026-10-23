@@ -93,6 +93,28 @@ pub fn resolve_symbols(symbols: &BTreeMap<String, BTreeSet<u64>>, base: u64) -> 
     result
 }
 
+/// Choose the `loggers` KASLR anchor when the disassembly derivation did not
+/// run or did not close. BTF supplies the enum index (the same slot the
+/// derivation targets); the 5.10 series keeps its measured `loggers+0x10`
+/// constant; every other family returns `None` rather than a foreign value.
+/// Returns the anchor and a source label for the log.
+pub fn loggers_anchor_fallback(
+    loggers: Option<u64>,
+    nf_log_type_ulog: Option<i64>,
+    is_5_10: bool,
+) -> (Option<u64>, &'static str) {
+    let Some(loggers) = loggers else {
+        return (None, "omitted");
+    };
+    if let Some(ulog) = nf_log_type_ulog.filter(|value| *value >= 0) {
+        return (loggers.checked_add(ulog as u64 * 8), "btf-enum");
+    }
+    if is_5_10 {
+        return (loggers.checked_add(0x10), "heuristic-5.10");
+    }
+    (None, "omitted")
+}
+
 /// Layout template selector for a release series. A returned template is not
 /// sufficient evidence to emit family-derived geometry; use
 /// `kernel_layout_verified` for that decision.
@@ -199,7 +221,7 @@ pub fn resolve_structs(btf: Option<&Btf>) -> ResolvedStructs {
 
 #[cfg(test)]
 mod tests {
-    use super::{kernel_layout_verified, kernel_struct_macro};
+    use super::{kernel_layout_verified, kernel_struct_macro, loggers_anchor_fallback};
 
     #[test]
     fn layout_template_and_verification_are_separate() {
@@ -210,6 +232,37 @@ mod tests {
         assert!(kernel_layout_verified(Some("6.1.162-android14-11-build")));
         assert!(!kernel_layout_verified(Some("6.1.162-generic")));
         assert!(!kernel_layout_verified(Some("6.7.1-android16-1-build")));
+    }
+
+    #[test]
+    fn loggers_fallback_respects_the_family() {
+        // BTF supplies the enum index on every family.
+        assert_eq!(
+            loggers_anchor_fallback(Some(0x1000), Some(1), false),
+            (Some(0x1008), "btf-enum")
+        );
+        assert_eq!(
+            loggers_anchor_fallback(Some(0x1000), Some(1), true),
+            (Some(0x1008), "btf-enum")
+        );
+        // Without BTF only the 5.10 series has a measured constant.
+        assert_eq!(
+            loggers_anchor_fallback(Some(0x1000), None, true),
+            (Some(0x1010), "heuristic-5.10")
+        );
+        assert_eq!(
+            loggers_anchor_fallback(Some(0x1000), None, false),
+            (None, "omitted")
+        );
+        // A missing symbol or a negative enum value never yields an anchor.
+        assert_eq!(
+            loggers_anchor_fallback(None, Some(1), true),
+            (None, "omitted")
+        );
+        assert_eq!(
+            loggers_anchor_fallback(Some(0x1000), Some(-1), false),
+            (None, "omitted")
+        );
     }
 
     #[test]

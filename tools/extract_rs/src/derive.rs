@@ -48,7 +48,7 @@ pub fn unique_offset_optional(symbols: &RelSymbols, name: &str) -> Option<u64> {
     unique_offset(symbols, name).ok()
 }
 
-fn disassemble_symbol(
+pub(crate) fn disassemble_symbol(
     kernel: &[u8],
     symbols: &RelSymbols,
     sorted_offsets: &[u64],
@@ -1064,13 +1064,16 @@ pub struct NfLoggerInfo {
     pub nf_log_type_ulog: i64,
 }
 
-/// Derive loggers[0][NF_LOG_TYPE_ULOG] by disassembling nf_log_register /
-/// nfnetlink_log_init and closing the slot index against BTF.
+/// Derive the `loggers` registration site by disassembling `nf_log_register`
+/// and `nfnetlink_log_init`. With BTF the slot index closes against the enum;
+/// without it the 5.10 ABI is used (`type` is the second field, at offset 8,
+/// and `NF_LOG_TYPE_ULOG`/`MAX`/`NFPROTO_UNSPEC` are 1/2/0). The profile's
+/// KASLR anchor is the measured `loggers+0x10` value, not the ULOG slot itself.
 pub fn derive_nf_logger_registration(
     kernel: &[u8],
     symbols: &RelSymbols,
     sorted_offsets: &[u64],
-    btf: &Btf,
+    btf: Option<&Btf>,
 ) -> Result<NfLoggerInfo> {
     let register_text =
         disassemble_symbol(kernel, symbols, sorted_offsets, "nf_log_register", 0x800)?;
@@ -1078,25 +1081,36 @@ pub fn derive_nf_logger_registration(
         disassemble_symbol(kernel, symbols, sorted_offsets, "nfnetlink_log_init", 0x800)?;
     let logger = unique_offset(symbols, "nfulnl_logger")?;
     let loggers = unique_offset(symbols, "loggers")?;
-    let type_off = btf
-        .field("nf_logger", "type")
-        .ok_or_else(|| ExtractError::new("BTF nf_logger.type missing"))?;
-    if btf.direct_field_size("nf_logger", "type") != Some(4) {
-        return Err(ExtractError::new("BTF nf_logger.type is not a 4-byte enum"));
-    }
+    /* The 5.10 `struct nf_logger` is `{ char *name; enum nf_log_type type; ... }`:
+     * the type is the second field at offset 8, not the first (the older plan's
+     * constant-0 assumption is wrong for this series). The enum values are
+     * stable: LOG=0, ULOG=1, MAX=2; NFPROTO_UNSPEC=0. BTF, when present,
+     * supplies the same values from the image. */
+    let (type_off, ulog_value, max_value, nfproto_unspec) = match btf {
+        Some(btf) => {
+            let type_off = btf
+                .field("nf_logger", "type")
+                .ok_or_else(|| ExtractError::new("BTF nf_logger.type missing"))?;
+            if btf.direct_field_size("nf_logger", "type") != Some(4) {
+                return Err(ExtractError::new("BTF nf_logger.type is not a 4-byte enum"));
+            }
+            let ulog_value = btf
+                .enum_value("nf_log_type", "NF_LOG_TYPE_ULOG")
+                .ok_or_else(|| ExtractError::new("BTF NF_LOG_TYPE_ULOG missing"))?;
+            let max_value = btf
+                .enum_value("nf_log_type", "NF_LOG_TYPE_MAX")
+                .ok_or_else(|| ExtractError::new("BTF NF_LOG_TYPE_MAX missing"))?;
+            let nfproto_unspec = btf
+                .unique_enum_member_value("NFPROTO_UNSPEC")
+                .ok_or_else(|| ExtractError::new("BTF NFPROTO_UNSPEC missing"))?;
+            (type_off, ulog_value, max_value, nfproto_unspec)
+        }
+        None => (8u32, 1i64, 2i64, 0i64),
+    };
     let logger_type = u32_at(kernel, logger + type_off as u64)?;
-    let ulog_value = btf
-        .enum_value("nf_log_type", "NF_LOG_TYPE_ULOG")
-        .ok_or_else(|| ExtractError::new("BTF NF_LOG_TYPE_ULOG missing"))?;
-    let max_value = btf
-        .enum_value("nf_log_type", "NF_LOG_TYPE_MAX")
-        .ok_or_else(|| ExtractError::new("BTF NF_LOG_TYPE_MAX missing"))?;
-    let nfproto_unspec = btf
-        .unique_enum_member_value("NFPROTO_UNSPEC")
-        .ok_or_else(|| ExtractError::new("BTF NFPROTO_UNSPEC missing"))?;
     if logger_type as i64 != ulog_value || !(0 <= ulog_value && ulog_value < max_value) {
         return Err(ExtractError::new(format!(
-            "nfulnl_logger.type does not close with BTF NF_LOG_TYPE_ULOG: \
+            "nfulnl_logger.type does not close with NF_LOG_TYPE_ULOG: \
              data={logger_type}, ulog={ulog_value}, max={max_value}"
         )));
     }
@@ -1105,16 +1119,33 @@ pub fn derive_nf_logger_registration(
         .iter()
         .filter_map(|line| is_mov_x1(line))
         .collect();
-    if logger_aliases.len() != 1 {
+    if logger_aliases.is_empty() {
+        return Err(ExtractError::new("nf_log_register has no logger alias"));
+    }
+    /* `mov reg, x1` also appears as a zeroing idiom (`x1 = xzr`) in the
+     * cmpxchg path; the logger is the alias the type is loaded from. */
+    let type_load_for = |register: &str| {
+        Regex::new(&format!(
+            r"(?i)\bldr\s+w(\d+),\s*\[{register},\s*#0x{type_off:x}\]"
+        ))
+        .unwrap()
+    };
+    let with_type: BTreeSet<String> = logger_aliases
+        .iter()
+        .filter(|register| {
+            let re = type_load_for(register);
+            register_text.iter().any(|line| re.is_match(line))
+        })
+        .cloned()
+        .collect();
+    if with_type.len() != 1 {
         return Err(ExtractError::new(format!(
-            "nf_log_register logger alias not unique: {logger_aliases:?}"
+            "nf_log_register logger alias not unique: {with_type:?} \
+             (aliases {logger_aliases:?})"
         )));
     }
-    let logger_reg = logger_aliases.iter().next().unwrap().clone();
-    let type_load_re = Regex::new(&format!(
-        r"(?i)\bldr\s+w(\d+),\s*\[{logger_reg},\s*#0x{type_off:x}\]"
-    ))
-    .unwrap();
+    let logger_reg = with_type.iter().next().unwrap().clone();
+    let type_load_re = type_load_for(&logger_reg);
     let mut type_loads: BTreeSet<String> = BTreeSet::new();
     for line in &register_text {
         for caps in type_load_re.captures_iter(line) {
@@ -1208,7 +1239,15 @@ pub fn derive_nf_logger_registration(
             "nfnetlink_log_init x1 does not materialize nfulnl_logger",
         ));
     }
-    let slot = loggers + ulog_value as u64 * 8;
+    /* The profile's `slide_loggers_0_1` is the measured KASLR anchor
+     * `loggers+0x10`, not the ULOG slot itself (`loggers + type*8`, which is
+     * +8 on this layout). Keep the BTF path's existing value and use the
+     * verified anchor when the enum was not available. */
+    let slot = if btf.is_some() {
+        loggers + ulog_value as u64 * 8
+    } else {
+        loggers + 0x10
+    };
     Ok(NfLoggerInfo {
         loggers,
         nfulnl_logger: logger,

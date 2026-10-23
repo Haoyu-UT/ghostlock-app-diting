@@ -24,8 +24,10 @@ use ghostlock_extract::kallsyms::Kallsyms;
 use ghostlock_extract::kallsyms_finder;
 use ghostlock_extract::payload;
 use ghostlock_extract::report;
+use ghostlock_extract::structs;
 use ghostlock_extract::symbols::{
-    kernel_layout_verified, kernel_struct_macro, resolve_structs, resolve_symbols,
+    kernel_layout_verified, kernel_struct_macro, loggers_anchor_fallback, resolve_structs,
+    resolve_symbols,
 };
 use ghostlock_extract::vendor_boot::recover_kernel_phys_from_vendor_boot;
 
@@ -525,6 +527,15 @@ fn run(cli: &Cli) -> Result<i32> {
         .as_deref()
         .and_then(|release| release.split('.').next())
         .and_then(|part| part.parse::<u32>().ok());
+    /* The SLUB stride is not derivable from the Image: BTF gives sizeof and
+     * the allocator may merge or pad the cache. Out-of-series 5.x profiles
+     * therefore carry the 1024 seed; label it so the generation log records it. */
+    if cli.format == "conf" && release_major == Some(5) && !series_matched {
+        eprintln!(
+            "warning: kernelsnitch.mm_struct_sz=1024 is the non-series heuristic; \
+             the SLUB stride is not derivable from the image without BTF or runtime slabinfo"
+        );
+    }
     // The pselect derivation runs for every image with BTF, and for a 5.10
     // image without it (the waiter layout is a 5.10 codegen constant). A
     // derivation failure is Unknown; only a geometric impossibility is
@@ -581,24 +592,59 @@ fn run(cli: &Cli) -> Result<i32> {
     };
 
     if !cli.no_disasm {
-        if let Some(btf) = &btf {
-            match derive_nf_logger_registration(&boot.kernel, &rel_symbols, &sorted_offsets, btf) {
-                Ok(info) => {
-                    derived.insert("off_slide_loggers_0_1".to_string(), info.loggers_0_1);
-                    eprintln!(
-                        "info: nf_logger loggers={:#x} nfulnl_logger={:#x} ulog={} slot={:#x}",
-                        info.loggers, info.nfulnl_logger, info.nf_log_type_ulog, info.loggers_0_1
-                    );
-                }
-                Err(err) => {
-                    eprintln!("warning: loggers_0_1 derivation failed: {err}");
-                }
+        match derive_nf_logger_registration(
+            &boot.kernel,
+            &rel_symbols,
+            &sorted_offsets,
+            btf.as_ref(),
+        ) {
+            Ok(info) => {
+                derived.insert("off_slide_loggers_0_1".to_string(), info.loggers_0_1);
+                eprintln!(
+                    "info: nf_logger loggers={:#x} nfulnl_logger={:#x} ulog={} slot={:#x}{}",
+                    info.loggers,
+                    info.nfulnl_logger,
+                    info.nf_log_type_ulog,
+                    info.loggers_0_1,
+                    if btf.is_none() {
+                        " (no BTF; structure verified, measured anchor)"
+                    } else {
+                        ""
+                    }
+                );
             }
-        } else {
-            eprintln!("warning: no BTF; loggers_0_1 falls back to the loggers+0x10 heuristic");
+            Err(err) => eprintln!("warning: nf_logger derivation failed: {err}"),
         }
     } else {
-        eprintln!("warning: --no-disasm; loggers_0_1 falls back to the loggers+0x10 heuristic");
+        eprintln!("info: --no-disasm; nf_logger uses the family fallback");
+    }
+
+    /* `resolve_symbols` seeds the measured 5.10 anchor (`loggers+0x10`). Do
+     * not let that constant reach another family: when the derivation did not
+     * close, BTF supplies the enum index, 5.10 keeps the measured constant, and
+     * every other family omits the field rather than shipping a foreign one. */
+    if !derived.contains_key("off_slide_loggers_0_1") {
+        let loggers =
+            kallsyms::unique(&symbols, "loggers").and_then(|value| value.checked_sub(base));
+        let ulog = btf
+            .as_ref()
+            .and_then(|btf| btf.enum_value("nf_log_type", "NF_LOG_TYPE_ULOG"));
+        let (fallback, source) = loggers_anchor_fallback(
+            loggers,
+            ulog,
+            release.as_deref().is_some_and(family::is_5_10),
+        );
+        symbol_offsets.insert("off_slide_loggers_0_1".to_string(), fallback);
+        match source {
+            "btf-enum" => eprintln!(
+                "info: nf_logger anchor loggers+{:#x} from the BTF enum",
+                ulog.unwrap_or(0) as u64 * 8
+            ),
+            "heuristic-5.10" => {
+                eprintln!("warning: nf_logger anchor uses the measured 5.10 heuristic loggers+0x10")
+            }
+            _ => eprintln!("warning: nf_logger anchor omitted; no BTF enum and no family fallback"),
+        }
     }
 
     let pselect_shift = match &pselect_outcome {
@@ -624,20 +670,80 @@ fn run(cli: &Cli) -> Result<i32> {
         symbol_offsets.insert("off_slide_loggers_0_1".to_string(), Some(slot));
     }
     let mut struct_offsets = resolve_structs(btf.as_ref());
+    let mut field_sources: BTreeMap<String, String> = BTreeMap::new();
+    // Per-image derivation first: init_task and copy_process locate the fields
+    // the image itself can prove. A field that does not close stays absent.
+    if btf.is_none() && cli.format == "conf" && !cli.no_disasm {
+        let init_task = kallsyms::unique(&symbols, "init_task");
+        let init_cred = kallsyms::unique(&symbols, "init_cred");
+        let root_task_group = kallsyms::unique(&symbols, "root_task_group");
+        if let (Some(init_task_va), Some(init_task_off)) = (
+            init_task,
+            symbol_offsets.get("off_init_task").copied().flatten(),
+        ) {
+            let derived = structs::derive_task_struct_5_10(
+                &boot.kernel,
+                &rel_symbols,
+                &sorted_offsets,
+                init_task_off,
+                init_task_va,
+                init_cred.unwrap_or(0),
+                root_task_group.unwrap_or(0),
+            );
+            if !derived.values.is_empty() {
+                for (name, value) in &derived.values {
+                    struct_offsets.insert((*name).to_string(), Some(*value));
+                    if let Some(source) = derived.sources.get(name) {
+                        field_sources.insert((*name).to_string(), format!("derived:{source}"));
+                    }
+                }
+                eprintln!(
+                    "info: no BTF; task_struct derived from the image ({} fields)",
+                    derived.values.len()
+                );
+            }
+        }
+    }
     // The template fills the profile contract, not the diagnostic report: the
     // JSON/text formats keep showing what the image itself yielded. It fills
-    // only inside the measured series; a fingerprint mismatch leaves the
-    // fields null and the log names the reason.
+    // only inside the measured series and only the fields the derivation did
+    // not close; a fingerprint mismatch leaves the rest null.
     if btf.is_none() && cli.format == "conf" && series_matched {
-        family::apply_structs(&mut struct_offsets);
+        for (name, template_value) in family::TASK_FIELDS {
+            match struct_offsets.get(*name).copied().flatten() {
+                Some(derived) if derived != *template_value => eprintln!(
+                    "warning: derived {name}={derived} differs from the measured-series \
+                     template {template_value}; using derived"
+                ),
+                Some(_) => {}
+                None => {
+                    struct_offsets.insert((*name).to_string(), Some(*template_value));
+                    let source = if series.is_heuristic() {
+                        format!("template:{} heuristic", series.label())
+                    } else {
+                        format!("template:{}", series.label())
+                    };
+                    field_sources.insert((*name).to_string(), source);
+                }
+            }
+        }
         eprintln!(
-            "info: no BTF; task_struct filled from the measured-series template ({})",
+            "info: no BTF; task_struct template filled the remaining fields ({})",
             series.label()
         );
         if series.is_heuristic() {
             eprintln!(
                 "warning: task_struct values are heuristic (patch-range series, no IKCONFIG)"
             );
+        }
+    }
+    // Per-field provenance for the generation log. The app copies these lines
+    // into the parse entry's meta; a later disagreement is reviewable without
+    // re-running the extractor.
+    if btf.is_none() && cli.format == "conf" {
+        for name in struct_offsets.keys() {
+            let source = field_sources.get(name).map(String::as_str).unwrap_or("null");
+            eprintln!("info: field_source {name}={source}");
         }
     }
 
@@ -1037,9 +1143,58 @@ fn run(cli: &Cli) -> Result<i32> {
                 Some(cred) => cred,
                 None if series_matched => {
                     let init_cred_off = symbol_offsets.get("off_init_cred").copied().flatten();
-                    match init_cred_off
-                        .and_then(|offset| family::cred_from_image(&boot.kernel, offset, base))
-                    {
+                    let derived = init_cred_off.and_then(|offset| {
+                        structs::derive_cred_layout_5_10(&boot.kernel, offset, base)
+                    });
+                    let cred = match derived {
+                        Some(cred) => {
+                            eprintln!(
+                                "info: no BTF; cred caps and refs derived from init_cred \
+                                 ({} refs, caps at {:#x})",
+                                cred.refs.len(),
+                                cred.caps_offset
+                            );
+                            field_sources.insert(
+                                "cred_layout.caps".to_string(),
+                                "derived:init_cred".to_string(),
+                            );
+                            field_sources.insert(
+                                "cred_layout.refs".to_string(),
+                                "derived:init_cred".to_string(),
+                            );
+                            Some(cred)
+                        }
+                        None => {
+                            let fallback = init_cred_off.and_then(|offset| {
+                                family::cred_from_image(&boot.kernel, offset, base)
+                            });
+                            if fallback.is_some() {
+                                eprintln!(
+                                    "warning: cred layout derivation failed; using the \
+                                     measured-series offsets ({})",
+                                    series.label()
+                                );
+                                field_sources.insert(
+                                    "cred_layout.caps".to_string(),
+                                    format!("family-constant:{}", series.label()),
+                                );
+                                field_sources.insert(
+                                    "cred_layout.refs".to_string(),
+                                    format!("family-constant:{}", series.label()),
+                                );
+                            }
+                            fallback
+                        }
+                    };
+                    field_sources.insert(
+                        "cred_layout.copy_size".to_string(),
+                        format!("template:{}", series.label()),
+                    );
+                    field_sources.insert(
+                        "cred_layout.usage".to_string(),
+                        "family-constant:5.10".to_string(),
+                    );
+                    match cred {
                         Some(cred) => {
                             let mut entries = report::conf_cred_5x(&cred, family::CRED_COPY_SIZE);
                             entries.push((
@@ -1048,15 +1203,10 @@ fn run(cli: &Cli) -> Result<i32> {
                             ));
                             entries.push(("ref3_offset".to_string(), "0".to_string()));
                             entries.push(("ref3_image".to_string(), "0".to_string()));
-                            eprintln!(
-                                "info: no BTF; cred refs read from init_cred at the \
-                                 measured-series offsets ({})",
-                                series.label()
-                            );
                             if series.is_heuristic() {
                                 eprintln!(
-                                    "warning: cred refs are heuristic (patch-range series, \
-                                     no IKCONFIG)"
+                                    "warning: cred copy size and usage are heuristic \
+                                     (patch-range series, no IKCONFIG)"
                                 );
                             }
                             entries
@@ -1081,6 +1231,16 @@ fn run(cli: &Cli) -> Result<i32> {
         } else {
             report::conf_cred_6x()
         };
+        for name in [
+            "cred_layout.caps",
+            "cred_layout.refs",
+            "cred_layout.copy_size",
+            "cred_layout.usage",
+        ] {
+            if let Some(source) = field_sources.get(name) {
+                eprintln!("info: field_source {name}={source}");
+            }
+        }
         let extra_offsets = report::ConfExtraOffsets {
             empty_zero_page: kallsyms::unique(&symbols, "empty_zero_page")
                 .and_then(|value| value.checked_sub(base)),

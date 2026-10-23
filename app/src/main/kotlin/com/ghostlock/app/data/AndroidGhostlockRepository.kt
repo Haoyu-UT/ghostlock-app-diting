@@ -551,6 +551,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         val heuristics = captured.filter { it.contains("heuristic", ignoreCase = true) }
         appendLine("heuristic_count=${heuristics.size}")
         heuristics.forEachIndexed { index, line -> appendLine("heuristic.$index=$line") }
+        val fieldSources = captured.filter { it.contains("field_source ") }
+        appendLine("field_source_count=${fieldSources.size}")
+        fieldSources.forEachIndexed { index, line -> appendLine("field_source.$index=$line") }
     }
 
     private fun sha256Of(file: File): String? = runCatching {
