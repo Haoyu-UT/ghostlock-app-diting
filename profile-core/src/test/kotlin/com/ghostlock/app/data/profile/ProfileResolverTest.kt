@@ -45,6 +45,56 @@ class ProfileResolverTest {
     }
 
     @Test
+    fun `nativeValue maps the anchor keys onto the multicast route branch`() {
+        /* The anchor trio is stated in the route's own section (`mcast.` is
+         * only the geometry's lookup prefix; the anchor keys are
+         * branch-relative like the select route's). */
+        val profile = valueMapOf(
+            "route" to valueMapOf(
+                "multicast_waiter" to valueMapOf(
+                    "lock_anchor_image" to 0x400000,
+                    "lock_anchor_bytes" to 0x600,
+                    "lock_anchor_stride" to 0x20,
+                ),
+            ),
+        )
+        assertEquals(
+            0x400000L,
+            ProfileResolver.nativeValue(profile, "multicast_waiter", "none", "lock_anchor_image"),
+        )
+        assertEquals(
+            0x600L,
+            ProfileResolver.nativeValue(profile, "multicast_waiter", "none", "lock_anchor_bytes"),
+        )
+        assertEquals(
+            0x20L,
+            ProfileResolver.nativeValue(profile, "multicast_waiter", "none", "lock_anchor_stride"),
+        )
+
+        /* Another route's section is not a source: the decoder never merges
+         * across routes, and the resolver must not either. */
+        val foreign = valueMapOf(
+            "route" to valueMapOf("select_stack" to valueMapOf("lock_anchor_image" to 0x400000)),
+        )
+        assertEquals(
+            null,
+            ProfileResolver.nativeValue(foreign, "multicast_waiter", "none", "lock_anchor_image"),
+        )
+
+        /* The declared fallback branch is a source, as it is for the other
+         * routes' keys. */
+        val fallbackOnly = valueMapOf(
+            "fallback" to valueMapOf(
+                "route" to valueMapOf("multicast_waiter" to valueMapOf("lock_anchor_image" to 0x400000)),
+            ),
+        )
+        assertEquals(
+            0x400000L,
+            ProfileResolver.nativeValue(fallbackOnly, "tcp_zerocopy", "multicast_waiter", "lock_anchor_image"),
+        )
+    }
+
+    @Test
     fun `validateMerged rejects an unknown top level key`() {
         val errors = ProfileResolver.validateMerged(validProfile() + ("bogus" to 1L), "select_stack", "none")
         assertTrue(errors.any { it.fieldPath == "bogus" })

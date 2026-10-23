@@ -15,6 +15,12 @@ int32_t main(void) {
             .mcast_buffer_size = 128,
             .mcast_task_offset = 40,
             .mcast_lock_offset = 48,
+            /* Synthetic vector: the multicast layout reuses the shared anchor
+             * storage, so all three travel even though only this route's
+             * section stated them. */
+            .select_lock_anchor_image = 0x400000,
+            .select_lock_anchor_bytes = 0x600,
+            .select_lock_anchor_stride = 0x20,
         },
         .execution = {
             .recommended_main_cpu = 2,
@@ -38,6 +44,9 @@ int32_t main(void) {
         profile.supports(ghostlock::profile::RouteKind::SelectStack) ||
         multicast.buffer_size.value_or(0) != 128 ||
         multicast.waiter_offset.value_or(0) != 32 ||
+        multicast.lock_anchor_image.value_or(0) != 0x400000 ||
+        multicast.lock_anchor_bytes.value_or(0) != 0x600 ||
+        multicast.lock_anchor_stride.value_or(0) != 0x20 ||
         select.waiter_shift.value_or(0) != 16 ||
         select.compact_waiter.value_or(0) == 0 ||
         tcp.compact_waiter.value_or(0) == 0 ||

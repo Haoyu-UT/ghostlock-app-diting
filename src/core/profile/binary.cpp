@@ -193,6 +193,13 @@ namespace ghostlock::binary_profile {
             OPT("buffer_size", geometry.mcast_buffer_size),
             OPT("task_offset", geometry.mcast_task_offset),
             OPT("lock_offset", geometry.mcast_lock_offset),
+            /* The anchor trio is stated by this route's own section, for the
+             * same reason as the sigreturn route's below: the decoder never
+             * merges across routes. Optional, and absence keeps the
+             * reclaimed-page behaviour. */
+            OPT("lock_anchor_image", geometry.select_lock_anchor_image),
+            OPT("lock_anchor_bytes", geometry.select_lock_anchor_bytes),
+            OPT("lock_anchor_stride", geometry.select_lock_anchor_stride),
         };
 
         /* The sigreturn route's own section. The anchor trio is not duplicated

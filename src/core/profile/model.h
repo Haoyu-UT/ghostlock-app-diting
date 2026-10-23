@@ -178,6 +178,14 @@ namespace ghostlock::profile {
     struct MulticastWaiterLayout {
         std::optional<int32_t> waiter_offset;
         std::optional<uint32_t> buffer_size, task_offset, lock_offset;
+        /* The same anchor keys the other routes carry. The lock word is
+         * route-independent, and a document never merges another route's
+         * section, so this route's own section has to be able to state it.
+         * Absent => the reclaimed payload page is used, i.e. the previous
+         * behaviour. */
+        std::optional<uint64_t> lock_anchor_image;
+        std::optional<uint64_t> lock_anchor_bytes;
+        std::optional<uint64_t> lock_anchor_stride;
     };
 
     struct SelectStackLayout {
@@ -364,6 +372,12 @@ namespace ghostlock::profile {
                            .buffer_size = values_.geometry.mcast_buffer_size,
                            .task_offset = values_.geometry.mcast_task_offset,
                            .lock_offset = values_.geometry.mcast_lock_offset,
+                           /* One shared anchor storage for every route (the
+                            * sigreturn route already reuses these fields);
+                            * only the transport section differs. */
+                           .lock_anchor_image = values_.geometry.select_lock_anchor_image,
+                           .lock_anchor_bytes = values_.geometry.select_lock_anchor_bytes,
+                           .lock_anchor_stride = values_.geometry.select_lock_anchor_stride,
                        }
                        : MulticastWaiterLayout{};
         }
