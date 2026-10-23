@@ -48,7 +48,6 @@ pub const CRED_REF_OFFSETS: [u32; 3] = [128, 136, 144];
 /// which is the spelling `data_alias()` expects.
 pub const KIMAGE_TEXT_BASE: u64 = 0xffff_ffc0_8000_0000;
 
-pub const MM_STRUCT_SZ: u64 = 960;
 pub const COLLISIONS: u64 = 8;
 // Execution tuning (selected_cpus, race knobs, route timing) is app-owned; the
 // extractor does not emit it. See docs/analysis/extractor-5x-route-geometry-plan.md.
@@ -216,7 +215,6 @@ mod tests {
         assert_eq!(CRED_CAPS_COUNT, 5);
         assert_eq!(CRED_CAPS_VALUE, 2199023255551);
         assert_eq!(CRED_REF_OFFSETS, [128, 136, 144]);
-        assert_eq!(MM_STRUCT_SZ, 960);
         assert_eq!(ANCHOR_STRIDE, 32);
         assert_eq!(SELECT_WAITER_SHIFT, -2);
         assert_eq!(SIGRETURN_OFF_SVE, 336);

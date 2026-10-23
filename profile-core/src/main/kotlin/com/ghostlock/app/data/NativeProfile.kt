@@ -29,7 +29,6 @@ data class NativeProfileDocument(
     val kernelPhysOffset: ULong?,
     val compactWaiter: UByte?,
     val kernelsnitchCollisions: UInt?,
-    val mmStructSz: UInt?,
     val execution: ExecutionTuning,
     val safeMode: UInt,
     /** Route-specific configuration; never part of the shared schema. */
@@ -99,7 +98,6 @@ data class NativeProfileDocument(
                 WireEntry("kernel_phys_offset", kernelPhysOffset),
                 WireEntry("compact_waiter", compactWaiter?.toULong()),
                 WireEntry("kernelsnitch_collisions", kernelsnitchCollisions?.toULong()),
-                WireEntry("mm_struct_sz", mmStructSz?.toULong()),
             ),
         )
         add(
@@ -528,7 +526,6 @@ data class NativeProfileDocument(
                 kernelPhysOffset = vulOrNull("kernel_phys_offset"),
                 compactWaiter = vbOrNull("compact_waiter"),
                 kernelsnitchCollisions = vuOrNull("kernelsnitch.collisions"),
-                mmStructSz = vuOrNull("kernelsnitch.mm_struct_sz"),
                 execution = ExecutionTuning(
                     recommendedMainCpu = vu("execution.recommended_cpus.main"),
                     recommendedConsumerCpu = vu("execution.recommended_cpus.consumer"),
@@ -576,7 +573,6 @@ data class NativeProfileDocument(
             private var kernelPhysOffset: ULong? = null
             private var compactWaiter: UByte? = null
             private var kernelsnitchCollisions: UInt? = null
-            private var mmStructSz: UInt? = null
             private var execution = ExecutionTuning()
             private var routeConfig: RouteConfig = routeKind.emptyConfig()
 
@@ -650,7 +646,6 @@ data class NativeProfileDocument(
                         "kernel_phys_offset" -> kernelPhysOffset = raw
                         "compact_waiter" -> compactWaiter = raw.toUByte()
                         "kernelsnitch_collisions" -> kernelsnitchCollisions = raw.toUInt()
-                        "mm_struct_sz" -> mmStructSz = raw.toUInt()
                     }
 
                     "execution.recommended_cpus" -> execution = when (key) {
@@ -736,7 +731,6 @@ data class NativeProfileDocument(
                 kernelPhysOffset = kernelPhysOffset,
                 compactWaiter = compactWaiter,
                 kernelsnitchCollisions = kernelsnitchCollisions,
-                mmStructSz = mmStructSz,
                 execution = execution,
                 safeMode = metaSafeMode,
                 routeConfig = routeConfig,

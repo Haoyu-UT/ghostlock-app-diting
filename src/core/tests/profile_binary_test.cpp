@@ -21,7 +21,7 @@ namespace {
      * block. Asserted with the same value in the Kotlin test
      * (profile-core `NativeProfileDigestTest`), which is what makes the two
      * implementations a checked contract rather than two hopeful copies. */
-    constexpr uint64_t kGoldenSchemaDigest = 0xcc8fc4e3d6a4eadfull;
+    constexpr uint64_t kGoldenSchemaDigest = 0x4599fa12586dd156ull;
 
     void put_u16(std::string &out, uint16_t value) {
         out.push_back(static_cast<char>(value & 0xff));
@@ -109,7 +109,6 @@ int32_t main(void) {
     values.offsets.slide_boot_id = 0x2336600;
     values.misc.compact_waiter = 1;
     values.misc.kernelsnitch_collisions = 4;
-    values.misc.mm_struct_sz = 0x400;
     values.execution.w1_attempts = 15;
     values.execution.race_route_done_timeout_ms = 300000;
     values.execution.handoff_enforce_poll_interval_ms = 100;
@@ -131,7 +130,6 @@ int32_t main(void) {
     assert(parsed.offsets.slide_boot_id == 0x2336600);
     assert(parsed.misc.compact_waiter.value_or(0) == 1);
     assert(parsed.misc.kernelsnitch_collisions.value_or(0) == 4);
-    assert(parsed.misc.mm_struct_sz.value_or(0) == 0x400);
     assert(parsed.execution.w1_attempts == 15);
     assert(parsed.execution.race_route_done_timeout_ms == 300000);
     assert(parsed.execution.handoff_enforce_poll_interval_ms == 100);
@@ -146,13 +144,11 @@ int32_t main(void) {
         /* A provided 0 is preserved and present (not "unset"). */
         strict.geometry.pselect_waiter_shift = 0;
         strict.misc.kernel_phys_load = 0;
-        strict.misc.mm_struct_sz = 0;
         assert(round_trip(strict, &parsed, release, sizeof(release)) == 0);
         assert(parsed.geometry.pselect_waiter_shift.has_value() &&
                *parsed.geometry.pselect_waiter_shift == 0);
         assert(parsed.misc.kernel_phys_load.has_value() &&
                *parsed.misc.kernel_phys_load == 0);
-        assert(parsed.misc.mm_struct_sz.has_value() && *parsed.misc.mm_struct_sz == 0);
 
         /* The same for the multicast route's own section. */
         profile::kernel_offsets mstrict = {};
@@ -219,7 +215,7 @@ int32_t main(void) {
         absent.geometry.mcast_buffer_size = 264;
         assert(round_trip(absent, &parsed, release, sizeof(release)) == 0);
         assert(!parsed.geometry.mcast_waiter_off.has_value());
-        assert(!parsed.misc.mm_struct_sz.has_value());
+        assert(!parsed.misc.compact_waiter.has_value());
         assert(parsed.geometry.mcast_buffer_size.value_or(0) == 264);
     }
 

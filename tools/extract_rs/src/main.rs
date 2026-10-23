@@ -527,15 +527,6 @@ fn run(cli: &Cli) -> Result<i32> {
         .as_deref()
         .and_then(|release| release.split('.').next())
         .and_then(|part| part.parse::<u32>().ok());
-    /* The SLUB stride is not derivable from the Image: BTF gives sizeof and
-     * the allocator may merge or pad the cache. Out-of-series 5.x profiles
-     * therefore carry the 1024 seed; label it so the generation log records it. */
-    if cli.format == "conf" && release_major == Some(5) && !series_matched {
-        eprintln!(
-            "warning: kernelsnitch.mm_struct_sz=1024 is the non-series heuristic; \
-             the SLUB stride is not derivable from the image without BTF or runtime slabinfo"
-        );
-    }
     // The pselect derivation runs for every image with BTF, and for a 5.10
     // image without it (the waiter layout is a 5.10 codegen constant). A
     // derivation failure is Unknown; only a geometric impossibility is
@@ -823,10 +814,10 @@ fn run(cli: &Cli) -> Result<i32> {
     }
     if let Some(mm_size) = struct_offsets.get("struct_mm_struct").copied().flatten() {
         eprintln!(
-            "info: sizeof(mm_struct)=0x{mm_size:X} (MM_STRUCT_SZ=0x500 in src/core/common.h)"
+            "info: sizeof(mm_struct)=0x{mm_size:X} (native spray default MM_STRUCT_SZ=0x500)"
         );
         if mm_size > 0x500 {
-            eprintln!("warning: sizeof(mm_struct) exceeds the hardcoded MM_STRUCT_SZ slab stride");
+            eprintln!("warning: sizeof(mm_struct) exceeds the native MM_STRUCT_SZ default (0x500)");
         }
     }
 
@@ -1251,7 +1242,6 @@ fn run(cli: &Cli) -> Result<i32> {
             /* DRAM base: from /proc/iomem when the extractor ran on a rooted
              * device, otherwise left for the profile author to fill. */
             phys_offset: kernel_phys_offset,
-            series_matched,
             symbols: &symbol_offsets,
             structs: &struct_offsets,
             route: route.as_deref(),

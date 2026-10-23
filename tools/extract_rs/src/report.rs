@@ -66,9 +66,7 @@ pub fn build_report(
     if kernel_layout_verified(release)
         && crate::symbols::kernel_struct_macro(release) == Some("STRUCT_OFFSETS_6_1")
     {
-        // 0x400 is the device SLUB stride, not the BTF 0x3c0
         report["compact_waiter"] = json!(1);
-        report["mm_struct_sz"] = json!(0x400);
     }
     report
 }
@@ -328,10 +326,6 @@ pub struct ConfInputs<'a> {
     /// DRAM base (linear-map PHYS_OFFSET); normally supplied by hand, so the
     /// extractor writes an explicit `null` unless one is known.
     pub phys_offset: Option<u64>,
-    /// Whether the image's embedded config matched the measured series. Gates
-    /// the 5.10 template fallback: 960 in-series, 1024 only as the non-series
-    /// seed (a heuristic).
-    pub series_matched: bool,
     pub symbols: &'a BTreeMap<String, Option<u64>>,
     pub structs: &'a BTreeMap<String, Option<u32>>,
     pub route: Option<&'a str>,
@@ -410,46 +404,23 @@ pub fn render_conf(input: &ConfInputs<'_>) -> String {
     // keys (rather than writing null) is the contract: a null inside a new
     // route group survives the app's merge and blocks the preset.
 
-    // KernelSnitch: full universe. `collisions` is emitted for a verified
-    // train (and every 5.x kernel); `mm_struct_sz` only where it applies. An
-    // unverified release keeps both as `null` rather than omitting the block.
+    // KernelSnitch: `collisions` is emitted for a verified train (and every
+    // 5.x kernel). The mm_struct SLUB stride is deliberately not a profile
+    // value: the leak scans a stride-agnostic grid and the spray uses the
+    // native default, so the extractor never guesses a value it cannot derive.
+    // An unverified release keeps `collisions` as `null`.
     let mut snitch = Vec::new();
     if kernel_layout_verified(Some(release)) || major == Some(5) {
         match major {
-            Some(6) => {
-                // = kernelsnitch-6x.conf
-                snitch.push(("collisions".to_string(), "4".to_string()));
-                if crate::symbols::kernel_struct_macro(Some(release)) == Some("STRUCT_OFFSETS_6_1")
-                {
-                    // 0x400 is the device SLUB stride, not the BTF sizeof (0x3c0).
-                    snitch.push(("mm_struct_sz".to_string(), "1024".to_string()));
-                }
-            }
-            Some(5) => {
-                snitch.push(("collisions".to_string(), "8".to_string()));
-                // The diting 5.10 line's slab stride is 960; 1024 is the
-                // template default (and the measured 5.15 value), used only as
-                // the non-series seed — a heuristic.
-                let mm_struct_sz = if input.series_matched {
-                    crate::family::MM_STRUCT_SZ
-                } else {
-                    1024
-                };
-                snitch.push(("mm_struct_sz".to_string(), mm_struct_sz.to_string()));
-            }
+            Some(6) => snitch.push(("collisions".to_string(), "4".to_string())),
+            Some(5) => snitch.push(("collisions".to_string(), "8".to_string())),
             _ => {}
         }
     }
     push_conf_block(
         &mut lines,
         "kernelsnitch",
-        &[
-            ("collisions".to_string(), conf_lookup(&snitch, "collisions")),
-            (
-                "mm_struct_sz".to_string(),
-                conf_lookup(&snitch, "mm_struct_sz"),
-            ),
-        ],
+        &[("collisions".to_string(), conf_lookup(&snitch, "collisions"))],
     );
 
     let task: Vec<(String, String)> = CONF_TASK_FIELDS
@@ -552,7 +523,6 @@ mod tests {
             release: "6.6.89-android15-8-g0889fe95bb10-ab14402178-4k",
             phys: Some(0x4000_0000),
             phys_offset: None,
-            series_matched: false,
             symbols: &symbols,
             structs: &structs,
             route: Some("select_stack"),
@@ -564,7 +534,7 @@ mod tests {
         assert!(out.contains("kernel_phys_load = 1073741824"));
         assert!(out.contains("route {\n  select_stack {\n    waiter_shift = -2\n  }\n}"));
         assert!(out.contains("collisions = 4"));
-        assert!(out.contains("mm_struct_sz = null"));
+        assert!(!out.contains("mm_struct_sz"));
         assert!(!out.contains("task_prio"));
         assert!(out.contains("  prio = 132"));
         assert!(out.contains("cred {"));
@@ -577,14 +547,13 @@ mod tests {
     }
 
     #[test]
-    fn conf_61_writes_the_compact_waiter_and_slub_stride() {
+    fn conf_61_writes_the_compact_waiter() {
         let (symbols, structs) = conf_fixture();
         let geometry: Vec<(&'static str, i64)> = vec![("compact_waiter", 1)];
         let out = render_conf(&ConfInputs {
             release: "6.1.118-android14-11-gca0ef6d17716-ab13624819",
             phys: None,
             phys_offset: None,
-            series_matched: false,
             symbols: &symbols,
             structs: &structs,
             route: Some("tcp_zerocopy"),
@@ -593,7 +562,7 @@ mod tests {
             extra_offsets: &no_extra_offsets(),
         });
         assert!(out.contains("tcp_zerocopy {\n    compact_waiter = 1"));
-        assert!(out.contains("mm_struct_sz = 1024"));
+        assert!(!out.contains("mm_struct_sz"));
         assert!(out.contains("kernel_phys_load = null"));
     }
 
@@ -621,7 +590,6 @@ mod tests {
             release: "5.15.189-android13-8-00016-g51bba4309aac-ab14546557",
             phys: None,
             phys_offset: None,
-            series_matched: false,
             symbols: &symbols,
             structs: &structs,
             route: Some("multicast_waiter"),
@@ -637,7 +605,7 @@ mod tests {
         assert!(out.contains("lock_offset = 56"));
         assert!(out.contains("compact_waiter = 1"));
         assert!(out.contains("collisions = 8"));
-        assert!(out.contains("mm_struct_sz = 1024"));
+        assert!(!out.contains("mm_struct_sz"));
         assert!(out.contains("cred {"));
         assert!(out.contains("copy_size = 176"));
         assert!(out.contains("usage_value = 256"));
@@ -782,7 +750,6 @@ mod tests {
             release: "5.15.178-g3575c47dc7ce-dirty",
             phys: None,
             phys_offset: None,
-            series_matched: false,
             symbols: &symbols,
             structs: &structs,
             route: Some("multicast_waiter"),
@@ -804,7 +771,6 @@ mod tests {
             release: "6.7.1-generic",
             phys: None,
             phys_offset: None,
-            series_matched: false,
             symbols: &symbols,
             structs: &structs,
             route: None,
@@ -814,7 +780,7 @@ mod tests {
         });
         assert!(out.contains("kernelsnitch {"));
         assert!(out.contains("collisions = null"));
-        assert!(out.contains("mm_struct_sz = null"));
+        assert!(!out.contains("mm_struct_sz"));
     }
 
     #[test]
@@ -830,7 +796,6 @@ mod tests {
             release: "5.15.178-g3575c47dc7ce-dirty",
             phys: None,
             phys_offset: None,
-            series_matched: false,
             symbols: &symbols,
             structs: &structs,
             route: Some("multicast_waiter"),
@@ -843,11 +808,11 @@ mod tests {
         assert!(out.contains("task_offset = 48"));
         assert!(out.contains("lock_offset = 56"));
         assert!(out.contains("compact_waiter = 1"));
-        // The 5.x KernelSnitch defaults are required to run and are emitted even
-        // without the "-android13-" train tag.
+        // The 5.x KernelSnitch collisions value is required to run and is
+        // emitted even without the "-android13-" train tag.
         assert!(out.contains("kernelsnitch"));
         assert!(out.contains("collisions = 8"));
-        assert!(out.contains("mm_struct_sz = 1024"));
+        assert!(!out.contains("mm_struct_sz"));
     }
 
     #[test]
@@ -992,7 +957,6 @@ mod tests {
             release: &release,
             phys: None,
             phys_offset: None,
-            series_matched: false,
             symbols: &symbols,
             structs: &structs,
             route: Some("multicast_waiter"),

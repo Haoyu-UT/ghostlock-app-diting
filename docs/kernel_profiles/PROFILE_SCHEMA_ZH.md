@@ -62,7 +62,7 @@ route {
   select_stack { waiter_shift = -2 }
 }
 fallback { to = "none" }
-kernelsnitch { collisions = 4, mm_struct_sz = 4096 }
+kernelsnitch { collisions = 4 }
 task_struct { prio = 132, cred = 2080, pi_lock = 2316 }
 cred { copy_size = 136, caps_offset = 48, caps_count = 5 }
 offset { init_task = 34464384, init_cred = 34538824 }
@@ -110,7 +110,7 @@ route { multicast_waiter { waiter_off = 96, buffer_size = 264 } }
 | `kernel_major` ∈ {5,6}、`cred.copy_size`、`cred.caps_count` 及凭据模板边界 | 必填 | 必填 | 必填 |
 | `route.tcp_zerocopy.compact_waiter` / `route.multicast_waiter.compact_waiter` | 必填 | | 必填 |
 | `route.select_stack.waiter_shift` | | 必填（0 合法） | |
-| `route.multicast_waiter.waiter_off`（>0）、`route.multicast_waiter.buffer_size`、`route.multicast_waiter.task_offset`、`route.multicast_waiter.lock_offset`、`offset.empty_zero_page`、`kernelsnitch.mm_struct_sz`、`cred.ref_count`（>0） | | | 必填 |
+| `route.multicast_waiter.waiter_off`（>0）、`route.multicast_waiter.buffer_size`、`route.multicast_waiter.task_offset`、`route.multicast_waiter.lock_offset`、`offset.empty_zero_page`、`cred.ref_count`（>0） | | | 必填 |
 
 凭据模板边界（通用）：`cred.usage_offset + 4 ≤ cred.copy_size`；`cred.caps_offset + cred.caps_count × 8 ≤ cred.copy_size`；`cred.ref_count ≤ 4`；每个 `cred.refN_image` 非零、`cred.refN_offset + 8 ≤ cred.copy_size`。`multicast_waiter` 还要求 `cred_copy_size ≥ 0xa0` 且 `route.multicast_waiter.waiter_off + route.multicast_waiter.lock_offset + 8 ≤ route.multicast_waiter.buffer_size`。
 
@@ -213,7 +213,6 @@ cred
 | 字段 | 含义 |
 |---|---|
 | `kernelsnitch.collisions` | 需要的 futex 碰撞数量 |
-| `kernelsnitch.mm_struct_sz` | `mm_struct` 的 SLUB 大小（未填写时使用内置默认） |
 
 ## 5. execution 调优参数（advisory）
 
@@ -292,12 +291,13 @@ cred
   | `symbols` 对象（`off_*` 键） | `offset.*` 命名空间 |
   | `struct_fields` 对象（`task_*` 键） | `task_struct.*` 命名空间；`rt_mutex_waiter`/`cred_uid`/`seccomp_*` 等字段保留原处，不参与校验与比较 |
   | 顶层 `pselect_waiter_shift` | `route.select_stack.waiter_shift`；tcp 配置则保留为 `fallback.route.select_stack.waiter_shift` |
-  | 顶层 `compact_waiter` / `mm_struct_sz` | `route.tcp_zerocopy.compact_waiter` / `kernelsnitch.mm_struct_sz` |
+  | 顶层 `compact_waiter` | `route.tcp_zerocopy.compact_waiter` |
+  | 顶层 `mm_struct_sz` | 丢弃（泄漏扫描已与 stride 无关） |
   | `kimage_text_base` / `btf_size` / `kallsyms` | 丢弃 |
   | 无 `route` 字段 | 按 6.x 几何推断：`compact_waiter` → tcp，否则 select |
   | 无 cred 模板 | 写入内置 6.x 常量（`credential-6x.conf` / `kernelsnitch-6x.conf`）；5.x 凭据字段仍由作者提供 |
 
-- 旧版扁平键（`kernelsnitch_collisions` / `mm_struct_sz` / `task_*` / `cred_*` / `off_*` / `mcast_*`）在导入旧 `offsets.json`、解析 extractor 输出或读取高级覆盖时自动归入对应命名空间。
+- 旧版扁平键（`kernelsnitch_collisions` / `task_*` / `cred_*` / `off_*` / `mcast_*`）在导入旧 `offsets.json`、解析 extractor 输出或读取高级覆盖时自动归入对应命名空间；已废弃的 `mm_struct_sz` 键直接丢弃。
 - 旧配置缺少 `route` 时同样按此推断：`kernel_major==5 且 mcast.waiter_off>0` → `multicast_waiter`；否则 `compact_waiter!=0` → `tcp_zerocopy`；否则 `select_stack`。v1 文档不可能选中 5.x 分支（`multicast_waiter` 仅作为受保护推断保留）。
 - 旧版 JSON 缓存**不迁移、启动即丢弃**；内部存储、快照与导出始终为 HOCON。
 - native 无 v1 解析器：native 侧 `legacy/` JSON 解码器已删除；v1 文档在传输前已由 Kotlin 侧转成 v2。

@@ -61,7 +61,6 @@ private fun fieldLabelRes(path: String): Int? = when (path) {
     "execution.stages.w3_settle_us" -> R.string.field_execution_stages_w3_settle_us
     "kernel_major" -> R.string.field_kernel_major
     "kernelsnitch.collisions" -> R.string.field_kernelsnitch_collisions
-    "kernelsnitch.mm_struct_sz" -> R.string.field_mm_struct_sz
     "kernel_phys_load" -> R.string.field_kernel_phys_load
     "kernel_phys_offset" -> R.string.field_kernel_phys_offset
     "route.multicast_waiter.buffer_size" -> R.string.field_mcast_buffer_size

@@ -124,7 +124,6 @@ namespace ghostlock::profile {
         std::optional<uint64_t> kernel_phys_offset;
         std::optional<uint8_t> compact_waiter;
         std::optional<uint32_t> kernelsnitch_collisions;
-        std::optional<uint32_t> mm_struct_sz;
     };
 
     struct RouteGeometry {
@@ -413,10 +412,6 @@ namespace ghostlock::profile {
         [[nodiscard]] uint32_t or_default(uint32_t value, uint32_t fallback)
         const noexcept {
             return (loaded_ && value) ? value : fallback;
-        }
-
-        [[nodiscard]] uint32_t mm_struct_stride(uint32_t fallback) const noexcept {
-            return or_default(loaded_ ? values_.misc.mm_struct_sz.value_or(0) : 0, fallback);
         }
 
         [[nodiscard]] uint64_t image(uint64_t offset, uint64_t image_base,

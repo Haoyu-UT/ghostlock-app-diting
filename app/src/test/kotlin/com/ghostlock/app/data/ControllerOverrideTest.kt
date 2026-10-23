@@ -391,7 +391,6 @@ class ControllerOverrideTest {
             }
             kernelsnitch {
               collisions = 8
-              mm_struct_sz = 1024
             }
             task_struct {
               prio = 124

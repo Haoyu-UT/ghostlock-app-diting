@@ -50,15 +50,17 @@ the stride only decides which addresses are offered to it.
 
 **Goal.** Make the leak succeed without knowing the true stride: the primary scan uses inner step
 **32** (complete coverage for every observed family stride), and `S=8` is the last resort for a
-stride that is not a multiple of 32. The profile `mm_struct_sz` remains only as the spray-sizing
-hint.
+stride that is not a multiple of 32. The profile `mm_struct_sz` was initially kept as the
+spray-sizing hint; the same-day follow-up below removed it from the profile contract.
 
 **Non-goals.**
 
-- No profile-schema or profile-value change; `mm_struct_sz` stays emitted and is still used for the
-  spray sizing hint.
+- ~~No profile-schema or profile-value change; `mm_struct_sz` stays emitted and is still used for
+  the spray sizing hint.~~ Superseded by the follow-up below: the field was removed once the scan
+  merged.
 - No `/proc/slabinfo` read, no root-only interface, no side channel.
-- No change to the validator, futex hash, routes, exploit stages, or wire format.
+- No change to the validator, futex hash, routes, or exploit stages. (The follow-up removes the
+  optional `mm_struct_sz` kernel-wire slot.)
 - No attempt to recover `T` for spray sizing (a possible later extension; see Open questions).
 
 **Constraints.**
@@ -107,8 +109,9 @@ flowchart TD
    `[identity_start, direct_map_end]` span. Cost: ~20 s over the 40 GiB span, ~7 s bank-filtered.
 2. **Last resort:** inner step **8**, same outer step and ranges. It is the universal grid for a
    stride that is not a multiple of 32; it is paid only when the primary pass finds nothing.
-3. **Spray sizing** keeps `profile.mm_struct_stride(kernel::MM_STRUCT_SZ)`. It is a soft value; the
-   gate must show that a wrong value does not independently break the chain (see Falsifier).
+3. **Spray sizing** initially kept `profile.mm_struct_stride(kernel::MM_STRUCT_SZ)`. It is a soft
+   value; the gate must show that a wrong value does not independently break the chain (see
+   Falsifier). The follow-up below replaces the profile input with the compiled `MM_STRUCT_SZ`.
 4. **Failure:** if both passes fail, keep the current failure result and logging.
 
 Range walker: the scan takes a list of `[start, end)` ranges instead of one span. With the iomem
@@ -220,12 +223,33 @@ scan criterion.
 
 ## Explicitly unchanged
 
-- `profile` schema, `kernelsnitch.mm_struct_sz` values, generation logs, and the app's extractor.
+- ~~`profile` schema, `kernelsnitch.mm_struct_sz` values, generation logs, and the app's extractor.~~
+  Superseded by the follow-up below: the field is gone from the schema, the extractor and the
+  bundled profiles.
 - The validator, futex hash, collision phase, and tag-sweep order.
-- The spray algorithm and its inputs (except that a wrong profile value remains possible, as today).
+- The spray algorithm; only its stride input changed (the compiled `MM_STRUCT_SZ` default).
 - The route/exploit stage machine and handoff.
-- The profile-side limitation: the unprivileged app still cannot read `/proc/slabinfo`; this plan
-  only removes the **leak's** dependence on the exact stride.
+- The profile-side limitation: the unprivileged app still cannot read `/proc/slabinfo`; the scan
+  no longer needs it, and the spray uses an approximate default.
+
+## Follow-up (2026-10-24): remove the stride from the profile
+
+After `7f859eb` merged to `document`, the operator directed that the value no longer appear in the
+profile: with the leak stride-agnostic, the extractor was still emitting a family guess (960/1024)
+it cannot derive. The follow-up removes it end to end:
+
+- **Profile contract:** `kernelsnitch.mm_struct_sz` is gone from the Kotlin model, the wire schema
+  and the native `KernelMisc`; the native spray sizes with the compiled `MM_STRUCT_SZ` default
+  (0x500, 25 objects per 32 KiB slab). Spray shaping is the only consumer left, and the device
+  falsifier showed a wrong stride (1024) still leaked the mm and reached W1–W3 — the leak cannot be
+  hidden by a wrong shaping value. The field was already optional, so a profile that omits it
+  behaves exactly like the old `null` fallback.
+- **Extractor:** the `kernelsnitch` block carries only `collisions`; the 5.10 960 / 6.1 1024 seeds,
+  the non-series-heuristic warning and the JSON `mm_struct_sz` field are removed.
+- **Bundled profiles/templates and the app:** every asset drops the line; the advanced editor no
+  longer shows it; multicast validation no longer requires it; legacy import drops the old flat
+  key instead of carrying it into the namespace.
+- The native scan is unchanged (merged as `7f859eb`).
 
 ## Open questions
 
@@ -268,4 +292,7 @@ scan criterion.
       `docs/analysis/device-gates/kernelsnitch-stride-2026-10-24.md`; evidence
       `external/port/kn-stride/{control-1,falsifier-2}`. The pre-registered 5/5 per cell was not
       run; a 5/5 series with `cpu-active-hold.sh` remains optional before merging.
+- [x] Follow-up (2026-10-24): the profile field, its extractor seeds and every bundled value were
+      removed; the native spray uses `MM_STRUCT_SZ`. Host gates and the extractor test suite were
+      rerun on the rebased branch.
 - [ ] PR branch and release decision.

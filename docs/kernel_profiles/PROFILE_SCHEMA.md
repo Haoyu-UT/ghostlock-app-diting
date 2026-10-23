@@ -83,7 +83,7 @@ route {
   select_stack { waiter_shift = -2 }
 }
 fallback { to = "none" }
-kernelsnitch { collisions = 4, mm_struct_sz = 4096 }
+kernelsnitch { collisions = 4 }
 task_struct { prio = 132, cred = 2080, pi_lock = 2316 }
 cred { copy_size = 136, caps_offset = 48, caps_count = 5 }
 offset { init_task = 34464384, init_cred = 34538824 }
@@ -137,7 +137,7 @@ route { multicast_waiter { waiter_off = 96, buffer_size = 264 } }
 | `kernel_major` ∈ {5,6}, `cred.copy_size`, `cred.caps_count`, and the credential-template bounds | required | required | required |
 | `route.tcp_zerocopy.compact_waiter` / `route.multicast_waiter.compact_waiter` | required | | required |
 | `route.select_stack.waiter_shift` | | required (0 is valid) | |
-| `route.multicast_waiter.waiter_off` (>0), `route.multicast_waiter.buffer_size`, `route.multicast_waiter.task_offset`, `route.multicast_waiter.lock_offset`, `offset.empty_zero_page`, `kernelsnitch.mm_struct_sz`, `cred.ref_count` (>0) | | | required |
+| `route.multicast_waiter.waiter_off` (>0), `route.multicast_waiter.buffer_size`, `route.multicast_waiter.task_offset`, `route.multicast_waiter.lock_offset`, `offset.empty_zero_page`, `cred.ref_count` (>0) | | | required |
 
 Credential-template bounds (general): `cred.usage_offset + 4 ≤ cred.copy_size`;
 `cred.caps_offset + cred.caps_count × 8 ≤ cred.copy_size`; `cred.ref_count ≤ 4`;
@@ -250,7 +250,6 @@ affected by route choice:
 | Field | Meaning |
 |---|---|
 | `kernelsnitch.collisions` | Number of futex collisions needed |
-| `kernelsnitch.mm_struct_sz` | SLUB size of `mm_struct` (falls back to the built-in default when omitted) |
 
 ## 5. execution tuning (advisory)
 
@@ -398,15 +397,16 @@ exclusively (section 9); the v1 path is Kotlin-side and self-contained.
   | `symbols` object (`off_*` keys) | `offset.*` namespace |
   | `struct_fields` object (`task_*` keys) | `task_struct.*` namespace; a few fields (`rt_mutex_waiter`, `cred_uid`, `seccomp_*`, …) stay in place and take no part in validation/comparison |
   | top-level `pselect_waiter_shift` | `route.select_stack.waiter_shift` (as `fallback.route.select_stack.waiter_shift` for a tcp profile) |
-  | top-level `compact_waiter` / `mm_struct_sz` | `route.tcp_zerocopy.compact_waiter` / `kernelsnitch.mm_struct_sz` |
+  | top-level `compact_waiter` | `route.tcp_zerocopy.compact_waiter` |
+  | top-level `mm_struct_sz` | dropped (the leak is stride-agnostic) |
   | `kimage_text_base` / `btf_size` / `kallsyms` | dropped |
   | no `route` field | inferred from 6.x geometry: `compact_waiter` → tcp, otherwise select |
   | no cred template | seeds the bundled 6.x constants (`credential-6x.conf` / `kernelsnitch-6x.conf`); 5.x credential fields stay author-supplied |
 
-- Old flat keys (`kernelsnitch_collisions` / `mm_struct_sz` / `task_*` /
-  `cred_*` / `off_*` / `mcast_*`) are folded into the matching namespaces when
-  importing an old `offsets.json`, parsing extractor output, or reading advanced
-  overrides.
+- Old flat keys (`kernelsnitch_collisions` / `task_*` / `cred_*` / `off_*` /
+  `mcast_*`) are folded into the matching namespaces when importing an old
+  `offsets.json`, parsing extractor output, or reading advanced overrides;
+  the obsolete `mm_struct_sz` key is dropped.
 - The same route inference applies to an old config with no `route`:
   `kernel_major == 5 && mcast.waiter_off > 0` → `multicast_waiter`; otherwise
   `compact_waiter != 0` → `tcp_zerocopy`; otherwise `select_stack`. A v1

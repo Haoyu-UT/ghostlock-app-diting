@@ -1,7 +1,7 @@
 //! Embedded kernel config (IKCONFIG) and the measured-series predicate.
 //!
 //! The extractor's shared template (`task_struct`, `cred` layout, the 5.10
-//! waiter offsets, `mm_struct_sz`) is frozen data measured on the diting
+//! waiter offsets) is frozen data measured on the diting
 //! 5.10.236 build. Its scope is the series that produced the measurement, and
 //! the series is decided from the image's own embedded config: the union of
 //! every `CONFIG_*` guard inside `task_struct`, `cred`, `mm_struct` and

@@ -178,14 +178,15 @@ Unknown/省略，不会产出错误 profile。
   9 个锚点全部失效、`init_task` 数据锚点与 cred caps 仍闭合（6/15），模板补齐；
   `-Os+LTO_NONE+CFI off` 下模板因指纹不匹配（`CONFIG_CFI_CLANG`）而停用，输出只剩
   6 个字段、路由全部 Unknown——这是设计允许的安全降级，不是错误值。
-- **限制及其可缓解性（2026-10-24）**：`kernelsnitch.mm_struct_sz` 是 SLUB stride，不是
+- **限制及其可缓解性（2026-10-24，同日随后移除）**：`mm_struct_sz` 曾是 SLUB stride，不是
   `sizeof(mm_struct)`，无法仅从 Image 推导（BTF 给 sizeof；slab 合并/对齐会改变对象大小，
-  6.1 为 0x3c0 对 1024）。5.10 系列保留运行时验证的 960；出系列 5.x 保留 1024 种子，
-  现已在日志中标记为 heuristic。**设备实测（2026-10-24，microbenchmark，40 GiB 直接映射跨度，
-  6 线程）**：S=960 0.8 s，S=32 20 s，S=8 80 s；外层 4 KiB 与 32 KiB 同价；tag 扫描
-  （V=15）在 S=32 下 263 s；按 iomem RAM bank 过滤（~13 GiB）可再降约 3×。因此 leak 不
-  需要知道 stride——任意整除步长即可覆盖全部对象位置；family 常量可降级为 spray sizing
-  的软参数。两阶段 leak 的设计与完整实测见
+  6.1 为 0x3c0 对 1024）。**已在 `7f859eb` 把 leak 改为 stride-agnostic 扫描后，从 profile
+  契约中整体移除了该字段**：主路径 S=32、兜底 S=8、外层 4 KiB；spray sizing 使用 native 的
+  `MM_STRUCT_SZ` 默认值，提取器不再输出任何 stride 猜测。**设备实测（2026-10-24，
+  microbenchmark，40 GiB 直接映射跨度，6 线程）**：S=960 0.8 s，S=32 20 s，S=8 80 s；
+  外层 4 KiB 与 32 KiB 同价；tag 扫描（V=15）在 S=32 下 263 s；按 iomem RAM bank 过滤
+  （~13 GiB）可再降约 3×。设备门禁中 bank 过滤后实际 leak 为 0.9–4.0 s；错误的 profile
+  stride（1024）不再影响 leak 结果。设计与完整实测见
   [`kernelsnitch-stride-fallback-plan.md`](kernelsnitch-stride-fallback-plan.md)。
 - **可部署性由另一组不变量决定**，与提取器的布局判断无关：vermagic、7,252 个导出符号的
   CRC/class/namespace、`module_layout` CRC。测试镜像的 `meta.txt` 以

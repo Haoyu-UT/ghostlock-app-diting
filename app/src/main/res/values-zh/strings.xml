@@ -231,7 +231,6 @@
     <string name="field_mcast_lock_offset">多播锁偏移</string>
     <string name="field_mcast_task_offset">多播任务偏移</string>
     <string name="field_mcast_waiter_off">多播 waiter 偏移</string>
-    <string name="field_mm_struct_sz">mm_struct 大小</string>
     <string name="field_off_empty_zero_page">empty_zero_page 偏移</string>
     <string name="field_off_init_cred">init_cred 偏移</string>
     <string name="field_off_init_task">init_task 偏移</string>

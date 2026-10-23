@@ -208,7 +208,6 @@ internal class AndroidProfileConfigController(
                     invalid += "$routePrefix.compact_waiter"
                 }
                 requireNonZero(
-                    "kernelsnitch.mm_struct_sz",
                     "offset.empty_zero_page",
                     "cred.ref_count",
                 )
@@ -1009,7 +1008,7 @@ internal class AndroidProfileConfigController(
             "selinux_blob_sizes", "security_hook_heads", "slide_nfulnl_logger", "slide_loggers_0_1",
             "slide_boot_id",
         )
-        private val KernelsnitchFieldNames = listOf("collisions", "mm_struct_sz")
+        private val KernelsnitchFieldNames = listOf("collisions")
 
         /** Fields each route branch carries, used to seed a switched-to route. */
         private val RouteBranchFields = mapOf(
