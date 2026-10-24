@@ -8,6 +8,7 @@ import com.ghostlock.app.domain.model.OffsetImportResult
 import com.ghostlock.app.domain.model.ParseResult
 import com.ghostlock.app.domain.model.ProfileConfig
 import com.ghostlock.app.domain.model.RunLogEntry
+import com.ghostlock.app.domain.model.StrideProbe
 import com.ghostlock.app.domain.model.UserProfileFile
 
 interface GhostlockRepository {
@@ -55,6 +56,25 @@ interface GhostlockRepository {
         route: String? = null,
         onLog: (String) -> Unit = {},
     ): ParseResult
+
+    /**
+     * Run the unprivileged mm_struct leak probe for a generated profile and
+     * return its stride evidence table, or null when the probe cannot run.
+     * Only meaningful when [release] is the running kernel.
+     */
+    suspend fun probeStride(
+        release: String,
+        profileName: String,
+        pair: CpuPair,
+        onLog: (String) -> Unit = {},
+    ): StrideProbe?
+
+    /** Write (or clear, with null) kernelsnitch.mm_struct_sz in a stored profile. */
+    suspend fun applyStrideToProfile(
+        profileName: String,
+        release: String,
+        stride: Int?,
+    ): Boolean
 
     suspend fun readDocument(uri: String): String
 

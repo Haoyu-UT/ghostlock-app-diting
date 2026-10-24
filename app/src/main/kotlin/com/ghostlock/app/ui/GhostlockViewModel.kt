@@ -15,6 +15,7 @@ import com.ghostlock.app.domain.model.RunLogEntry
 import com.ghostlock.app.domain.model.ProfileFieldNode
 import com.ghostlock.app.domain.model.RouteVerdict
 import com.ghostlock.app.domain.model.ShizukuStatus
+import com.ghostlock.app.domain.model.StrideProbe
 import com.ghostlock.app.domain.repository.GhostlockRepository
 import com.ghostlock.app.domain.repository.ProfileConfigController
 import com.ghostlock.app.domain.usecase.FormatLogUseCase
@@ -56,7 +57,7 @@ enum class DocumentRequest { ImportOffsetsHocon, ImportOffsetsJson, BootImage, X
  * only ever added to that list for MediaTek devices */
 private enum class AttachOption { NONE, XBL, UEFI, XBL_UEFI, VENDOR_BOOT }
 
-private enum class ParseDialogStage { Mode, Attach, Route }
+private enum class ParseDialogStage { Mode, Attach, Route, Stride }
 
 class GhostlockViewModel(
     private val repository: GhostlockRepository,
@@ -91,6 +92,12 @@ class GhostlockViewModel(
     /** Inputs of the pass that reported Ambiguous, re-run with the picked route. */
     private var pendingRouteParse: PendingRouteParse? = null
     private var pendingRouteChoices: List<RouteVerdict> = emptyList()
+
+    /** The generated document and its stride evidence, held while the picker is up. */
+    private var pendingStrideParse: ParseResult.Parsed? = null
+    private var pendingStrideProbe: StrideProbe? = null
+    private var pendingStrideDocument: String? = null
+    private var pendingStrideRelease: String? = null
 
     /** The layer notice is decided once per process, from the first resolution. */
     private var layerNoticeChecked = false
@@ -1113,6 +1120,46 @@ class GhostlockViewModel(
                     }
                 }
             }
+
+            ParseDialogStage.Stride -> {
+                val parse = pendingStrideParse
+                val probe = pendingStrideProbe
+                val document = pendingStrideDocument ?: parse?.documentName
+                val release = pendingStrideRelease
+                pendingStrideParse = null
+                pendingStrideProbe = null
+                pendingStrideDocument = null
+                pendingStrideRelease = null
+                parseDialogStage = ParseDialogStage.Mode
+                if (probe != null && document != null && release != null) {
+                    val chosen = probe.candidates.getOrNull(index)
+                    if (chosen != null) {
+                        appendLog("stride chosen: ${chosen.value}")
+                        viewModelScope.launch(Dispatchers.IO) {
+                            val ok = runCatching {
+                                repository.applyStrideToProfile(document, release, chosen.value)
+                            }.getOrDefault(false)
+                            withContext(Dispatchers.Main) {
+                                appendLog(
+                                    if (ok) {
+                                        "stride: wrote kernelsnitch.mm_struct_sz = ${chosen.value}"
+                                    } else {
+                                        "stride: could not update the profile"
+                                    },
+                                )
+                                selectUserProfile(document)
+                                parse?.takeIf { it.missing.isNotEmpty() }
+                                    ?.let(::showMissingSidecarNotice)
+                            }
+                        }
+                    } else {
+                        appendLog("stride left unset (native default + stride-agnostic scan)")
+                        selectUserProfile(document)
+                        parse?.takeIf { it.missing.isNotEmpty() }
+                            ?.let(::showMissingSidecarNotice)
+                    }
+                }
+            }
         }
     }
 
@@ -1136,6 +1183,18 @@ class GhostlockViewModel(
             pendingRouteChoices = emptyList()
             parseDialogStage = ParseDialogStage.Mode
             appendLog("result: route choice cancelled")
+        }
+        if (parseDialogStage == ParseDialogStage.Stride) {
+            val parse = pendingStrideParse
+            val document = pendingStrideDocument ?: parse?.documentName
+            pendingStrideParse = null
+            pendingStrideProbe = null
+            pendingStrideDocument = null
+            pendingStrideRelease = null
+            parseDialogStage = ParseDialogStage.Mode
+            appendLog("stride left unset (native default + stride-agnostic scan)")
+            selectUserProfile(document)
+            parse?.takeIf { it.missing.isNotEmpty() }?.let(::showMissingSidecarNotice)
         }
         dismissDialog()
     }
@@ -1412,6 +1471,20 @@ class GhostlockViewModel(
         }
     }
 
+    /** The sidecar warning deferred while the stride picker was up. */
+    private fun showMissingSidecarNotice(result: ParseResult.Parsed) {
+        val mediaTek = isMediaTek()
+        showNotice(
+            titleRes = R.string.parse_result_title,
+            messageRes = if (mediaTek) {
+                R.string.parse_missing_phys_mediatek
+            } else {
+                R.string.parse_missing_phys_hint
+            },
+            docUrl = if (mediaTek) mediatekDocUrl() else null,
+        )
+    }
+
     private fun isMediaTek(): Boolean {
         val soc = kernelSnapshot?.socName?.lowercase(Locale.ROOT).orEmpty()
         return soc.contains("mediatek") || soc.contains("mtk") ||
@@ -1491,27 +1564,65 @@ class GhostlockViewModel(
                     }
                     appendLog("offsets exported: ${result.releases.joinToString()}")
                     appendLog("result: offsets parsed successfully")
-                    /* Auto-load the just-saved document so the parsed profile
-                     * takes effect without a manual trip to the profile list. */
-                    if (result.documentName != null) {
-                        appendLog("auto-loading parsed profile: ${result.documentName}")
-                        selectUserProfile(result.documentName)
+                    /* The live stride probe only makes sense for the running
+                     * kernel; a profile generated for another image skips it. */
+                    val runningRelease = kernelSnapshot?.kernelRelease
+                    val pair = kernelSnapshot?.let { snapshot ->
+                        snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair)
+                    }
+                    val documentName = result.documentName
+                    val strideProbe = if (documentName != null && runningRelease != null &&
+                        pair != null && runningRelease in result.releases
+                    ) {
+                        appendLog("stride: probing the mm_struct slab on the running kernel")
+                        runCatching {
+                            repository.probeStride(runningRelease, documentName, pair, ::appendLog)
+                        }.getOrNull()
+                    } else {
+                        null
+                    }
+                    val stridePickerShown =
+                        strideProbe != null && documentName != null && runningRelease != null
+                    if (strideProbe != null && documentName != null && runningRelease != null) {
+                        pendingStrideParse = result
+                        pendingStrideProbe = strideProbe
+                        pendingStrideDocument = documentName
+                        pendingStrideRelease = runningRelease
+                        parseDialogStage = ParseDialogStage.Stride
+                        val items = strideProbe.candidates.mapIndexed { index, candidate ->
+                            val best = if (index == 0 && strideProbe.decided) " — best supported" else ""
+                            "${candidate.value} — ${candidate.votes}/${candidate.samples} rounds · " +
+                                "${candidate.objectsPerSlab} objects/slab$best"
+                        } + "leave unset — native default 1280 + stride-agnostic scan"
+                        appendLog(
+                            "stride: ${strideProbe.candidates.size} candidate(s), " +
+                                "gcd=0x${strideProbe.gcd.toString(16)}, rounds=${strideProbe.rounds}",
+                        )
+                        mutableState.update {
+                            it.copy(
+                                dialogVisible = true,
+                                dialogType = DialogType.LIST,
+                                dialogTitleRes = R.string.parse_stride_title,
+                                dialogItems = items,
+                                dialogItemResIds = emptyList(),
+                                dialogCurrentItemIndex = -1,
+                                executionSheetVisible = false,
+                            )
+                        }
+                    } else if (documentName != null) {
+                        /* Auto-load the just-saved document so the parsed profile
+                         * takes effect without a manual trip to the profile list. */
+                        appendLog("auto-loading parsed profile: $documentName")
+                        selectUserProfile(documentName)
                     }
                     if (result.missing.isNotEmpty()) {
                         appendLog(
                             "warning: missing ${result.missing.joinToString()}; " +
                                     "run the MediaTek extractor or attach xbl_config.img / uefi.img",
                         )
-                        val mediaTek = isMediaTek()
-                        showNotice(
-                            titleRes = R.string.parse_result_title,
-                            messageRes = if (mediaTek) {
-                                R.string.parse_missing_phys_mediatek
-                            } else {
-                                R.string.parse_missing_phys_hint
-                            },
-                            docUrl = if (mediaTek) mediatekDocUrl() else null,
-                        )
+                        /* The notice would overwrite the stride picker; defer it
+                         * until the picker is resolved. */
+                        if (!stridePickerShown) showMissingSidecarNotice(result)
                     } else if (result.documentName == null) {
                         showNotice(R.string.parse_result_title, R.string.parse_success)
                     }

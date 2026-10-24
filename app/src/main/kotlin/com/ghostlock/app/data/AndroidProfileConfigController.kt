@@ -1008,7 +1008,7 @@ internal class AndroidProfileConfigController(
             "selinux_blob_sizes", "security_hook_heads", "slide_nfulnl_logger", "slide_loggers_0_1",
             "slide_boot_id",
         )
-        private val KernelsnitchFieldNames = listOf("collisions")
+        private val KernelsnitchFieldNames = listOf("collisions", "mm_struct_sz")
 
         /** Fields each route branch carries, used to seed a switched-to route. */
         private val RouteBranchFields = mapOf(

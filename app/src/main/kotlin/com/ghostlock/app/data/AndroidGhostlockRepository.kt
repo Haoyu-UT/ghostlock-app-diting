@@ -20,6 +20,8 @@ import com.ghostlock.app.domain.model.ParseResult
 import com.ghostlock.app.domain.model.ProfileConfig
 import com.ghostlock.app.domain.model.RunLogEntry
 import com.ghostlock.app.domain.model.RunLogState
+import com.ghostlock.app.domain.model.StrideCandidateOption
+import com.ghostlock.app.domain.model.StrideProbe
 import com.ghostlock.app.domain.model.UserProfileFile
 import com.ghostlock.app.domain.repository.GhostlockRepository
 import com.ghostlock.app.domain.repository.ProfileConfigController
@@ -47,6 +49,11 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         const val UserProfilesDirectoryName = "user_profiles"
         const val EditSessionPreferences = "ghostlock_edit_session"
         const val ExtractBinaryName = "libextract.so"
+        const val NativeBinaryName = "libghostlock.so"
+
+        /* The probe runs up to ten leak rounds plus the spray setup. */
+        const val ProbeTimeoutSeconds = 900L
+        val AnsiEscape = Regex("\u001B\\[[0-9;]*m")
         const val PrefForceAttackTest = "force_attack_test"
 
         /** Build identity the layer-disable notice was last shown for. */
@@ -486,6 +493,112 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             tempBootFile?.delete()
             tempXblFile?.delete()
         }
+    }
+
+    override suspend fun probeStride(
+        release: String,
+        profileName: String,
+        pair: CpuPair,
+        onLog: (String) -> Unit,
+    ): StrideProbe? {
+        /* Select the freshly generated document first so the frame below is
+         * the generated profile, not whatever layer was active before. */
+        val config = runCatching {
+            profileController.selectUserProfile(profileName, release, pair)
+        }.getOrNull() ?: return null
+        if (!config.hasProfile) return null
+        val blob = profileController.nativeDocument(config) ?: return null
+        val binary = File(appContext.applicationInfo.nativeLibraryDir, NativeBinaryName)
+        if (!binary.isFile) return null
+        val lines = mutableListOf<String>()
+        val exit = runProcess(
+            /* --enable-status-record selects the length-prefixed stdin frame
+             * (`read_glk1_frame_stdin`); without it the native reads the bare
+             * document and blocks on the app's length prefix. */
+            ProcessBuilder(
+                listOf(
+                    binary.absolutePath,
+                    "--ghostlock-app-call",
+                    "--enable-status-record",
+                    "--probe-stride",
+                ),
+            )
+                .directory(filesDir)
+                .redirectErrorStream(true)
+                .apply {
+                    environment()["GHOSTLOCK_HOME"] = filesDir.absolutePath
+                    environment()["TMPDIR"] = filesDir.absolutePath
+                    environment()["HOME"] = filesDir.absolutePath
+                },
+            onLog = { raw ->
+                val line = raw.replace(AnsiEscape, "")
+                lines += line
+                onLog(line)
+            },
+            timeoutSeconds = ProbeTimeoutSeconds,
+            /* captureOutput=true is what runs the reader that calls onLog; the
+             * run path uses false because it redirects stdout to a file and
+             * tails it instead. */
+            captureOutput = true,
+            stdin = blob,
+            frameStdin = true,
+        )
+        onLog("stride: probe exit=$exit captured=${lines.size}")
+        if (exit != 0) return null
+        val probe = parseStrideProbe(lines)
+        if (probe == null) onLog("stride: no candidate table")
+        return probe
+    }
+
+    override suspend fun applyStrideToProfile(
+        profileName: String,
+        release: String,
+        stride: Int?,
+    ): Boolean {
+        val text = userProfileStore.rawText(profileName) ?: return false
+        val entries = runCatching { userProfileStore.parseEntries(text) }.getOrNull() ?: return false
+        val targets = entries.filter { it["release"] == release }
+        if (targets.isEmpty()) return false
+        for (entry in targets) {
+            val snitch = entry.mutableChild("kernelsnitch")
+            if (stride != null) snitch["mm_struct_sz"] = stride else snitch.remove("mm_struct_sz")
+            if (snitch.isEmpty()) entry.remove("kernelsnitch")
+        }
+        val document = if (entries.size == 1) entries.first() else ValueList().apply { addAll(entries) }
+        return userProfileStore.overwrite(profileName, HoconSupport.render(document))
+    }
+
+    private fun parseStrideProbe(lines: List<String>): StrideProbe? {
+        val candidates = mutableListOf<StrideCandidateOption>()
+        var rounds = 0
+        var samples = 0
+        var gcd = 0L
+        var decided = false
+        val candidateLine = Regex(
+            """\[stride\] candidate value=(\d+) votes=(\d+)/(\d+) objects=(\d+)""",
+        )
+        val summaryLine = Regex(
+            """\[stride\] summary rounds=(\d+) samples=(\d+) gcd=0x([0-9a-fA-F]+) """ +
+                """candidates=\d+ decided=(\d+)""",
+        )
+        for (line in lines) {
+            candidateLine.find(line)?.let { match ->
+                candidates += StrideCandidateOption(
+                    value = match.groupValues[1].toInt(),
+                    votes = match.groupValues[2].toInt(),
+                    samples = match.groupValues[3].toInt(),
+                    objectsPerSlab = match.groupValues[4].toInt(),
+                )
+            }
+            summaryLine.find(line)?.let { match ->
+                rounds = match.groupValues[1].toInt()
+                samples = match.groupValues[2].toInt()
+                gcd = match.groupValues[3].toLong(16)
+                decided = match.groupValues[4] == "1"
+            }
+        }
+        if (candidates.isEmpty()) return null
+        return StrideProbe(candidates, rounds, samples, gcd, decided)
     }
 
     /** The extractor's first anchor decision line, or null when none ran. */

@@ -251,6 +251,30 @@ data class RouteVerdict(
     val numbers: Map<String, Long> = emptyMap(),
 )
 
+/** One candidate from the unprivileged mm_struct slab-stride probe. */
+data class StrideCandidateOption(
+    val value: Int,
+    /** Rounds whose leaked offset is divisible by this stride. */
+    val votes: Int,
+    /** Nonzero-offset rounds: the denominator shown next to [votes]. */
+    val samples: Int,
+    /** `ORDER3_SIZE / value`, the spray shaping this candidate implies. */
+    val objectsPerSlab: Int,
+)
+
+/**
+ * The probe's evidence table. Candidates arrive sorted by votes (descending),
+ * then value; no vote threshold has been applied — the user weighs the counts.
+ */
+data class StrideProbe(
+    val candidates: List<StrideCandidateOption>,
+    val rounds: Int,
+    val samples: Int,
+    val gcd: Long,
+    /** One candidate holds every nonzero vote. */
+    val decided: Boolean,
+)
+
 sealed interface ParseResult {
     /** Fields only an xbl_config/uefi sidecar can supply (e.g.
      * `kernel_phys_load`) that the parsed profile is still missing. */

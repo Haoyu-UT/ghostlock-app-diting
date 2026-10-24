@@ -5,7 +5,7 @@ package com.ghostlock.app.data
  *
  * That era only shipped 6.x kernels with no Shizuku path and no 5.x geometry:
  * the extractor report carries `kernel_phys_load`, `pselect_waiter_shift`,
- * `compact_waiter`, a `symbols` object keyed by `off_*`, a
+ * `compact_waiter`, `mm_struct_sz`, a `symbols` object keyed by `off_*`, a
  * `struct_fields` object keyed by `task_*`, plus `kimage_text_base`/`btf_size`
  * metadata. Credential templates came from the built-in profile, not the
  * report, so none are invented here. The conversion is idempotent and also
@@ -164,8 +164,7 @@ internal object LegacyProfileConverter {
         val structFields = entry["struct_fields"].asValueMap() ?: return
         val snitch = entry.mutableChild("kernelsnitch")
         moveKey(structFields, snitch, "kernelsnitch_collisions", "collisions")
-        /* The SLUB stride is no longer a profile value; drop the old key. */
-        structFields.remove("mm_struct_sz")
+        moveKey(structFields, snitch, "mm_struct_sz", "mm_struct_sz")
         if (snitch.isEmpty()) entry.remove("kernelsnitch")
         if (structFields.isEmpty()) entry.remove("struct_fields")
     }
@@ -223,8 +222,7 @@ internal object LegacyProfileConverter {
         if (!hasFlat) return
         val nested = entry.mutableChild("kernelsnitch")
         moveKey(entry, nested, "kernelsnitch_collisions", "collisions")
-        /* The SLUB stride is no longer a profile value; drop the old key. */
-        entry.remove("mm_struct_sz")
+        moveKey(entry, nested, "mm_struct_sz", "mm_struct_sz")
         if (nested.isEmpty()) entry.remove("kernelsnitch")
     }
 

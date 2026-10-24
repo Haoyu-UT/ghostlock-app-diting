@@ -64,9 +64,19 @@ namespace ghostlock::support {
 
     int32_t prepare_skb_payload(uintptr_t base, const ghostlock::memory::WriteRequest *request);
 
-    uintptr_t prepare_kernel_page(const ghostlock::memory::WriteRequest *request);
+    /* leak_only: run the spray and the mm_struct leak, then tear the spray
+     * down without preparing a payload page. Used by the profile-generation
+     * stride probe; the attack path always calls the default form. */
+    uintptr_t prepare_kernel_page(const ghostlock::memory::WriteRequest *request,
+                                  bool leak_only = false);
 
     uintptr_t prepare_good_kernel_page(const ghostlock::memory::WriteRequest &request);
+
+    /* Run up to max_rounds unprivileged leak rounds for the slab-stride
+     * verifier and print its evidence table ([stride] lines). Returns whether
+     * one candidate held every nonzero vote. The caller must have installed the
+     * profile and initialized the runtime configuration. */
+    bool probe_mm_stride(std::size_t sizeof_mm, std::size_t max_rounds);
 } // namespace ghostlock::support
 
 #endif

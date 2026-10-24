@@ -62,7 +62,7 @@ route {
   select_stack { waiter_shift = -2 }
 }
 fallback { to = "none" }
-kernelsnitch { collisions = 4 }
+kernelsnitch { collisions = 4, mm_struct_sz = 1024 }  # 跨度：仅测量后写入
 task_struct { prio = 132, cred = 2080, pi_lock = 2316 }
 cred { copy_size = 136, caps_offset = 48, caps_count = 5 }
 offset { init_task = 34464384, init_cred = 34538824 }
@@ -213,6 +213,7 @@ cred
 | 字段 | 含义 |
 |---|---|
 | `kernelsnitch.collisions` | 需要的 futex 碰撞数量 |
+| `kernelsnitch.mm_struct_sz` | `mm_struct` 的 SLUB 对象跨度；仅在测量后写入（生成时的选择器或 root 读取 `/proc/slabinfo`），绝不猜测；省略时使用编译默认值 `0x500`。它决定 spray 的每 slab 对象数（`ORDER3_SIZE / stride`），泄漏扫描本身仍与跨度无关。 |
 
 ## 5. execution 调优参数（advisory）
 
@@ -292,12 +293,12 @@ cred
   | `struct_fields` 对象（`task_*` 键） | `task_struct.*` 命名空间；`rt_mutex_waiter`/`cred_uid`/`seccomp_*` 等字段保留原处，不参与校验与比较 |
   | 顶层 `pselect_waiter_shift` | `route.select_stack.waiter_shift`；tcp 配置则保留为 `fallback.route.select_stack.waiter_shift` |
   | 顶层 `compact_waiter` | `route.tcp_zerocopy.compact_waiter` |
-  | 顶层 `mm_struct_sz` | 丢弃（泄漏扫描已与 stride 无关） |
+  | 顶层 `mm_struct_sz` | `kernelsnitch.mm_struct_sz` |
   | `kimage_text_base` / `btf_size` / `kallsyms` | 丢弃 |
   | 无 `route` 字段 | 按 6.x 几何推断：`compact_waiter` → tcp，否则 select |
   | 无 cred 模板 | 写入内置 6.x 常量（`credential-6x.conf` / `kernelsnitch-6x.conf`）；5.x 凭据字段仍由作者提供 |
 
-- 旧版扁平键（`kernelsnitch_collisions` / `task_*` / `cred_*` / `off_*` / `mcast_*`）在导入旧 `offsets.json`、解析 extractor 输出或读取高级覆盖时自动归入对应命名空间；已废弃的 `mm_struct_sz` 键直接丢弃。
+- 旧版扁平键（`kernelsnitch_collisions` / `mm_struct_sz` / `task_*` / `cred_*` / `off_*` / `mcast_*`）在导入旧 `offsets.json`、解析 extractor 输出或读取高级覆盖时自动归入对应命名空间。
 - 旧配置缺少 `route` 时同样按此推断：`kernel_major==5 且 mcast.waiter_off>0` → `multicast_waiter`；否则 `compact_waiter!=0` → `tcp_zerocopy`；否则 `select_stack`。v1 文档不可能选中 5.x 分支（`multicast_waiter` 仅作为受保护推断保留）。
 - 旧版 JSON 缓存**不迁移、启动即丢弃**；内部存储、快照与导出始终为 HOCON。
 - native 无 v1 解析器：native 侧 `legacy/` JSON 解码器已删除；v1 文档在传输前已由 Kotlin 侧转成 v2。
