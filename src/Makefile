@@ -199,7 +199,7 @@ $(HOST_BUILD_DIR)/run_state_test: core/tests/run_state_test.cpp core/support/run
 
 $(HOST_BUILD_DIR)/address_space_test: core/tests/address_space_test.cpp core/memory/address_space.cpp core/memory/address_space.h core/profile/model.h
 	@mkdir -p $(HOST_BUILD_DIR)
-	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore core/tests/address_space_test.cpp core/memory/address_space.cpp -o $@
+	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore -DTARGET_CONFIG_H=\"kernel/target.h\" core/tests/address_space_test.cpp core/memory/address_space.cpp -o $@
 
 $(HOST_BUILD_DIR)/route_status_test: core/tests/route_status_test.cpp core/route/route_status.h
 	@mkdir -p $(HOST_BUILD_DIR)
