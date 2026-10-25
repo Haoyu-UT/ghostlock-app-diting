@@ -86,6 +86,13 @@ An external selection that can no longer be read (file deleted, permission lost)
 not a silent fallback to the bundle: the run log and the profile screen say why. Clearing the
 selection restores the bundle.
 
+**Update 2026-10-26 — the home support flag follows the same model.**
+`isKernelSupported()` = bundled release ∪ legacy `user_profiles` import ∪ the stored external
+selection's release (`releaseSupportedByProfileSources`, covered by `ProfileLayerPolicyTest`).
+Before this, a device with no bundled profile could select an external document — it loaded —
+but the home stayed "Not supported" and `runExploit()` refused. Device test:
+`external/port/external-profile-support-2026-10-26/` in the port repository.
+
 App data keeps, and only keeps: the bundled assets; the measured DB; the run logs (with the
 per-run `profile.conf`/`profile.bin` and the source metadata); the selected profile's reference
 (URI, display name, release, SHA-256, parent lineage); ordinary settings.

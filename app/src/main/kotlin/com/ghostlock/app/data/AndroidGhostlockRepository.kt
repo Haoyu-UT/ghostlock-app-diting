@@ -1338,7 +1338,11 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
 
     private fun isKernelSupported(): Boolean {
         val version = System.getProperty("os.version", "").orEmpty()
-        return version in builtinProfiles.unames || importedOffsetsMatch(version)
+        return releaseSupportedByProfileSources(
+            version,
+            builtinProfiles.unames,
+            profileController.activeExternalProfile()?.release,
+        ) || importedOffsetsMatch(version)
     }
 
     private fun importedOffsetsMatch(version: String): Boolean =
@@ -1554,3 +1558,16 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     private val processes = mutableSetOf<Process>()
 
 }
+
+/**
+ * Whether the release is covered by a profile source the app can trust: a
+ * bundled asset naming it, or an SD-card document the user selected for it.
+ * The measured-db model keeps no copy in app data, so the selection reference
+ * is the only place to ask; an unreadable file surfaces in the resolution as
+ * an error, never a silent fallback.
+ */
+internal fun releaseSupportedByProfileSources(
+    release: String,
+    bundledReleases: Set<String>,
+    externalSelectionRelease: String?,
+): Boolean = release in bundledReleases || externalSelectionRelease == release
