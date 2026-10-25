@@ -106,6 +106,26 @@ class ProfileLayerPolicyTest {
     }
 
     @Test
+    fun `a selected external profile makes its own release supported`() = runBlocking {
+        val uri = external.add(
+            "content://profiles/foreign.conf",
+            document(foreignRelease, routeWaitMs = 4242),
+        )
+        assertNotNull(controller.selectExternalProfile(uri, foreignRelease, pair))
+
+        val selected = controller.activeExternalProfile()?.release
+        assertTrue(releaseSupportedByProfileSources(foreignRelease, emptySet(), selected))
+        assertTrue(
+            releaseSupportedByProfileSources(
+                foreignRelease,
+                setOf(bundledRelease),
+                selected,
+            ),
+        )
+        assertFalse(releaseSupportedByProfileSources(bundledRelease, emptySet(), selected))
+    }
+
+    @Test
     fun `an external selection for another release does not apply`() = runBlocking {
         val uri = external.add(
             "content://profiles/foreign.conf",
