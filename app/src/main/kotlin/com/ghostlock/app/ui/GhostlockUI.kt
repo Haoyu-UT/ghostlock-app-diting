@@ -24,15 +24,20 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.CheckCircleOutline
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.RemoveCircleOutline
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -88,6 +93,8 @@ import top.yukonga.miuix.kmp.overlay.OverlayBottomSheet
 import top.yukonga.miuix.kmp.overlay.OverlayDialog
 import top.yukonga.miuix.kmp.preference.ArrowPreference
 import top.yukonga.miuix.kmp.preference.OverlaySpinnerPreference
+import top.yukonga.miuix.kmp.preference.RadioButtonLocation
+import top.yukonga.miuix.kmp.preference.RadioButtonPreference
 import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.darkColorScheme
@@ -179,6 +186,8 @@ data class GhostlockUiState(
     val activeUserProfile: String? = null,
     /** Which layers the last resolution applied, and which it deliberately did not. */
     val profileLayers: ProfileLayers? = null,
+    /** The slab-stride choice sheet; non-null while a probe result awaits. */
+    val stridePicker: StridePickerUiState? = null,
     /** File name of the open user-profile detail screen, null when closed. */
     val userProfileDetail: String? = null,
     val userProfileRenameTarget: String? = null,
@@ -233,6 +242,10 @@ interface GhostlockActions {
     fun onDialogExportLog()
     fun onOverwriteConfirm()
     fun onOverwriteDismiss()
+    fun onStrideOptionSelected(value: Int)
+    fun onStrideUse()
+    fun onStrideSkip()
+    fun onStridePickerDismiss()
     fun onExecutionFieldChanged(path: String, value: String)
     fun onRouteChanged(index: Int)
     fun onFallbackChanged(index: Int)
@@ -407,6 +420,7 @@ internal fun GhostlockApp(
                 GhostlockDialog(state = state, actions = actions)
                 GhostlockOverwriteDialog(state = state, actions = actions)
                 RunLogPickerDialog(state = state, actions = actions)
+                StridePickerDialog(state = state, actions = actions)
                 GhostlockExecutionSheet(state = state, actions = actions)
             }
         }
@@ -687,9 +701,201 @@ private fun RunLogPickerDialog(
     )
 }
 
+/**
+ * The slab-stride decision sheet: one recommendation with an evidence level in
+ * plain language, the alternatives as radio rows, and the raw table behind a
+ * "technical details" toggle. Dismissing it is the same as Skip.
+ */
+@Composable
+private fun StridePickerDialog(
+    state: GhostlockUiState,
+    actions: GhostlockActions,
+) {
+    val picker = state.stridePicker ?: return
+    val recommendation = picker.recommendation
+    var detailsExpanded by remember { mutableStateOf(false) }
+    OverlayDialog(
+        show = true,
+        title = stringResource(R.string.stride_title),
+        summary = stringResource(R.string.stride_subtitle, recommendation.samples),
+        onDismissRequest = actions::onStridePickerDismiss,
+        content = {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = recommendation.recommendedValue
+                                    ?.let { stringResource(R.string.stride_bytes, it) }
+                                    ?: stringResource(R.string.stride_none),
+                                modifier = Modifier.weight(1f),
+                                fontSize = 22.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = MiuixTheme.colorScheme.onSurface,
+                            )
+                            Text(
+                                text = stringResource(strideLevelRes(recommendation.level)),
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = if (recommendation.level == StrideEvidenceLevel.CONFIRMED ||
+                                    recommendation.level == StrideEvidenceLevel.CONSISTENT
+                                ) {
+                                    MiuixTheme.colorScheme.primary
+                                } else {
+                                    MiuixTheme.colorScheme.onSurfaceVariantSummary
+                                },
+                            )
+                        }
+                        Text(
+                            text = strideReasonText(recommendation.reason),
+                            style = MiuixTheme.textStyles.body2,
+                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        )
+                        recommendation.confirmedValue?.let { confirmed ->
+                            Text(
+                                text = stringResource(R.string.stride_confirmed_line, confirmed),
+                                style = MiuixTheme.textStyles.body2,
+                                color = MiuixTheme.colorScheme.primary,
+                            )
+                        }
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 280.dp)
+                        .verticalScroll(rememberScrollState()),
+                ) {
+                    recommendation.options.forEach { option ->
+                        RadioButtonPreference(
+                            title = stringResource(
+                                R.string.stride_option,
+                                option.value,
+                                option.matches,
+                                option.samples,
+                            ),
+                            selected = picker.selectedValue == option.value,
+                            onClick = { actions.onStrideOptionSelected(option.value) },
+                            radioButtonLocation = RadioButtonLocation.End,
+                        )
+                    }
+                }
+                TextButton(
+                    text = if (detailsExpanded) {
+                        "▾ " + stringResource(R.string.stride_details)
+                    } else {
+                        "▸ " + stringResource(R.string.stride_details)
+                    },
+                    onClick = { detailsExpanded = !detailsExpanded },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                if (detailsExpanded) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Text(
+                            text = stringResource(
+                                R.string.stride_details_measurements,
+                                recommendation.samples,
+                                recommendation.rounds,
+                            ),
+                            style = MiuixTheme.textStyles.body2,
+                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        )
+                        Text(
+                            text = stringResource(
+                                R.string.stride_details_gcd,
+                                recommendation.gcd.toString(16),
+                            ),
+                            style = MiuixTheme.textStyles.body2,
+                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        )
+                        recommendation.options.forEach { option ->
+                            Text(
+                                text = stringResource(
+                                    R.string.stride_details_candidate,
+                                    option.value,
+                                    option.matches,
+                                    option.samples,
+                                    option.objectsPerSlab,
+                                ),
+                                style = MiuixTheme.textStyles.body2,
+                                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            )
+                        }
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    TextButton(
+                        text = picker.selectedValue
+                            ?.let { stringResource(R.string.stride_use, it) }
+                            ?: stringResource(R.string.stride_use_none),
+                        enabled = picker.selectedValue != null,
+                        onClick = actions::onStrideUse,
+                        colors = ButtonDefaults.textButtonColorsPrimary(),
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(
+                        text = stringResource(R.string.stride_skip),
+                        onClick = actions::onStrideSkip,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                Text(
+                    text = stringResource(picker.footerRes),
+                    style = MiuixTheme.textStyles.body2,
+                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+            }
+        },
+    )
+}
+
+private fun strideLevelRes(level: StrideEvidenceLevel): Int = when (level) {
+    StrideEvidenceLevel.CONFIRMED -> R.string.stride_level_confirmed
+    StrideEvidenceLevel.CONSISTENT -> R.string.stride_level_consistent
+    StrideEvidenceLevel.MIXED -> R.string.stride_level_mixed
+    StrideEvidenceLevel.INSUFFICIENT -> R.string.stride_level_insufficient
+}
+
+@Composable
+private fun strideReasonText(reason: StrideReason): String = when (reason) {
+    is StrideReason.ConfirmedAgree -> stringResource(
+        R.string.stride_reason_confirmed_agree,
+        reason.samples,
+    )
+
+    is StrideReason.ConfirmedOnly -> stringResource(R.string.stride_reason_confirmed)
+    is StrideReason.Agree -> stringResource(R.string.stride_reason_agree, reason.samples)
+    is StrideReason.Partial -> stringResource(
+        R.string.stride_reason_partial,
+        reason.matches,
+        reason.samples,
+        reason.runnerUp,
+    )
+
+    StrideReason.Tie -> stringResource(R.string.stride_reason_tie)
+    is StrideReason.Single -> stringResource(
+        if (reason.samples > 0) R.string.stride_reason_single else R.string.stride_reason_none,
+    )
+}
+
 /** `20261009-212803 · Shizuku · interrupted · 42 KB` */
-private fun runLogLabel(context: Context, run: RunLogEntry): String {
-    val state = context.getString(
+private fun runLogLabel(context: Context, run: RunLogEntry): String {    val state = context.getString(
         when (run.state) {
             RunLogState.RUNNING -> R.string.run_log_state_running
             RunLogState.COMPLETED -> R.string.run_log_state_completed

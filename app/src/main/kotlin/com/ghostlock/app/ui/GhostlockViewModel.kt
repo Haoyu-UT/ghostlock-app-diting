@@ -57,7 +57,7 @@ enum class DocumentRequest { ImportOffsetsHocon, ImportOffsetsJson, BootImage, X
  * only ever added to that list for MediaTek devices */
 private enum class AttachOption { NONE, XBL, UEFI, XBL_UEFI, VENDOR_BOOT }
 
-private enum class ParseDialogStage { Mode, Attach, Route, Stride }
+private enum class ParseDialogStage { Mode, Attach, Route }
 
 class GhostlockViewModel(
     private val repository: GhostlockRepository,
@@ -1120,46 +1120,6 @@ class GhostlockViewModel(
                     }
                 }
             }
-
-            ParseDialogStage.Stride -> {
-                val parse = pendingStrideParse
-                val probe = pendingStrideProbe
-                val document = pendingStrideDocument ?: parse?.documentName
-                val release = pendingStrideRelease
-                pendingStrideParse = null
-                pendingStrideProbe = null
-                pendingStrideDocument = null
-                pendingStrideRelease = null
-                parseDialogStage = ParseDialogStage.Mode
-                if (probe != null && document != null && release != null) {
-                    val chosen = probe.candidates.getOrNull(index)
-                    if (chosen != null) {
-                        appendLog("stride chosen: ${chosen.value}")
-                        viewModelScope.launch(Dispatchers.IO) {
-                            val ok = runCatching {
-                                repository.applyStrideToProfile(document, release, chosen.value)
-                            }.getOrDefault(false)
-                            withContext(Dispatchers.Main) {
-                                appendLog(
-                                    if (ok) {
-                                        "stride: wrote kernelsnitch.mm_struct_sz = ${chosen.value}"
-                                    } else {
-                                        "stride: could not update the profile"
-                                    },
-                                )
-                                selectUserProfile(document)
-                                parse?.takeIf { it.missing.isNotEmpty() }
-                                    ?.let(::showMissingSidecarNotice)
-                            }
-                        }
-                    } else {
-                        appendLog("stride left unset (native default + stride-agnostic scan)")
-                        selectUserProfile(document)
-                        parse?.takeIf { it.missing.isNotEmpty() }
-                            ?.let(::showMissingSidecarNotice)
-                    }
-                }
-            }
         }
     }
 
@@ -1184,19 +1144,62 @@ class GhostlockViewModel(
             parseDialogStage = ParseDialogStage.Mode
             appendLog("result: route choice cancelled")
         }
-        if (parseDialogStage == ParseDialogStage.Stride) {
-            val parse = pendingStrideParse
-            val document = pendingStrideDocument ?: parse?.documentName
-            pendingStrideParse = null
-            pendingStrideProbe = null
-            pendingStrideDocument = null
-            pendingStrideRelease = null
-            parseDialogStage = ParseDialogStage.Mode
+        dismissDialog()
+    }
+
+    /* ---- the slab-stride decision sheet ---- */
+
+    fun onStrideOptionSelected(value: Int) {
+        mutableState.update { state ->
+            val picker = state.stridePicker ?: return@update state
+            state.copy(stridePicker = picker.copy(selectedValue = value))
+        }
+    }
+
+    /** Applies the selected stride to the generated document, then loads it. */
+    fun onStrideUse() {
+        val value = state.value.stridePicker?.selectedValue ?: return
+        finishStride(value)
+    }
+
+    fun onStrideSkip() = finishStride(null)
+
+    /** Dismissing the sheet means the same as Skip, with the same log line. */
+    fun onStridePickerDismiss() = finishStride(null)
+
+    private fun finishStride(value: Int?) {
+        val parse = pendingStrideParse
+        val document = pendingStrideDocument
+        val release = pendingStrideRelease
+        pendingStrideParse = null
+        pendingStrideProbe = null
+        pendingStrideDocument = null
+        pendingStrideRelease = null
+        mutableState.update { it.copy(stridePicker = null) }
+        if (document == null || release == null) return
+        if (value == null) {
             appendLog("stride left unset (native default + stride-agnostic scan)")
             selectUserProfile(document)
             parse?.takeIf { it.missing.isNotEmpty() }?.let(::showMissingSidecarNotice)
+            return
         }
-        dismissDialog()
+        appendLog("stride chosen: $value")
+        viewModelScope.launch(Dispatchers.IO) {
+            val ok = runCatching {
+                repository.applyStrideToProfile(document, release, value)
+            }.getOrDefault(false)
+            withContext(Dispatchers.Main) {
+                appendLog(
+                    if (ok) {
+                        "stride: wrote kernelsnitch.mm_struct_sz = $value"
+                    } else {
+                        "stride: could not update the profile"
+                    },
+                )
+                selectUserProfile(document)
+                parse?.takeIf { it.missing.isNotEmpty() }?.let(::showMissingSidecarNotice)
+            }
+        }
     }
 
     /** "Export log & report" from the failed-run notice: dismiss, then the picker. */
@@ -1588,24 +1591,19 @@ class GhostlockViewModel(
                         pendingStrideProbe = strideProbe
                         pendingStrideDocument = documentName
                         pendingStrideRelease = runningRelease
-                        parseDialogStage = ParseDialogStage.Stride
-                        val items = strideProbe.candidates.mapIndexed { index, candidate ->
-                            val best = if (index == 0 && strideProbe.decided) " — best supported" else ""
-                            "${candidate.value} — ${candidate.votes}/${candidate.samples} rounds · " +
-                                "${candidate.objectsPerSlab} objects/slab$best"
-                        } + "leave unset — native default 1280 + stride-agnostic scan"
+                        val recommendation = recommendStride(strideProbe)
                         appendLog(
                             "stride: ${strideProbe.candidates.size} candidate(s), " +
-                                "gcd=0x${strideProbe.gcd.toString(16)}, rounds=${strideProbe.rounds}",
+                                "gcd=0x${strideProbe.gcd.toString(16)}, " +
+                                "rounds=${strideProbe.rounds}, samples=${strideProbe.samples}",
                         )
                         mutableState.update {
                             it.copy(
-                                dialogVisible = true,
-                                dialogType = DialogType.LIST,
-                                dialogTitleRes = R.string.parse_stride_title,
-                                dialogItems = items,
-                                dialogItemResIds = emptyList(),
-                                dialogCurrentItemIndex = -1,
+                                stridePicker = StridePickerUiState(
+                                    recommendation = recommendation,
+                                    selectedValue = recommendation.recommendedValue,
+                                    footerRes = R.string.stride_footer_saved,
+                                ),
                                 executionSheetVisible = false,
                             )
                         }
