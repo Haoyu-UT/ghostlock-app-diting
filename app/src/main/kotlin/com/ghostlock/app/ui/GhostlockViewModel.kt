@@ -21,6 +21,7 @@ import com.ghostlock.app.domain.model.ProfileFieldNode
 import com.ghostlock.app.domain.model.RouteVerdict
 import com.ghostlock.app.domain.model.ShizukuStatus
 import com.ghostlock.app.domain.model.StrideProbe
+import com.ghostlock.app.domain.model.VrKoMode
 import com.ghostlock.app.domain.repository.GhostlockRepository
 import com.ghostlock.app.domain.repository.ProfileConfigController
 import com.ghostlock.app.domain.usecase.FormatLogUseCase
@@ -314,6 +315,7 @@ class GhostlockViewModel(
         mutableState.update {
             it.copy(
                 advancedScreenVisible = true,
+                vrKoVisible = false,
                 aboutVisible = false,
                 measurementsVisible = false,
                 parametersVisible = false,
@@ -338,6 +340,7 @@ class GhostlockViewModel(
         mutableState.update {
             it.copy(
                 advancedScreenVisible = false,
+                vrKoVisible = false,
                 aboutVisible = false,
                 measurementsVisible = false,
                 parametersVisible = false,
@@ -347,6 +350,27 @@ class GhostlockViewModel(
                 advancedOverrideVisible = false,
             )
         }
+    }
+
+    /** Opens the vr.ko anti-root countermeasure options screen from the home entry. */
+    fun onOpenVrKo() {
+        mutableState.update {
+            it.copy(
+                vrKoVisible = true,
+                advancedScreenVisible = false,
+                aboutVisible = false,
+                measurementsVisible = false,
+                parametersVisible = false,
+                loadConfigVisible = false,
+                builtinScreenVisible = false,
+                profileOverrideVisible = false,
+                advancedOverrideVisible = false,
+            )
+        }
+    }
+
+    fun onCloseVrKo() {
+        mutableState.update { it.copy(vrKoVisible = false) }
     }
 
     /** Opens the read-only measured-facts screen and refreshes its store. */
@@ -956,6 +980,16 @@ class GhostlockViewModel(
         mutableState.update { it.copy(forceAttackTestEnabled = enabled) }
     }
 
+    fun setVrKoTagClear(mode: VrKoMode) {
+        repository.setVrKoTagClear(mode)
+        mutableState.update { it.copy(vrKoTagClear = mode) }
+    }
+
+    fun setVrKoSelinuxBlock(mode: VrKoMode) {
+        repository.setVrKoSelinuxBlock(mode)
+        mutableState.update { it.copy(vrKoSelinuxBlock = mode) }
+    }
+
     fun toggleShizuku(enabled: Boolean) {
         repository.setShizukuEnabled(enabled)
         mutableState.update { it.copy(shizukuEnabled = enabled) }
@@ -1288,6 +1322,8 @@ class GhostlockViewModel(
                 cpuPairIndex = snapshot.selectedCpuPair,
                 safeModeEnabled = snapshot.safeModeEnabled,
                 forceAttackTestEnabled = snapshot.forceAttackTest,
+                vrKoTagClear = snapshot.vrKoTagClear,
+                vrKoSelinuxBlock = snapshot.vrKoSelinuxBlock,
                 shizukuEnabled = snapshot.shizukuEnabled,
                 shizukuStatus = snapshot.shizukuStatus,
                 profileInvalidPaths = loaded?.invalidPaths ?: emptySet(),

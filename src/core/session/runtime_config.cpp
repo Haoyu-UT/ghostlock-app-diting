@@ -80,6 +80,19 @@ static void runtime_config_init_paths(config::RuntimeConfig *config) {
     const char *anchor_trusted = getenv("GHOSTLOCK_ANCHOR_TRUSTED");
     config->anchor_trusted = anchor_trusted && anchor_trusted[0] &&
                              anchor_trusted[0] != '0';
+
+    const char *run_dir = getenv("GHOSTLOCK_RUN_DIR");
+    config->run_dir = (run_dir && run_dir[0]) ? std::string(run_dir) : std::string();
+
+    const char *tag_clear = getenv("GHOSTLOCK_VRKO_TAG_CLEAR");
+    if (tag_clear && tag_clear[0]) {
+        config->vrko_tag_clear = ghostlock::config::parse_vr_ko_mode(tag_clear);
+    }
+
+    const char *selinux_block = getenv("GHOSTLOCK_VRKO_SELINUX_BLOCK");
+    if (selinux_block && selinux_block[0]) {
+        config->vrko_selinux_block = ghostlock::config::parse_vr_ko_mode(selinux_block);
+    }
 }
 
 /* Capture all process environment and CPU/path choices exactly once. Input:
@@ -91,7 +104,10 @@ int32_t ghostlock::config::RuntimeConfig::init() {
     root_script_path.clear();
     ksu_log_path.clear();
     debug_dir.clear();
+    run_dir.clear();
     anchor_trusted = false;
+    vrko_tag_clear = VrKoMode::Auto;
+    vrko_selinux_block = VrKoMode::Auto;
 
     runtime_config_init_cpus(this);
     runtime_config_init_paths(this);
@@ -104,4 +120,7 @@ void ghostlock::config::RuntimeConfig::log() const {
     pr_info("cpu pair: main=%d consumer=%d\n", main_cpu, consumer_cpu);
     pr_info("runtime home=%s script=%s\n", home_dir.c_str(),
             root_script_path.c_str());
+    pr_info("vr.ko choices: tag_clear=%s selinux_block=%s\n",
+            vr_ko_mode_name(vrko_tag_clear),
+            vr_ko_mode_name(vrko_selinux_block));
 }

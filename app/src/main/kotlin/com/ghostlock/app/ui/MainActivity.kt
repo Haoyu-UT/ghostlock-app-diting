@@ -22,6 +22,7 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.ghostlock.app.GhostlockApplication
 import com.ghostlock.app.R
+import com.ghostlock.app.domain.model.VrKoMode
 
 class MainActivity : ComponentActivity() {
     private val viewModel by viewModels<GhostlockViewModel> {
@@ -157,6 +158,12 @@ private fun GhostlockRoute(
             override fun onForceAttackTestChanged(enabled: Boolean) =
                 viewModel.toggleForceAttackTest(enabled)
 
+            override fun onVrKoTagClearChanged(mode: VrKoMode) =
+                viewModel.setVrKoTagClear(mode)
+
+            override fun onVrKoSelinuxBlockChanged(mode: VrKoMode) =
+                viewModel.setVrKoSelinuxBlock(mode)
+
             override fun onShizukuChanged(enabled: Boolean) = viewModel.toggleShizuku(enabled)
             override fun onDialogItemSelected(index: Int) = viewModel.onDialogItemSelected(index)
             override fun onDialogInputChange(value: String) = viewModel.onDialogInputChange(value)
@@ -177,6 +184,8 @@ private fun GhostlockRoute(
             override fun onRevertProfileEdits() = viewModel.onRevertProfileEdits()
             override fun onOpenAdvanced() = viewModel.onOpenAdvanced()
             override fun onCloseAdvanced() = viewModel.onCloseAdvanced()
+            override fun onOpenVrKo() = viewModel.onOpenVrKo()
+            override fun onCloseVrKo() = viewModel.onCloseVrKo()
             override fun onOpenMeasurements() = viewModel.onOpenMeasurements()
             override fun onCloseMeasurements() = viewModel.onCloseMeasurements()
             override fun onShowAbout() = viewModel.onShowAbout()
