@@ -122,7 +122,7 @@ NATIVE_HOST_TESTS := \
   tcp_zerocopy_route_test select_stack_route_test sigreturn_route_test \
   target_constants_test native_resource_test \
   profile_binary_test futex_hash_test scan_grid_test stride_verify_test \
-  number_parse_test runtime_paths_test handoff_probe_test victim_context_test \
+  number_parse_test runtime_paths_test runtime_config_test handoff_probe_test victim_context_test \
   run_state_test address_space_test cpp_link_probe_test
 
 native-host-tests: $(addprefix $(HOST_BUILD_DIR)/,$(NATIVE_HOST_TESTS))
@@ -206,6 +206,10 @@ $(HOST_BUILD_DIR)/route_status_test: core/tests/route_status_test.cpp core/route
 	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore $< -o $@
 
 $(HOST_BUILD_DIR)/runtime_time_test: core/tests/runtime_time_test.cpp core/support/time.h
+	@mkdir -p $(HOST_BUILD_DIR)
+	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore $< -o $@
+
+$(HOST_BUILD_DIR)/runtime_config_test: core/tests/runtime_config_test.cpp core/session/runtime_config.h
 	@mkdir -p $(HOST_BUILD_DIR)
 	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore $< -o $@
 

@@ -68,6 +68,7 @@ import com.ghostlock.app.domain.model.RunLogEntry
 import com.ghostlock.app.domain.model.RunLogState
 import com.ghostlock.app.domain.model.ShizukuStatus
 import com.ghostlock.app.domain.model.UserProfileFile
+import com.ghostlock.app.domain.model.VrKoMode
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.CardDefaults
@@ -121,6 +122,8 @@ data class GhostlockUiState(
     val customCpuPair: CpuPair? = null,
     val safeModeEnabled: Boolean = false,
     val forceAttackTestEnabled: Boolean = false,
+    val vrKoTagClear: VrKoMode = VrKoMode.AUTO,
+    val vrKoSelinuxBlock: VrKoMode = VrKoMode.AUTO,
     val tcpRouteEnabled: Boolean = true,
     val compact: Boolean = false,
     val executionSheetVisible: Boolean = false,
@@ -160,6 +163,8 @@ data class GhostlockUiState(
     val executionFields: List<ExecutionFieldValue> = emptyList(),
     val executionEditing: Map<String, String> = emptyMap(),
     val advancedScreenVisible: Boolean = false,
+    /** The vr.ko anti-root countermeasure options screen. */
+    val vrKoVisible: Boolean = false,
     /** Read-only measurements screen state. */
     val measurementsVisible: Boolean = false,
     val measuredKernels: List<MeasuredKernelInfo> = emptyList(),
@@ -250,6 +255,8 @@ interface GhostlockActions {
     fun onCpuPairSelected(index: Int)
     fun onSafeModeChanged(enabled: Boolean)
     fun onForceAttackTestChanged(enabled: Boolean)
+    fun onVrKoTagClearChanged(mode: VrKoMode)
+    fun onVrKoSelinuxBlockChanged(mode: VrKoMode)
     fun onShizukuChanged(enabled: Boolean)
     fun onDialogItemSelected(index: Int)
     fun onDialogInputChange(value: String)
@@ -273,6 +280,8 @@ interface GhostlockActions {
     fun onRevertProfileEdits()
     fun onOpenAdvanced()
     fun onCloseAdvanced()
+    fun onOpenVrKo()
+    fun onCloseVrKo()
     fun onOpenMeasurements()
     fun onCloseMeasurements()
     fun onShowAbout()
@@ -306,6 +315,7 @@ interface GhostlockActions {
 
 internal sealed interface GhostlockScreen : NavKey {
     data object Main : GhostlockScreen
+    data object VrKo : GhostlockScreen
     data object Advanced : GhostlockScreen
     data object About : GhostlockScreen
     data object Measurements : GhostlockScreen
@@ -327,6 +337,10 @@ internal fun navigationPath(state: GhostlockUiState): List<GhostlockScreen> {
     }
     if (state.mergePreviewVisible) {
         path += GhostlockScreen.MergePreview
+        return path
+    }
+    if (state.vrKoVisible) {
+        path += GhostlockScreen.VrKo
         return path
     }
     if (!state.advancedScreenVisible) return path
@@ -367,6 +381,7 @@ internal fun syncNavigationPath(backStack: NavBackStack, desired: List<Ghostlock
 private fun closeScreen(screen: GhostlockScreen, actions: GhostlockActions) {
     when (screen) {
         GhostlockScreen.Main -> Unit
+        GhostlockScreen.VrKo -> actions.onCloseVrKo()
         GhostlockScreen.Advanced -> actions.onCloseAdvanced()
         GhostlockScreen.About -> actions.onCloseAbout()
         GhostlockScreen.Measurements -> actions.onCloseMeasurements()
@@ -425,6 +440,9 @@ internal fun GhostlockApp(
                 ) {
                     entry<GhostlockScreen.Main>(swipeDismiss = NavSwipeDirection.None) {
                         MainScreen(state = state, actions = actions)
+                    }
+                    entry<GhostlockScreen.VrKo>(swipeDismiss = swipeBack) {
+                        VrKoScreen(state = state, actions = actions)
                     }
                     entry<GhostlockScreen.Advanced>(swipeDismiss = swipeBack) {
                         AdvancedScreen(state = state, actions = actions)
@@ -1121,6 +1139,13 @@ private fun ControlPanel(
                         else -> R.string.shizuku_status_checking
                     },
                 ),
+            )
+            val tagMode = stringResource(vrKoModeLabelRes(state.vrKoTagClear))
+            val selinuxMode = stringResource(vrKoModeLabelRes(state.vrKoSelinuxBlock))
+            ArrowPreference(
+                title = stringResource(R.string.vr_ko_entry_label),
+                summary = stringResource(R.string.vr_ko_entry_summary, tagMode, selinuxMode),
+                onClick = actions::onOpenVrKo,
             )
         }
         Card(modifier = modifier.padding(top = 12.dp)) {

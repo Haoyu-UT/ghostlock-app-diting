@@ -29,6 +29,7 @@ import com.ghostlock.app.domain.model.RunLogState
 import com.ghostlock.app.domain.model.StrideCandidateOption
 import com.ghostlock.app.domain.model.StrideProbe
 import com.ghostlock.app.domain.model.UserProfileFile
+import com.ghostlock.app.domain.model.VrKoMode
 import com.ghostlock.app.domain.repository.GhostlockRepository
 import com.ghostlock.app.domain.repository.ProfileConfigController
 import com.ghostlock.app.shizuku.ShizukuExploitRunner
@@ -65,6 +66,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         const val ProbeTimeoutSeconds = 900L
         val AnsiEscape = Regex("\u001B\\[[0-9;]*m")
         const val PrefForceAttackTest = "force_attack_test"
+        /** Tri-state vr.ko choices, stored as auto/on/off (legacy booleans are migrated). */
+        const val PrefVrKoTagClear = "vr_ko_tag_clear"
+        const val PrefVrKoSelinuxBlock = "vrko_selinux_block"
 
         /** Build identity the layer-disable notice was last shown for. */
         const val PrefLayerNoticeAck = "profile_layer_notice_ack"
@@ -114,6 +118,8 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     private var selectedCpuPair = 0
     private var safeModeEnabled = false
     private var forceAttackTest = false
+    private var vrKoTagClear = VrKoMode.AUTO
+    private var vrKoSelinuxBlock = VrKoMode.AUTO
     private var shizukuEnabled = false
     /** True once the user flipped the toggle; only then does it override the
      * profile suggestion (PROFILE-SUGGEST-01). */
@@ -125,6 +131,8 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         restoreCpuPair()
         restoreShizukuPreference()
         restoreForceAttackTest()
+        restoreVrKoTagClear()
+        restoreVrKoSelinuxBlock()
         dropLegacyOffsetsCache()
         migrateLegacyOffsetsStore()
     }
@@ -194,6 +202,8 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             selectedCpuPair = selectedCpuPair,
             safeModeEnabled = safeModeEnabled,
             forceAttackTest = forceAttackTest,
+            vrKoTagClear = vrKoTagClear,
+            vrKoSelinuxBlock = vrKoSelinuxBlock,
             recommendShizuku = recommendShizuku,
             shizukuEnabled = shizukuActive,
             shizukuStatus = if (shizukuActive) shizukuRunner.status()
@@ -216,6 +226,16 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     override fun setForceAttackTest(enabled: Boolean) {
         forceAttackTest = enabled
         preferences.edit { putBoolean(PrefForceAttackTest, enabled) }
+    }
+
+    override fun setVrKoTagClear(mode: VrKoMode) {
+        vrKoTagClear = mode
+        preferences.edit { putString(PrefVrKoTagClear, mode.wire) }
+    }
+
+    override fun setVrKoSelinuxBlock(mode: VrKoMode) {
+        vrKoSelinuxBlock = mode
+        preferences.edit { putString(PrefVrKoSelinuxBlock, mode.wire) }
     }
 
     override fun layerNoticeAcknowledged(): String? =
@@ -368,7 +388,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
              * run store and are exportable from the log screen. Exit 7 is a
              * completed pass (the choice moves to the user), not a failure. */
             val code = withDebugAttackLog("parse", onLog, completedCodes = setOf(0, 7)) {
-                    archivedLog, _, writeSidecar ->
+                    archivedLog, _, _, writeSidecar ->
                 val tee: (String) -> Unit = { line ->
                     captured += line
                     archivedLog(line)
@@ -628,12 +648,15 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     }.getOrNull()
 
     override suspend fun runExploit(pair: CpuPair, onLog: (String) -> Unit): Int =
-        withDebugAttackLog("direct", onLog, measure = true) { archivedLog, debugDir, writeSidecar ->
-            runExploitBinary(pair, "libghostlock.so", archivedLog, debugDir, writeSidecar)
+        withDebugAttackLog("direct", onLog, measure = true) { archivedLog, debugDir, runDir, writeSidecar ->
+            runExploitBinary(pair, "libghostlock.so", archivedLog, debugDir, runDir, writeSidecar)
         }
 
     override suspend fun runExploitWithShizuku(pair: CpuPair, onLog: (String) -> Unit): Int {
-        return withDebugAttackLog("shizuku", onLog, measure = true) { archivedLog, debugDir, writeSidecar ->
+        /* The Shizuku service runs as uid 2000 and cannot write the app's run
+         * folder; the module sidecar is a direct-entry diagnostic. Its AIDL also
+         * carries no vr.ko mode, so that entry runs Auto. */
+        return withDebugAttackLog("shizuku", onLog, measure = true) { archivedLog, debugDir, _, writeSidecar ->
             archivedLog("<s> resolving profile")
             val release = System.getProperty("os.version", "").orEmpty()
             val config = profileController.load(release, pair)
@@ -751,7 +774,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
          * exit codes are not a chain completion, and it has no root phase.
          */
         measure: Boolean = false,
-        run: suspend ((String) -> Unit, String?, (String, ByteArray) -> Boolean) -> Int,
+        run: suspend ((String) -> Unit, String?, String?, (String, ByteArray) -> Boolean) -> Int,
     ): Int {
         val settings = debugSettings()
         /* Deleted before the run, so a capture present afterwards proves this
@@ -762,7 +785,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         val archive = DebugAttackLog.open(appContext, entry)
         if (archive == null) {
             onLog("<k> warning: cannot create the run log")
-            return run(onLog, null) { _, _ -> false }
+            return run(onLog, null, null) { _, _ -> false }
         }
         val archivedLog: (String) -> Unit = { line ->
             runCatching { archive.append(line) }
@@ -785,6 +808,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             val code = run(
                 archivedLog,
                 if (settings.kernelLogEnabled) archive.folderFile.absolutePath else null,
+                archive.folderFile.absolutePath,
                 writeSidecar,
             )
             if (measure && code in completedCodes) {
@@ -912,6 +936,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         binaryName: String,
         onLog: (String) -> Unit,
         debugDir: String?,
+        runDir: String?,
         writeSidecar: (String, ByteArray) -> Boolean,
     ): Int {
         val workDir = filesDir
@@ -997,6 +1022,14 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     environment()["TMPDIR"] = workDir.absolutePath
                     environment()["HOME"] = workDir.absolutePath
                     environment()["GHOSTLOCK_KSU_LOG"] = ksuLog.absolutePath
+                    /* The user-authoritative vr.ko choices; the native resolves Auto. */
+                    environment()["GHOSTLOCK_VRKO_TAG_CLEAR"] = vrKoTagClear.wire
+                    environment()["GHOSTLOCK_VRKO_SELINUX_BLOCK"] = vrKoSelinuxBlock.wire
+                    /* The run folder the exporter zips whole: the native writes
+                     * the vr.ko diagnostic sidecar next to the log. */
+                    if (!runDir.isNullOrEmpty()) {
+                        environment()["GHOSTLOCK_RUN_DIR"] = runDir
+                    }
                     /* Only when it is provable: a missing anchor state file is
                      * then known to mean "no run since the reboot" instead of
                      * "cannot tell", which is what let a clean install never
@@ -1379,6 +1412,25 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     private fun restoreForceAttackTest() {
         forceAttackTest = preferences.getBoolean(PrefForceAttackTest, false)
     }
+
+    private fun restoreVrKoTagClear() {
+        vrKoTagClear = readVrKoMode(PrefVrKoTagClear)
+    }
+
+    private fun restoreVrKoSelinuxBlock() {
+        vrKoSelinuxBlock = readVrKoMode(PrefVrKoSelinuxBlock)
+    }
+
+    /**
+     * Reads a tri-state preference. The unreleased v2 build stored a boolean:
+     * true maps to Auto (never a forced On) and false to Off.
+     */
+    private fun readVrKoMode(key: String): VrKoMode =
+        when (val raw = preferences.all[key]) {
+            is Boolean -> if (raw) VrKoMode.AUTO else VrKoMode.OFF
+            is String -> VrKoMode.fromWire(raw)
+            else -> VrKoMode.AUTO
+        }
 
     private fun parseCpuList(value: String): List<Int> = value.split(',').flatMap { part ->
         val range = part.trim().split('-').mapNotNull { it.toIntOrNull() }

