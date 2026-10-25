@@ -45,14 +45,10 @@ internal data class Profile(
     val compactWaiter: Boolean get() = (document.compactWaiter?.toInt() ?: 0) != 0
     val pselectWaiterShift: Int?
         get() = (document.routeConfig as? SelectConfig)?.waiterShift
-    val mmStructSz: UInt? get() = document.mmStructSz
 
     fun supports(candidate: RouteKind): Boolean = route == candidate
 
     fun hasCompactWaiter(): Boolean = compactWaiter
-
-    /** mm_struct stride; a missing or zero value uses [fallback]. */
-    fun mmStructStride(fallback: UInt): UInt = mmStructSz?.takeIf { it != 0u } ?: fallback
 
     fun multicastLayout(): MulticastWaiterLayout = MulticastWaiterLayout(
         waiterOffset = multicast.waiterOff,

@@ -12,14 +12,22 @@ import com.ghostlock.app.BuildConfig
 import com.ghostlock.app.BuildInfo
 import com.ghostlock.app.domain.model.CpuPair
 import com.ghostlock.app.domain.model.DebugSettings
+import com.ghostlock.app.domain.model.ExternalProfileInfo
 import com.ghostlock.app.domain.model.KernelSnapshot
+import com.ghostlock.app.domain.model.LegacyProfileState
+import com.ghostlock.app.domain.model.MeasuredFactInfo
+import com.ghostlock.app.domain.model.MeasuredKernelInfo
+import com.ghostlock.app.domain.model.MeasurementMergeRow
 import com.ghostlock.app.domain.model.OffsetCandidate
 import com.ghostlock.app.data.ota.OtaPayloadExtractor
 import com.ghostlock.app.domain.model.OffsetImportResult
 import com.ghostlock.app.domain.model.ParseResult
 import com.ghostlock.app.domain.model.ProfileConfig
+import com.ghostlock.app.domain.model.ProfileDiffRow
 import com.ghostlock.app.domain.model.RunLogEntry
 import com.ghostlock.app.domain.model.RunLogState
+import com.ghostlock.app.domain.model.StrideCandidateOption
+import com.ghostlock.app.domain.model.StrideProbe
 import com.ghostlock.app.domain.model.UserProfileFile
 import com.ghostlock.app.domain.repository.GhostlockRepository
 import com.ghostlock.app.domain.repository.ProfileConfigController
@@ -43,9 +51,19 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     private companion object {
         const val OffsetsFileName = "offsets.conf"
         const val LegacyOffsetsFileName = "offsets.json"
+        const val FeasibleReportFileName = "offsets_feasible.json"
         const val UserProfilesDirectoryName = "user_profiles"
         const val EditSessionPreferences = "ghostlock_edit_session"
         const val ExtractBinaryName = "libextract.so"
+        const val NativeBinaryName = "libghostlock.so"
+
+        /* Measured database and the root phase's /proc/slabinfo capture. */
+        const val MeasuredDbFileName = "measured_profiles.conf"
+        const val SlabinfoCaptureFileName = ".ghostlock_slabinfo"
+
+        /* The probe runs up to ten leak rounds plus the spray setup. */
+        const val ProbeTimeoutSeconds = 900L
+        val AnsiEscape = Regex("\u001B\\[[0-9;]*m")
         const val PrefForceAttackTest = "force_attack_test"
 
         /** Build identity the layer-disable notice was last shown for. */
@@ -78,14 +96,17 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     private val offsetsFile get() = File(filesDir, OffsetsFileName)
     private val builtinProfiles = BuiltinProfileCatalog(appContext)
     private val assetConfigLoader = AssetConfigLoader(appContext)
+    /** Legacy app-data documents; read only by the one-time cleanup flow. */
     private val userProfileStore = UserProfileStore(
         directory = File(filesDir, UserProfilesDirectoryName),
         assetLoader = assetConfigLoader,
     )
+    /** Ground-truth facts; written only from a completed run's root phase. */
+    private val measuredProfiles = MeasuredProfileStore(File(filesDir, MeasuredDbFileName))
+    private val externalProfileStore = AndroidExternalProfileStore(appContext)
     private val profileController = AndroidProfileConfigController(
         appContext,
-        filesDir,
-        userProfileStore,
+        externalProfileStore,
         preferences,
     )
     private val cpuPairs = mutableListOf<CpuPair>()
@@ -97,7 +118,6 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     /** True once the user flipped the toggle; only then does it override the
      * profile suggestion (PROFILE-SUGGEST-01). */
     private var shizukuPreferenceSet = false
-    private var pendingParsedDocument: PendingParsedDocument? = null
     private val shizukuRunner = ShizukuExploitRunner(appContext)
 
     init {
@@ -218,6 +238,24 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
 
     override fun profileController(): ProfileConfigController = profileController
 
+    override suspend fun measurements(): List<MeasuredKernelInfo> = withContext(Dispatchers.IO) {
+        measuredProfiles.kernels().map { kernel ->
+            MeasuredKernelInfo(
+                release = kernel.release,
+                updatedAt = kernel.updatedAt,
+                facts = kernel.facts.map { fact ->
+                    MeasuredFactInfo(
+                        key = fact.key,
+                        value = fact.value,
+                        source = fact.source,
+                        evidence = fact.evidence,
+                        measuredAt = fact.measuredAt,
+                    )
+                },
+            )
+        }
+    }
+
     /* debug-ui: preferences for the hidden debug screen. */
     override suspend fun debugSettings(): DebugSettings = DebugSettings(
         kernelLogEnabled = preferences.getBoolean(PrefDebugKernelLogEnabled, true),
@@ -248,83 +286,20 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     /* Profile configuration now lives in AndroidProfileConfigController: the
      * repository only wires it and forwards the native document. */
 
-    override suspend fun importOffsets(documents: Map<String, String>): OffsetImportResult =
-        mergeImported(documents, overwrite = false)
-
-    override suspend fun confirmImport(documents: Map<String, String>): OffsetImportResult =
-        mergeImported(documents, overwrite = true)
-
-    private fun mergeImported(documents: Map<String, String>, overwrite: Boolean): OffsetImportResult {
-        return try {
-            val imported = parseImportDocuments(documents)
-                ?: return OffsetImportResult.Failed("not a valid profile document")
-            /* Unlike export candidates, imports are never compared against the
-             * bundled tables: whatever the user picked lands in the store. */
-            val fresh = imported.filter { (it["release"] as? String).orEmpty().isNotEmpty() }
-            if (fresh.isEmpty()) return OffsetImportResult.AlreadyPresent
-
-            val releases = freshReleases(fresh)
-            val overlaps = releases.filter { userProfileStore.containsRelease(it) }
-            if (!overwrite && overlaps.isNotEmpty()) {
-                return OffsetImportResult.RequiresOverwrite(overlaps)
-            }
-            if (overwrite) dropReplacedDocuments(releases)
-            for ((name, text) in documents) userProfileStore.save(name, text)
-            OffsetImportResult.Imported(releases)
-        } catch (error: CancellationException) {
-            throw error
-        } catch (error: UserProfileStore.MissingIncludes) {
-            OffsetImportResult.MissingIncludes(error.files)
-        } catch (error: Exception) {
-            OffsetImportResult.Failed(error.message ?: "import failed")
-        }
-    }
-
-    /** Confirmed overwrite: drop old documents fully superseded by [releases]. */
-    private fun dropReplacedDocuments(releases: List<String>) {
-        val incoming = releases.toSet()
-        userProfileStore.list().forEach { stored ->
-            if (stored.releases.isNotEmpty() && stored.releases.all { it in incoming }) {
-                userProfileStore.delete(stored.name)
-            }
-        }
-    }
-
-    /**
-     * Parses every picked document, resolving includes against the picked
-     * files first (by full name or base name), then the bundled assets.
-     * Anything unresolvable is reported so the user can pick it too; only
-     * objects carrying a `release` become entries.
-     */
-    private fun parseImportDocuments(documents: Map<String, String>): List<ValueMap>? {
-        val entries = mutableListOf<ValueMap>()
-        documents.forEach { (_, text) ->
-            entries += userProfileStore.parseEntries(text, extraDocuments = documents)
-        }
-        return entries.takeIf { it.isNotEmpty() }
-    }
-
     override suspend fun parseSource(
         input: String,
         xblPath: String?,
         uefiPath: String?,
         vendorBootPath: String?,
         overwrite: Boolean,
+        route: String?,
         onLog: (String) -> Unit,
     ): ParseResult {
         val parsedFile = File(filesDir, "offsets_parse.tmp")
+        val feasibleFile = File(filesDir, FeasibleReportFileName)
         var tempBootFile: File? = null
         var tempXblFile: File? = null
         return try {
-            if (overwrite) {
-                val pending = pendingParsedDocument
-                if (pending != null) {
-                    pendingParsedDocument = null
-                    dropReplacedDocuments(pending.releases)
-                    userProfileStore.save(pending.name, pending.text)
-                    return ParseResult.Parsed(pending.releases, pending.missing, pending.name)
-                }
-            }
             val binary = File(appContext.applicationInfo.nativeLibraryDir, ExtractBinaryName)
             if (!binary.isFile) return ParseResult.Failed(1, "missing native binary: ${binary.absolutePath}")
 
@@ -347,6 +322,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             }
 
             parsedFile.delete()
+            feasibleFile.delete()
             val args = buildList {
                 add(effectiveInput)
                 if (effectiveXblPath != null) {
@@ -366,6 +342,8 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                  * stored document needs no legacy conversion. */
                 /* --anchor: the diting 5.10 line gets its lock-anchor triple
                  * derived from the image; other families warn and ignore it. */
+                /* --feasible-out: written before an ambiguity exit, so the app
+                 * can offer the routes the image actually supports. */
                 addAll(
                     listOf(
                         "--format",
@@ -375,57 +353,287 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                         parsedFile.absolutePath,
                         "--work-dir",
                         filesDir.absolutePath,
+                        "--feasible-out",
+                        feasibleFile.absolutePath,
                     ),
                 )
+                if (route != null) {
+                    add("--route")
+                    add(route)
+                }
             }
-            onLog("<k> extract: $effectiveInput")
-            val code = runProcess(
-                ProcessBuilder(listOf(binary.absolutePath) + args).directory(filesDir).redirectErrorStream(true).apply {
-                        environment()["GHOSTLOCK_HOME"] = filesDir.absolutePath
-                        environment()["TMPDIR"] = filesDir.absolutePath
-                        environment()["HOME"] = filesDir.absolutePath
-                    },
-                onLog = onLog,
-                timeoutSeconds = 1800,
-            )
-            onLog("<k> extract exit code=$code")
+            val captured = mutableListOf<String>()
+            /* One generation log per extractor pass: the stderr decision lines,
+             * the verdict JSON and a meta summary land in the app's crash-safe
+             * run store and are exportable from the log screen. Exit 7 is a
+             * completed pass (the choice moves to the user), not a failure. */
+            val code = withDebugAttackLog("parse", onLog, completedCodes = setOf(0, 7)) {
+                    archivedLog, _, writeSidecar ->
+                val tee: (String) -> Unit = { line ->
+                    captured += line
+                    archivedLog(line)
+                }
+                tee("<k> extract: $effectiveInput")
+                val exit = runProcess(
+                    ProcessBuilder(listOf(binary.absolutePath) + args).directory(filesDir).redirectErrorStream(true).apply {
+                            environment()["GHOSTLOCK_HOME"] = filesDir.absolutePath
+                            environment()["TMPDIR"] = filesDir.absolutePath
+                            environment()["HOME"] = filesDir.absolutePath
+                        },
+                    onLog = tee,
+                    timeoutSeconds = 1800,
+                )
+                tee("<k> extract exit code=$exit")
+                val reportText = feasibleFile.takeIf { it.isFile }?.readText()
+                val report = reportText?.let(FeasibleReport::parse)
+                if (reportText != null) {
+                    writeSidecar("generation.json", reportText.toByteArray(StandardCharsets.UTF_8))
+                }
+                writeSidecar(
+                    "generation.meta",
+                    generationMeta(
+                        input = input,
+                        effectiveInput = effectiveInput,
+                        requestedRoute = route,
+                        exit = exit,
+                        report = report,
+                        captured = captured,
+                    ).toByteArray(StandardCharsets.UTF_8),
+                )
+                exit
+            }
+            val report = feasibleFile.takeIf { it.isFile }?.readText()?.let(FeasibleReport::parse)
+            if (code == 7) {
+                val routes = report?.routes.orEmpty()
+                if (routes.none { it.verdict == FeasibleReport.VerdictFeasible }) {
+                    return ParseResult.Failed(7, "route ambiguity without a feasible-route report")
+                }
+                return ParseResult.Ambiguous(routes)
+            }
             if (code != 0 || !parsedFile.isFile) return ParseResult.Failed(code)
             val document = parsedFile.readText()
             val fresh = parseEntries(document) ?: return ParseResult.Failed(code, "invalid extractor output")
-            /* Parsed reports are stored as-is, even when they match a bundled
-             * profile; loading decides whether they take effect. */
+            /* The document is returned, never stored: the app keeps no profile
+             * documents (measured-db-plan §1). The caller probes it in memory,
+             * applies the chosen stride, and an export is the only way it can
+             * become selectable. */
             val filtered = fresh.mapNotNull { it.asValueMap() }
                 .filter { (it["release"] as? String).orEmpty().isNotEmpty() }
             if (filtered.isEmpty()) return ParseResult.AlreadyPresent
             val releases = freshReleases(filtered)
             val missing = missingSidecarFields(filtered)
-            val overlaps = releases.filter { userProfileStore.containsRelease(it) }
             val name = parsedDocumentName(releases)
-            if (!overwrite && overlaps.isNotEmpty()) {
-                pendingParsedDocument = PendingParsedDocument(name, document, releases, missing)
-                return ParseResult.RequiresOverwrite(overlaps, missing)
-            }
-            dropReplacedDocuments(releases)
-            userProfileStore.save(name, document)
-            ParseResult.Parsed(releases, missing, name)
+            ParseResult.Parsed(
+                releases = releases,
+                missing = missing,
+                documentName = name,
+                route = report?.chosen ?: route,
+                anchor = anchorLine(captured),
+                documentText = document,
+            )
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
             ParseResult.Failed(1, error.message)
         } finally {
             parsedFile.delete()
+            feasibleFile.delete()
             tempBootFile?.delete()
             tempXblFile?.delete()
         }
     }
 
+    override suspend fun probeStride(
+        release: String,
+        documentText: String,
+        pair: CpuPair,
+        onLog: (String) -> Unit,
+    ): StrideProbe? {
+        /* The probe frame is the generated document, built in memory; nothing
+         * is selected or stored (measured-db-plan §1). */
+        val blob = profileController.nativeDocumentFor(documentText, release, pair)
+            ?: return null
+        val binary = File(appContext.applicationInfo.nativeLibraryDir, NativeBinaryName)
+        if (!binary.isFile) return null
+        val lines = mutableListOf<String>()
+        val exit = runProcess(
+            /* --enable-status-record selects the length-prefixed stdin frame
+             * (`read_glk1_frame_stdin`); without it the native reads the bare
+             * document and blocks on the app's length prefix. */
+            ProcessBuilder(
+                listOf(
+                    binary.absolutePath,
+                    "--ghostlock-app-call",
+                    "--enable-status-record",
+                    "--probe-stride",
+                ),
+            )
+                .directory(filesDir)
+                .redirectErrorStream(true)
+                .apply {
+                    environment()["GHOSTLOCK_HOME"] = filesDir.absolutePath
+                    environment()["TMPDIR"] = filesDir.absolutePath
+                    environment()["HOME"] = filesDir.absolutePath
+                },
+            onLog = { raw ->
+                val line = raw.replace(AnsiEscape, "")
+                lines += line
+                onLog(line)
+            },
+            timeoutSeconds = ProbeTimeoutSeconds,
+            /* captureOutput=true is what runs the reader that calls onLog; the
+             * run path uses false because it redirects stdout to a file and
+             * tails it instead. */
+            captureOutput = true,
+            stdin = blob,
+            frameStdin = true,
+        )
+        onLog("stride: probe exit=$exit captured=${lines.size}")
+        if (exit != 0) return null
+        val probe = parseStrideProbe(lines)
+        if (probe == null) onLog("stride: no candidate table")
+        return probe
+    }
+
+    override fun applyStrideToDocument(
+        documentText: String,
+        release: String,
+        stride: Int?,
+    ): String? {
+        val entries = ProfileDocumentParser.entries(documentText) ?: return null
+        val targets = entries.filter { it["release"] == release }
+        if (targets.isEmpty()) return null
+        for (entry in targets) {
+            val snitch = entry.mutableChild("kernelsnitch")
+            if (stride != null) snitch["mm_struct_sz"] = stride.toLong() else snitch.remove("mm_struct_sz")
+            if (snitch.isEmpty()) entry.remove("kernelsnitch")
+        }
+        val document = if (entries.size == 1) entries.first() else ValueList().apply { addAll(entries) }
+        return HoconSupport.render(document)
+    }
+
+    private fun parseStrideProbe(lines: List<String>): StrideProbe? {
+        val candidates = mutableListOf<StrideCandidateOption>()
+        var rounds = 0
+        var samples = 0
+        var gcd = 0L
+        var decided = false
+        val candidateLine = Regex(
+            """\[stride\] candidate value=(\d+) votes=(\d+)/(\d+) objects=(\d+)""",
+        )
+        val summaryLine = Regex(
+            """\[stride\] summary rounds=(\d+) samples=(\d+) gcd=0x([0-9a-fA-F]+) """ +
+                """candidates=\d+ decided=(\d+)""",
+        )
+        for (line in lines) {
+            candidateLine.find(line)?.let { match ->
+                candidates += StrideCandidateOption(
+                    value = match.groupValues[1].toInt(),
+                    votes = match.groupValues[2].toInt(),
+                    samples = match.groupValues[3].toInt(),
+                    objectsPerSlab = match.groupValues[4].toInt(),
+                )
+            }
+            summaryLine.find(line)?.let { match ->
+                rounds = match.groupValues[1].toInt()
+                samples = match.groupValues[2].toInt()
+                gcd = match.groupValues[3].toLong(16)
+                decided = match.groupValues[4] == "1"
+            }
+        }
+        if (candidates.isEmpty()) return null
+        return StrideProbe(candidates, rounds, samples, gcd, decided)
+    }
+
+    /** The extractor's first anchor decision line, or null when none ran. */
+    private fun anchorLine(lines: List<String>): String? = lines.firstOrNull {
+        it.contains("lock anchor") && (it.startsWith("info:") || it.startsWith("warning:"))
+    }
+
+    /**
+     * The generation record design 10 asks for: what the image is, which series
+     * tier filled the shared fields, every route verdict, the route and why it
+     * was chosen, the anchor verdict and how the pass ended. The raw stderr
+     * (including every heuristic warning) is the log file itself; the lines
+     * about heuristic values are copied here so the meta alone is enough to
+     * see that a profile is not fully image-derived.
+     */
+    private fun generationMeta(
+        input: String,
+        effectiveInput: String,
+        requestedRoute: String?,
+        exit: Int,
+        report: FeasibleReport?,
+        captured: List<String>,
+    ): String = buildString {
+        val state = when (exit) {
+            0 -> "completed"
+            7 -> "ambiguous"
+            3 -> "infeasible"
+            -1 -> "timeout"
+            else -> "failed"
+        }
+        appendLine("state=$state")
+        appendLine("exit=$exit")
+        appendLine("release=${report?.release.orEmpty()}")
+        appendLine("input=$input")
+        appendLine("input_sha256=${sha256Of(File(effectiveInput)) ?: "unavailable"}")
+        appendLine("series=${captured.firstOrNull { it.contains("series ") }?.substringAfter("series ")?.trim() ?: "unknown"}")
+        appendLine("route=${report?.chosen ?: requestedRoute.orEmpty()}")
+        /* The extractor's own selection line distinguishes a derived choice
+         * from the zero-feasible frame-rule fallback; the report alone cannot. */
+        val selection = captured.firstOrNull {
+            it.startsWith("info: route ") && it.contains(" selected (")
+        }
+        appendLine(
+            "route_basis=" + when {
+                requestedRoute != null -> "forced"
+                selection?.contains("(Fallback)") == true -> "fallback"
+                selection != null -> "derived"
+                exit == 7 -> "ambiguous"
+                else -> "none"
+            },
+        )
+        appendLine("route_selection=${selection ?: "none"}")
+        appendLine("feasible=${report?.feasible.orEmpty().joinToString(",") { it.route }}")
+        report?.routes.orEmpty().forEach { verdict ->
+            val numbers = if (verdict.numbers.isEmpty()) {
+                ""
+            } else {
+                "; " + verdict.numbers.entries.joinToString(", ") { (key, value) -> "$key=$value" }
+            }
+            appendLine("verdict.${verdict.route}=${verdict.verdict}: ${verdict.reason}$numbers")
+        }
+        appendLine("anchor=${anchorLine(captured) ?: "none"}")
+        val heuristics = captured.filter { it.contains("heuristic", ignoreCase = true) }
+        appendLine("heuristic_count=${heuristics.size}")
+        heuristics.forEachIndexed { index, line -> appendLine("heuristic.$index=$line") }
+        val fieldSources = captured.filter { it.contains("field_source ") }
+        appendLine("field_source_count=${fieldSources.size}")
+        fieldSources.forEachIndexed { index, line -> appendLine("field_source.$index=$line") }
+    }
+
+    private fun sha256Of(file: File): String? = runCatching {
+        if (!file.isFile) return@runCatching null
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { stream ->
+            val buffer = ByteArray(1 shl 20)
+            while (true) {
+                val read = stream.read(buffer)
+                if (read < 0) break
+                digest.update(buffer, 0, read)
+            }
+        }
+        digest.digest().joinToString("") { "%02x".format(it) }
+    }.getOrNull()
+
     override suspend fun runExploit(pair: CpuPair, onLog: (String) -> Unit): Int =
-        withDebugAttackLog("direct", onLog) { archivedLog, debugDir, writeSidecar ->
+        withDebugAttackLog("direct", onLog, measure = true) { archivedLog, debugDir, writeSidecar ->
             runExploitBinary(pair, "libghostlock.so", archivedLog, debugDir, writeSidecar)
         }
 
     override suspend fun runExploitWithShizuku(pair: CpuPair, onLog: (String) -> Unit): Int {
-        return withDebugAttackLog("shizuku", onLog) { archivedLog, debugDir, writeSidecar ->
+        return withDebugAttackLog("shizuku", onLog, measure = true) { archivedLog, debugDir, writeSidecar ->
             archivedLog("<s> resolving profile")
             val release = System.getProperty("os.version", "").orEmpty()
             val config = profileController.load(release, pair)
@@ -535,9 +743,20 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     private suspend fun withDebugAttackLog(
         entry: String,
         onLog: (String) -> Unit,
+        /** Exit codes that mean the pass ended cleanly for its kind (7 is the
+         * ambiguity hand-off, not a failure). */
+        completedCodes: Set<Int> = setOf(0),
+        /**
+         * Attack runs record the measured database. Parsing does not: its
+         * exit codes are not a chain completion, and it has no root phase.
+         */
+        measure: Boolean = false,
         run: suspend ((String) -> Unit, String?, (String, ByteArray) -> Boolean) -> Int,
     ): Int {
         val settings = debugSettings()
+        /* Deleted before the run, so a capture present afterwards proves this
+         * run's root phase wrote it, not a previous boot's. */
+        if (measure) runCatching { File(filesDir, SlabinfoCaptureFileName).delete() }
         /* Unconditional: a run with no log is a run nobody can report, and the
          * user who most needs one is the one whose device just died. */
         val archive = DebugAttackLog.open(appContext, entry)
@@ -568,13 +787,52 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 if (settings.kernelLogEnabled) archive.folderFile.absolutePath else null,
                 writeSidecar,
             )
+            if (measure && code in completedCodes) {
+                runCatching { ingestMeasuredFacts(writeSidecar, archivedLog) }
+            }
             /* Recorded before the descriptor closes: a run that ends without a
              * terminal state reads as interrupted at the next start. */
-            archive.finish(if (code == 0) RunLogState.COMPLETED else RunLogState.FAILED)
+            archive.finish(if (code in completedCodes) RunLogState.COMPLETED else RunLogState.FAILED)
             code
         } finally {
             runCatching { archive.close() }
         }
+    }
+
+    /**
+     * Records the root phase's `/proc/slabinfo` measurement after a completed
+     * run. The capture is the only root-written measurement text, so it is also
+     * copied into the run folder as evidence. A capture that does not parse is
+     * logged and dropped — the database only takes facts it can name.
+     */
+    private fun ingestMeasuredFacts(
+        writeSidecar: (String, ByteArray) -> Boolean,
+        log: (String) -> Unit,
+    ) {
+        val capture = File(filesDir, SlabinfoCaptureFileName)
+        if (!capture.isFile) {
+            log("<k> measured: no root slabinfo capture")
+            return
+        }
+        val raw = runCatching { capture.readText(StandardCharsets.UTF_8) }.getOrNull()
+        if (raw.isNullOrEmpty()) return
+        val release = System.getProperty("os.version", "").orEmpty()
+        val fact = MeasuredProfileStore.parseSlabinfo(release, raw)
+        if (fact == null) {
+            log("<k> measured: slabinfo capture did not parse for $release")
+            return
+        }
+        val recorded = measuredProfiles.record(release, fact)
+        if (recorded) {
+            writeSidecar("slabinfo-mm_struct.txt", raw.toByteArray(StandardCharsets.UTF_8))
+        }
+        log(
+            if (recorded) {
+                "<k> measured: ${fact.key}=${fact.value} recorded (${fact.source})"
+            } else {
+                "<k> warning: measured database refused the write"
+            },
+        )
     }
 
     /**
@@ -674,8 +932,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             )
             logProfileLayers(onLog, config)
             if (!config.hasProfile) {
+                val reason = config.layers?.externalError?.let { " ($it)" } ?: ""
                 error(
-                    "no profile matched $release; import its .conf and select it, " +
+                    "no profile resolved for $release$reason; select a profile file, " +
                         "or pick a built-in release",
                 )
             }
@@ -800,162 +1059,235 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             }
         }
 
-    override suspend fun deleteUserProfile(name: String): Boolean {
-        val deleted = withContext(Dispatchers.IO) { userProfileStore.delete(name) }
-        if (deleted) profileController.onUserProfileDeleted(name)
-        return deleted
-    }
+    /* ---- profile sources (measured-db storage model) ---- */
 
-    override suspend fun renameUserProfile(name: String, newName: String): String? {
-        val renamed = withContext(Dispatchers.IO) { userProfileStore.rename(name, newName) }
-        if (renamed != null) profileController.onUserProfileRenamed(name, renamed)
-        return renamed
-    }
+    override fun activeExternalProfile(): ExternalProfileInfo? =
+        profileController.activeExternalProfile()
 
-    /** Renders a stored document as HOCON and shares it; returns the URI. */
-    override suspend fun exportUserProfile(name: String): String {
-        val hocon = withContext(Dispatchers.IO) { userProfileStore.exportHocon(name) }
-            ?: throw IOException("cannot export $name")
-        return publishOffsets(OffsetCandidate(name.substringBeforeLast('.'), hocon))
-    }
-
-    /**
-     * Converts a stored legacy document into the current layout and stores the
-     * result as a new user document; returns its name, or null on failure.
-     */
-    override suspend fun convertUserProfile(name: String): String? {
-        val hocon = withContext(Dispatchers.IO) { userProfileStore.exportHocon(name) }
-            ?: return null
-        val base = name.substringBeforeLast('.')
-        return withContext(Dispatchers.IO) {
-            userProfileStore.save("$base-converted.conf", hocon)
+    override suspend fun selectExternalProfile(uri: String): ProfileConfig? =
+        withContext(Dispatchers.IO) {
+            val release = deviceRelease()
+            val pair = cpuPairs.getOrNull(selectedCpuPair) ?: return@withContext null
+            runCatching {
+                profileController.selectExternalProfile(uri, release, pair)
+            }.getOrNull()
         }
+
+    override suspend fun clearExternalProfile(): ProfileConfig = withContext(Dispatchers.IO) {
+        profileController.clearExternalProfile(deviceRelease(), currentPairOrZero())
     }
 
-    /* ---- editing session: isolated from the live attack controller ---- */
+    override fun liveProfileDocument(): String? {
+        val release = deviceRelease()
+        val pair = cpuPairs.getOrNull(selectedCpuPair) ?: return null
+        val text = profileController.renderResolved(release, pair) ?: return null
+        return withLineage(
+            text,
+            profileController.currentSelectionLabel(release),
+            profileController.activeExternalProfile()?.sha256,
+        )
+    }
+
+    override suspend fun writeProfileDocument(uri: String, text: String): Boolean =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                appContext.contentResolver.openOutputStream(uri.toUri(), "wt")?.use { stream ->
+                    stream.write(text.toByteArray(StandardCharsets.UTF_8))
+                } ?: return@runCatching false
+                true
+            }.getOrDefault(false)
+        }
+
+    /* ---- editing session: in-memory, export-only ---- */
 
     private var editSession: AndroidProfileConfigController? = null
     private var editSessionTargetName: String? = null
     private var editSessionTargetRelease: String? = null
-    private var editSessionLive = false
 
-    override suspend fun beginEditSession(name: String?): ProfileConfig? =
-        withContext(Dispatchers.IO) {
-            endEditSession()
-            val deviceRelease = System.getProperty("os.version", "").orEmpty()
-            val pair = cpuPairs.getOrNull(selectedCpuPair) ?: return@withContext null
-            /* A stored document is edited against its own release: the device
-             * release would resolve the bundled profile instead and hide the
-             * imported geometry. Only the live controller stays device-keyed. */
-            val targetRelease = name?.let { userProfileStore.releasesOf(it).firstOrNull() }
-                ?: deviceRelease
-            val sessionPreferences = appContext.getSharedPreferences(
-                EditSessionPreferences,
-                Context.MODE_PRIVATE,
-            )
-            sessionPreferences.edit { clear() }
-            editSessionLive = name != null && name == profileController.activeUserProfile()
-            if (editSessionLive) {
-                val overrides = profileController.overridesSnapshot(deviceRelease)
-                if (overrides.isNotEmpty()) {
-                    /* The store keeps one entry per release, so wrap it back. */
-                    sessionPreferences.edit(commit = true) {
-                        putString(
-                            AndroidProfileConfigController.PrefDebugProfileOverrides,
-                            HoconSupport.render(valueMapOf(deviceRelease to overrides)),
-                        )
-                        /* The session inherits the writer's identity too: without
-                         * it the layer would read as disabled inside the editor
-                         * and the user's own values would be shown as defaults. */
-                        profileController.overridesBuildStamp()?.let { stamp ->
-                            putString(AndroidProfileConfigController.PrefOverridesBuildSha, stamp)
-                        }
-                    }
-                }
-            }
-            val session = AndroidProfileConfigController(
-                context = appContext,
-                filesDir = filesDir,
-                userProfiles = userProfileStore,
-                preferences = sessionPreferences,
-                forcedUserProfile = name,
-                forcedBuiltinRelease = profileController.activeBuiltinRelease(),
-            )
-            editSession = session
-            editSessionTargetName = name
-            editSessionTargetRelease = targetRelease
-            runCatching { session.load(targetRelease, pair) }.getOrNull()
-        }
+    override suspend fun beginEditSession(): ProfileConfig? = withContext(Dispatchers.IO) {
+        endEditSession()
+        val release = deviceRelease()
+        val pair = cpuPairs.getOrNull(selectedCpuPair) ?: return@withContext null
+        val live = runCatching { profileController.load(release, pair) }.getOrNull()
+        if (live?.hasProfile != true) return@withContext null
+        val session = AndroidProfileConfigController(
+            context = appContext,
+            externalProfiles = externalProfileStore,
+            preferences = preferences,
+            overrideStore = MemoryOverrideStore(),
+            forcedSelection = profileController.currentSelection(release),
+        )
+        editSession = session
+        editSessionTargetName = profileController.currentSelectionLabel(release)
+        editSessionTargetRelease = release
+        runCatching { session.load(release, pair) }.getOrNull()
+    }
 
     override fun editSessionController(): ProfileConfigController? = editSession
-
-    override fun editSessionIsLive(): Boolean = editSessionLive
 
     override fun editSessionTarget(): String? = editSessionTargetName
 
     override fun editSessionRelease(): String? = editSessionTargetRelease
 
-    override suspend fun saveEditSessionInPlace(): Boolean = withContext(Dispatchers.IO) {
-        if (editSessionLive) return@withContext false
-        val session = editSession ?: return@withContext false
-        val target = editSessionTargetName ?: return@withContext false
-        val release = editSessionTargetRelease
-            ?: System.getProperty("os.version", "").orEmpty()
-        val pair = cpuPairs.getOrNull(selectedCpuPair) ?: return@withContext false
-        val document = session.renderResolved(release, pair) ?: return@withContext false
-        userProfileStore.overwrite(target, document)
+    override fun editSessionDocument(): String? {
+        val session = editSession ?: return null
+        val release = editSessionTargetRelease ?: return null
+        val pair = cpuPairs.getOrNull(selectedCpuPair) ?: return null
+        val text = session.renderResolved(release, pair) ?: return null
+        return withLineage(text, editSessionTargetName, session.activeExternalProfile()?.sha256)
     }
 
-    override suspend fun commitEditSession(): Boolean = withContext(Dispatchers.IO) {
-        if (!editSessionLive) return@withContext false
-        val session = editSession ?: return@withContext false
-        val release = System.getProperty("os.version", "").orEmpty()
-        profileController.replaceOverrides(release, session.overridesSnapshot(release))
-        val pair = cpuPairs.getOrNull(selectedCpuPair) ?: return@withContext false
-        runCatching { profileController.load(release, pair) }.isSuccess
+    override fun editSessionDiff(): List<ProfileDiffRow> {
+        val session = editSession ?: return emptyList()
+        val release = editSessionTargetRelease ?: return emptyList()
+        val pair = cpuPairs.getOrNull(selectedCpuPair) ?: return emptyList()
+        return session.diffAgainstBundle(release, pair)
     }
 
-    override suspend fun saveEditSessionAsNew(): String? = withContext(Dispatchers.IO) {
+    override suspend fun rebaseEditSession(): ProfileConfig? = withContext(Dispatchers.IO) {
         val session = editSession ?: return@withContext null
-        val release = editSessionTargetRelease
-            ?: System.getProperty("os.version", "").orEmpty()
+        val release = editSessionTargetRelease ?: return@withContext null
         val pair = cpuPairs.getOrNull(selectedCpuPair) ?: return@withContext null
-        val stem = (editSessionTargetName ?: release)
-            .substringBeforeLast('.')
-            .replace(Regex("[^A-Za-z0-9._-]"), "_")
-        val name = "${stem.ifEmpty { "profile" }}-edited.conf"
-        if (session.saveResolved(release, pair, name)) name else null
-    }
-
-    override suspend fun exportEditSession(): String = withContext(Dispatchers.IO) {
-        val session = editSession ?: throw IOException("no editing session")
-        val release = editSessionTargetRelease
-            ?: System.getProperty("os.version", "").orEmpty()
-        val pair = cpuPairs.getOrNull(selectedCpuPair) ?: throw IOException("no cpu pair")
-        val document = session.renderResolved(release, pair)
-            ?: throw IOException("cannot render the edited profile")
-        val stem = editSessionTargetName?.substringBeforeLast('.') ?: release
-        publishOffsets(OffsetCandidate(stem.ifEmpty { release }, document))
+        val config = runCatching { session.rebaseToBundle(release, pair) }.getOrNull()
+        if (config != null) editSessionTargetName = session.currentSelectionLabel(release)
+        config
     }
 
     override fun endEditSession() {
         editSession = null
         editSessionTargetName = null
         editSessionTargetRelease = null
-        editSessionLive = false
     }
 
-    override suspend fun publishOffsets(candidate: OffsetCandidate): String {
-        val safeRelease = candidate.release.replace(Regex("[^A-Za-z0-9._-]"), "_")
-        val values = ContentValues().apply {
-            put(MediaStore.Downloads.DISPLAY_NAME, "offsets-$safeRelease.conf")
-            put(MediaStore.Downloads.MIME_TYPE, "text/plain")
+    /* ---- measured database merge ---- */
+
+    override suspend fun measurementMergeDiff(): List<MeasurementMergeRow> =
+        withContext(Dispatchers.IO) {
+            val release = deviceRelease()
+            val pair = cpuPairs.getOrNull(selectedCpuPair) ?: return@withContext emptyList()
+            val numbers = profileController.resolvedNumbers(release, pair)
+                ?: return@withContext emptyList()
+            measuredProfiles.kernel(release)?.facts.orEmpty().map { fact ->
+                MeasurementMergeRow(
+                    path = fact.key,
+                    profileValue = numbers[fact.key],
+                    measuredValue = fact.value,
+                    source = fact.source,
+                    evidence = fact.evidence,
+                    measuredAt = fact.measuredAt,
+                )
+            }.filter { it.profileValue != it.measuredValue }
         }
-        val uri = appContext.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: throw IOException("cannot create download entry")
-        appContext.contentResolver.openOutputStream(uri)?.use { output ->
-            output.write(candidate.document.toByteArray(StandardCharsets.UTF_8))
-        } ?: throw IOException("cannot open download entry")
-        return uri.toString()
+
+    override fun mergedProfileDocument(): String? {
+        val release = deviceRelease()
+        val pair = cpuPairs.getOrNull(selectedCpuPair) ?: return null
+        val facts = measuredProfiles.kernel(release)?.facts.orEmpty()
+        if (facts.isEmpty()) return null
+        val text = profileController.renderMerged(
+            release,
+            pair,
+            facts.associate { it.key to it.value },
+        ) ?: return null
+        return withLineage(
+            text,
+            profileController.currentSelectionLabel(release),
+            profileController.activeExternalProfile()?.sha256,
+        )
+    }
+
+    /* ---- legacy app-data cleanup ---- */
+
+    override suspend fun legacyState(): LegacyProfileState = withContext(Dispatchers.IO) {
+        val profiles = userProfileStore.list().map { stored ->
+            UserProfileFile(
+                name = stored.name,
+                releases = stored.releases,
+                importedAt = stored.importedAt,
+                sizeBytes = stored.sizeBytes,
+                parseError = stored.parseError,
+                version = stored.version,
+            )
+        }
+        LegacyProfileState(profiles, legacyOverridePresent())
+    }
+
+    override fun legacyProfileDocument(name: String, applyOverride: Boolean): String? {
+        val text = userProfileStore.rawText(name) ?: return null
+        val entries = runCatching { userProfileStore.parseEntries(text) }.getOrNull() ?: return null
+        if (entries.isEmpty()) return null
+        /* Export in the current layout: the stored text may still be v1. */
+        entries.forEach { LegacyProfileConverter.convertValue(it) }
+        if (applyOverride) {
+            val overrides = readLegacyOverrides()
+            entries.forEach { entry ->
+                val release = entry["release"] as? String ?: return@forEach
+                overrides[release].asValueMap()?.let { applyLegacyOverride(entry, it) }
+            }
+        }
+        entries.forEach { it["schema_version"] = 1 }
+        val document = if (entries.size == 1) entries.first() else ValueList().apply { addAll(entries) }
+        return HoconSupport.render(document)
+    }
+
+    override suspend fun finishLegacyCleanup(): Boolean = withContext(Dispatchers.IO) {
+        runCatching {
+            userProfileStore.list().forEach { userProfileStore.delete(it.name) }
+            /* Old builds also kept one resolved snapshot per release in
+             * filesDir. Delete only files that parse as a profile, and never
+             * the measured database. */
+            filesDir.listFiles { file -> file.isFile && file.name.endsWith(".conf") }
+                ?.forEach { file ->
+                    if (file.name == MeasuredDbFileName) return@forEach
+                    val text = runCatching { file.readText() }.getOrNull() ?: return@forEach
+                    val isProfile = runCatching {
+                        HoconSupport.parseValue(text).asValueMap()?.containsKey("release") == true
+                    }.getOrDefault(false)
+                    if (isProfile) file.delete()
+                }
+            preferences.edit {
+                remove(AndroidProfileConfigController.PrefDebugProfileOverrides)
+                remove(AndroidProfileConfigController.PrefOverridesBuildSha)
+            }
+            true
+        }.getOrDefault(false)
+    }
+
+    private fun deviceRelease(): String = System.getProperty("os.version", "").orEmpty()
+
+    private fun currentPairOrZero(): CpuPair = cpuPairs.getOrNull(selectedCpuPair) ?: CpuPair(0, 0)
+
+    private fun withLineage(text: String, parentLabel: String?, parentSha256: String?): String {
+        val parent = parentLabel?.let { ProfileLineage.Parent(it, parentSha256) }
+        return ProfileLineage.header(parent) + "\n" + text
+    }
+
+    private fun legacyOverridePresent(): Boolean {
+        val raw = preferences.getString(
+            AndroidProfileConfigController.PrefDebugProfileOverrides,
+            null,
+        ) ?: return false
+        return runCatching {
+            HoconSupport.parseValue(raw).asValueMap()?.isNotEmpty() == true
+        }.getOrDefault(false)
+    }
+
+    private fun readLegacyOverrides(): ValueMap {
+        val raw = preferences.getString(
+            AndroidProfileConfigController.PrefDebugProfileOverrides,
+            null,
+        ) ?: return valueMapOf()
+        return runCatching { HoconSupport.parseValue(raw).asValueMap() ?: valueMapOf() }
+            .getOrDefault(valueMapOf())
+    }
+
+    /**
+     * Applies a stored legacy override to one document entry. The branch rule
+     * (same branch merges, a different branch replaces) lives in
+     * [LegacyProfileExport] so the export is testable.
+     */
+    private fun applyLegacyOverride(entry: ValueMap, override: ValueMap) {
+        LegacyProfileExport.applyOverride(entry, override)
     }
 
     override fun close() {
@@ -982,13 +1314,6 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             null
         }
     }
-
-    private class PendingParsedDocument(
-        val name: String,
-        val text: String,
-        val releases: List<String>,
-        val missing: Set<String>,
-    )
 
     /**
      * Fields a parsed profile still lacks that only an xbl_config FDT or uefi

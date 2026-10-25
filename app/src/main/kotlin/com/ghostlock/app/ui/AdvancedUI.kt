@@ -34,7 +34,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.ghostlock.app.BuildConfig
 import com.ghostlock.app.R
+import com.ghostlock.app.domain.model.MeasuredKernelInfo
+import com.ghostlock.app.domain.model.MeasurementMergeRow
 import com.ghostlock.app.domain.model.ProfileConfig
+import com.ghostlock.app.domain.model.ProfileDiffRow
 import com.ghostlock.app.domain.model.ProfileFieldNode
 import com.ghostlock.app.domain.model.ProfileLayers
 import com.ghostlock.app.domain.model.UserProfileFile
@@ -204,6 +207,15 @@ internal fun AdvancedScreen(
                     )
                 }
             }
+            item(key = "measurements") {
+                Card {
+                    ArrowPreference(
+                        title = stringResource(R.string.measurements_title),
+                        summary = stringResource(R.string.measurements_summary),
+                        onClick = actions::onOpenMeasurements,
+                    )
+                }
+            }
             item(key = "export") {
                 Card {
                     Column {
@@ -368,19 +380,70 @@ internal fun LoadConfigScreen(
             ),
         ) {
             item(key = "top-space") { Spacer(Modifier.height(12.dp)) }
-            item(key = "import-conf") {
+            item(key = "source") {
+                val external = state.externalProfile
+                val externalApplied = state.profileLayers?.external != null
+                val details = buildList {
+                    when {
+                        external != null && externalApplied -> {
+                            add(stringResource(R.string.external_profile_label, external.name))
+                            add(stringResource(R.string.external_profile_sha, external.sha256.take(16)))
+                            external.parent?.let { add(stringResource(R.string.external_profile_parent, it)) }
+                        }
+
+                        external != null -> {
+                            add(stringResource(R.string.external_profile_label, external.name))
+                            add(
+                                stringResource(
+                                    R.string.external_profile_other_release,
+                                    external.release,
+                                ),
+                            )
+                            external.parent?.let { add(stringResource(R.string.external_profile_parent, it)) }
+                        }
+
+                        state.activeBuiltinProfile != null -> add(
+                            stringResource(R.string.builtin_profile_label, state.activeBuiltinProfile),
+                        )
+
+                        state.executionHasProfile -> add(
+                            stringResource(R.string.builtin_profile_label, state.executionRelease),
+                        )
+
+                        else -> add(stringResource(R.string.profile_not_loaded))
+                    }
+                }.joinToString("\n")
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    ProfileHintBanner(
+                        title = stringResource(R.string.profile_source_title),
+                        text = details,
+                        warning = state.profileLayers?.externalError != null,
+                        modifier = Modifier.preferencePageItem(),
+                    )
+                    if (state.profileLayers?.externalError != null) {
+                        ProfileHintBanner(
+                            text = stringResource(R.string.external_profile_missing),
+                            warning = true,
+                            modifier = Modifier.preferencePageItem(),
+                        )
+                    }
+                }
+            }
+            item(key = "select-profile") {
                 Card(modifier = Modifier.preferencePageItem()) {
                     ArrowPreference(
-                        title = stringResource(R.string.action_import_offsets_conf),
-                        onClick = actions::onImportOffsetsHocon,
+                        title = stringResource(R.string.select_profile_file),
+                        summary = stringResource(R.string.select_profile_summary),
+                        onClick = actions::onSelectProfileFile,
                     )
                 }
             }
-            item(key = "import-json") {
-                Card(modifier = Modifier.preferencePageItem()) {
-                    ArrowPreference(
-                        title = stringResource(R.string.action_import_offsets_json),
-                        onClick = actions::onImportOffsetsJson,
+            if (state.externalProfile != null) {
+                item(key = "clear-external") {
+                    TextButton(
+                        text = stringResource(R.string.clear_external_profile),
+                        onClick = actions::onClearExternalProfile,
+                        modifier = Modifier.preferencePageItem(),
                     )
                 }
             }
@@ -400,9 +463,6 @@ internal fun LoadConfigScreen(
                     )
                 }
             }
-            item(key = "user-title") {
-                SmallTitle(text = stringResource(R.string.user_profiles_title))
-            }
             item(key = "builtin") {
                 Card(modifier = Modifier.preferencePageItem()) {
                     ArrowPreference(
@@ -410,7 +470,9 @@ internal fun LoadConfigScreen(
                         summary = stringResource(R.string.load_builtin_summary),
                         onClick = actions::onOpenBuiltinProfiles,
                         endActions = {
-                            if (state.executionHasProfile && state.activeUserProfile == null) {
+                            if (state.executionHasProfile && state.activeUserProfile == null &&
+                                state.activeBuiltinProfile == null
+                            ) {
                                 Text(
                                     text = stringResource(R.string.user_profile_loaded_badge),
                                     fontSize = 14.sp,
@@ -422,21 +484,16 @@ internal fun LoadConfigScreen(
                     )
                 }
             }
-            if (state.userProfiles.isEmpty()) {
-                item(key = "user-empty") {
-                    ProfileHintBanner(
-                        text = stringResource(R.string.user_profiles_empty),
-                        modifier = Modifier.preferencePageItem(),
-                    )
+            if (state.legacyPresent) {
+                item(key = "legacy") {
+                    Card(modifier = Modifier.preferencePageItem()) {
+                        ArrowPreference(
+                            title = stringResource(R.string.legacy_present_title),
+                            summary = stringResource(R.string.legacy_present_summary),
+                            onClick = actions::onOpenLegacyCleanup,
+                        )
+                    }
                 }
-            }
-            items(state.userProfiles, key = { it.name }) { profile ->
-                UserProfileCard(
-                    profile = profile,
-                    loaded = state.executionHasProfile && profile.name == state.activeUserProfile,
-                    onClick = { actions.onOpenUserProfileDetail(profile.name) },
-                    modifier = Modifier.preferencePageItem(),
-                )
             }
             item(key = "bottom-space") {
                 Spacer(Modifier.height(24.dp).navigationBarsPadding())
@@ -445,202 +502,6 @@ internal fun LoadConfigScreen(
     }
 }
 
-/** One stored document; taps open the secondary menu with its actions. */
-@Composable
-private fun UserProfileCard(
-    profile: UserProfileFile,
-    loaded: Boolean,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    Card(modifier = modifier.fillMaxWidth()) {
-        val status = if (profile.parseError) {
-            stringResource(R.string.user_profile_parse_error)
-        } else {
-            releaseSummary(profile.releases)
-        }
-        val metadata = stringResource(
-            R.string.user_profile_meta,
-            formatFileSize(profile.sizeBytes),
-            formatProfileTime(profile.importedAt),
-        )
-        ArrowPreference(
-            title = profile.name,
-            summary = "$status\n$metadata",
-            onClick = onClick,
-            endActions = {
-                Text(
-                    text = "v${profile.version}",
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = if (profile.version == 1) FieldErrorHighlight
-                    else MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                )
-                if (loaded) {
-                    Icon(
-                        imageVector = MiuixIcons.Basic.Check,
-                        contentDescription = stringResource(R.string.user_profile_loaded_badge),
-                        tint = OverrideHighlight,
-                        modifier = Modifier
-                            .padding(start = 8.dp)
-                            .size(18.dp),
-                    )
-                }
-            },
-        )
-    }
-}
-
-/**
- * Secondary menu for one stored document: load/unload, modify (the shared
- * parameter-override editor), export, rename and delete.
- */
-@Composable
-internal fun UserProfileDetailScreen(
-    state: GhostlockUiState,
-    actions: GhostlockActions,
-    name: String,
-) {
-    val scrollBehavior = MiuixScrollBehavior(rememberTopAppBarState())
-    val profile = state.userProfiles.firstOrNull { it.name == name }
-    val loaded = state.executionHasProfile && name == state.activeUserProfile
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = stringResource(R.string.user_profile_detail),
-                scrollBehavior = scrollBehavior,
-                navigationIcon = {
-                    IconButton(onClick = actions::onCloseUserProfileDetail) {
-                        Icon(
-                            imageVector = MiuixIcons.Back,
-                            contentDescription = stringResource(R.string.action_back),
-                        )
-                    }
-                },
-            )
-        },
-    ) { paddingValues ->
-        LazyColumn(
-            modifier = Modifier
-                .fillMaxSize()
-                .imePadding()
-                .scrollEndHaptic()
-                .overScrollVertical()
-                .nestedScroll(scrollBehavior.nestedScrollConnection),
-            contentPadding = pageContentPadding(paddingValues),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            item(key = "info") {
-                val details = if (profile == null) "" else buildList {
-                    add(
-                        if (profile.parseError) stringResource(R.string.user_profile_parse_error)
-                        else releaseSummary(profile.releases),
-                    )
-                    add(
-                        stringResource(
-                            R.string.user_profile_meta,
-                            formatFileSize(profile.sizeBytes),
-                            formatProfileTime(profile.importedAt),
-                        ),
-                    )
-                    add(stringResource(R.string.user_profile_version, profile.version))
-                    if (loaded) add(stringResource(R.string.user_profile_loaded_badge))
-                }.joinToString("\n")
-                ProfileHintBanner(
-                    title = profile?.name ?: name,
-                    text = details,
-                    warning = profile?.parseError == true,
-                )
-            }
-            if (profile != null) {
-                item(key = "load") {
-                    TextButton(
-                        text = stringResource(
-                            if (loaded) R.string.user_profile_unload
-                            else R.string.user_profile_load,
-                        ),
-                        onClick = {
-                            if (loaded) actions.onUnloadUserProfile()
-                            else actions.onLoadUserProfile(profile.name)
-                        },
-                        colors = if (loaded) {
-                            ButtonDefaults.textButtonColors()
-                        } else {
-                            ButtonDefaults.textButtonColorsPrimary()
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                }
-                if (profile.version == 1) {
-                    item(key = "legacy-notice") {
-                        ProfileHintBanner(text = stringResource(R.string.user_profile_legacy_notice))
-                    }
-                    item(key = "convert") {
-                        TextButton(
-                            text = stringResource(R.string.user_profile_convert),
-                            onClick = { actions.onConvertUserProfile(profile.name) },
-                            colors = ButtonDefaults.textButtonColorsPrimary(),
-                            modifier = Modifier.fillMaxWidth(),
-                        )
-                    }
-                } else {
-                    item(key = "edit") {
-                        Card {
-                            ArrowPreference(
-                                title = stringResource(R.string.user_profile_edit),
-                                onClick = { actions.onEditUserProfile(profile.name) },
-                            )
-                        }
-                    }
-                }
-                item(key = "export") {
-                    TextButton(
-                        text = stringResource(R.string.user_profile_export),
-                        onClick = { actions.onUserProfileExport(profile.name) },
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                }
-                item(key = "rename") {
-                    TextButton(
-                        text = stringResource(R.string.user_profile_rename),
-                        onClick = { actions.onUserProfileRename(profile.name) },
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                }
-                item(key = "delete") {
-                    TextButton(
-                        text = stringResource(R.string.user_profile_delete),
-                        onClick = { actions.onUserProfileDelete(profile.name) },
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                }
-            }
-        }
-    }
-    val deleteTarget = state.userProfileDeleteTarget
-    OverlayDialog(
-        show = deleteTarget != null,
-        title = stringResource(R.string.user_profile_delete_title),
-        summary = deleteTarget?.let { stringResource(R.string.user_profile_delete_message, it) },
-        onDismissRequest = actions::onUserProfileDeleteDismiss,
-        content = {
-            Row(modifier = Modifier.fillMaxWidth()) {
-                TextButton(
-                    modifier = Modifier.weight(1f),
-                    text = stringResource(R.string.cancel),
-                    onClick = actions::onUserProfileDeleteDismiss,
-                )
-                Spacer(modifier = Modifier.width(12.dp))
-                TextButton(
-                    modifier = Modifier.weight(1f),
-                    text = stringResource(R.string.user_profile_delete),
-                    colors = ButtonDefaults.textButtonColorsPrimary(),
-                    onClick = actions::onUserProfileDeleteConfirm,
-                )
-            }
-        },
-    )
-}
 
 private fun releaseSummary(releases: List<String>): String {
     if (releases.isEmpty()) return ""
@@ -694,17 +555,15 @@ internal fun ProfileOverrideScreen(
             item(key = "top-space") { Spacer(Modifier.height(12.dp)) }
             item(key = "general-banner") {
                 val source = buildList {
-                    add(
-                        stringResource(
-                            R.string.loaded_profile,
-                            state.activeBuiltinProfile ?: state.executionRelease,
-                        ),
-                    )
-                    if (state.activeBuiltinProfile != null) {
+                    state.externalProfile?.let {
+                        add(stringResource(R.string.external_profile_label, it.name))
+                    }
+                    state.activeBuiltinProfile?.let {
+                        add(stringResource(R.string.builtin_profile_label, it))
                         add(stringResource(R.string.target_kernel, state.executionRelease))
                     }
-                    state.activeUserProfile?.let {
-                        add(stringResource(R.string.loaded_user_profile, it))
+                    if (state.externalProfile == null && state.activeBuiltinProfile == null) {
+                        add(stringResource(R.string.builtin_profile_label, state.executionRelease))
                     }
                     state.editTargetName?.let {
                         add(stringResource(R.string.editing_profile, it))
@@ -712,7 +571,7 @@ internal fun ProfileOverrideScreen(
                 }.joinToString("\n")
                 ProfileHintBanner(
                     text = source,
-                    warning = state.activeBuiltinProfile != null,
+                    warning = state.profileLayers?.externalError != null,
                     modifier = Modifier.preferencePageItem(),
                 )
             }
@@ -745,17 +604,18 @@ internal fun ProfileOverrideScreen(
                     modifier = Modifier.preferencePageItem(),
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    if (state.editTargetName == null) {
-                        ProfileHintBanner(
-                            text = stringResource(R.string.builtin_edit_save_hint),
-                            warning = true,
-                        )
-                    }
+                    ProfileHintBanner(
+                        text = stringResource(R.string.profile_editor_memory_hint),
+                    )
                     TextButton(
-                        text = stringResource(R.string.profile_save),
-                        enabled = state.editTargetName != null,
+                        text = stringResource(R.string.override_export),
                         onClick = actions::onSaveProfileEdits,
                         colors = ButtonDefaults.textButtonColorsPrimary(),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    TextButton(
+                        text = stringResource(R.string.profile_export_as_new),
+                        onClick = actions::onSaveProfileAs,
                         modifier = Modifier.fillMaxWidth(),
                     )
                     Row(
@@ -763,13 +623,13 @@ internal fun ProfileOverrideScreen(
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
                         TextButton(
-                            text = stringResource(R.string.profile_save_as),
-                            onClick = actions::onSaveProfileAs,
+                            text = stringResource(R.string.profile_compare_bundle),
+                            onClick = actions::onOpenProfileDiff,
                             modifier = Modifier.weight(1f),
                         )
                         TextButton(
-                            text = stringResource(R.string.override_export),
-                            onClick = actions::onExportProfileEdits,
+                            text = stringResource(R.string.profile_rebase),
+                            onClick = actions::onRebaseToBundle,
                             modifier = Modifier.weight(1f),
                         )
                     }
@@ -1021,10 +881,120 @@ internal fun AdvancedOverrideScreen(
     }
 }
 
+/**
+ * Read-only view of the measured database: per kernel, each root-measured fact
+ * with its source, time and the raw evidence line it came from. Nothing here
+ * can be edited, and nothing here is applied automatically.
+ */
+@Composable
+internal fun MeasurementsScreen(
+    state: GhostlockUiState,
+    actions: GhostlockActions,
+) {
+    val scrollBehavior = MiuixScrollBehavior(rememberTopAppBarState())
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = stringResource(R.string.measurements_title),
+                scrollBehavior = scrollBehavior,
+                navigationIcon = {
+                    IconButton(onClick = actions::onCloseMeasurements) {
+                        Icon(
+                            imageVector = MiuixIcons.Back,
+                            contentDescription = stringResource(R.string.action_back),
+                        )
+                    }
+                },
+            )
+        },
+    ) { paddingValues ->
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .scrollEndHaptic()
+                .overScrollVertical()
+                .nestedScroll(scrollBehavior.nestedScrollConnection),
+            contentPadding = pageContentPadding(paddingValues),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            item(key = "readonly") {
+                ProfileHintBanner(
+                    text = stringResource(R.string.measurements_readonly),
+                    modifier = Modifier.preferencePageItem(),
+                )
+            }
+            if (state.measuredKernels.isEmpty()) {
+                item(key = "empty") {
+                    ProfileHintBanner(
+                        text = stringResource(R.string.measurements_empty),
+                        modifier = Modifier.preferencePageItem(),
+                    )
+                }
+            }
+            items(state.measuredKernels, key = { it.release }) { kernel ->
+                Card(modifier = Modifier.preferencePageItem()) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            text = kernel.release,
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MiuixTheme.colorScheme.onSurface,
+                        )
+                        Text(
+                            text = stringResource(
+                                R.string.measurement_updated,
+                                formatProfileTime(kernel.updatedAt),
+                            ),
+                            style = MiuixTheme.textStyles.body2,
+                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        )
+                        kernel.facts.forEach { fact ->
+                            Text(
+                                text = "${fact.key} = ${fact.value}",
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MiuixTheme.colorScheme.onSurface,
+                            )
+                            Text(
+                                text = stringResource(R.string.measurement_source, fact.source),
+                                style = MiuixTheme.textStyles.body2,
+                                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            )
+                            Text(
+                                text = stringResource(
+                                    R.string.measurement_time,
+                                    formatProfileTime(fact.measuredAt),
+                                ),
+                                style = MiuixTheme.textStyles.body2,
+                                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            )
+                            Text(
+                                text = stringResource(
+                                    R.string.measurement_evidence,
+                                    fact.evidence,
+                                ),
+                                style = MiuixTheme.textStyles.body2,
+                                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            )
+                        }
+                    }
+                }
+            }
+            item(key = "bottom-space") {
+                Spacer(Modifier.height(24.dp).navigationBarsPadding())
+            }
+        }
+    }
+}
+
 /** Parent/child tree with collapsible groups and highlighted overrides. */
 @Composable
-private fun ProfileTree(
-    nodes: List<ProfileFieldNode>,
+private fun ProfileTree(    nodes: List<ProfileFieldNode>,
     depth: Int,
     editing: Map<String, String>,
     invalidPaths: Set<String>,
@@ -1109,4 +1079,326 @@ private fun ProfileTree(
             )
         }
     }
+}
+
+/**
+ * Home merge preview: the facts the measured database would change, their raw
+ * evidence, and the one action that matters — exporting a new document. The
+ * source profile is never modified.
+ */
+@Composable
+internal fun MergePreviewScreen(
+    state: GhostlockUiState,
+    actions: GhostlockActions,
+) {
+    val scrollBehavior = MiuixScrollBehavior(rememberTopAppBarState())
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = stringResource(R.string.merge_preview_title),
+                scrollBehavior = scrollBehavior,
+                navigationIcon = {
+                    IconButton(onClick = actions::onCloseMergePreview) {
+                        Icon(
+                            imageVector = MiuixIcons.Back,
+                            contentDescription = stringResource(R.string.action_back),
+                        )
+                    }
+                },
+            )
+        },
+    ) { paddingValues ->
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .scrollEndHaptic()
+                .overScrollVertical()
+                .nestedScroll(scrollBehavior.nestedScrollConnection),
+            contentPadding = pageContentPadding(paddingValues),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            item(key = "summary") {
+                ProfileHintBanner(
+                    text = stringResource(R.string.merge_preview_summary),
+                    modifier = Modifier.preferencePageItem(),
+                )
+            }
+            items(state.mergeRows, key = { it.path }) { row ->
+                Card(modifier = Modifier.preferencePageItem()) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text(
+                            text = row.path,
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MiuixTheme.colorScheme.onSurface,
+                        )
+                        Text(
+                            text = buildString {
+                                append(stringResource(R.string.merge_profile_value))
+                                append(": ")
+                                append(row.profileValue ?: "—")
+                                append("    ")
+                                append(stringResource(R.string.merge_measured_value))
+                                append(": ")
+                                append(row.measuredValue)
+                            },
+                            style = MiuixTheme.textStyles.body2,
+                            color = MiuixTheme.colorScheme.onSurface,
+                        )
+                        Text(
+                            text = stringResource(R.string.measurement_source, row.source),
+                            style = MiuixTheme.textStyles.body2,
+                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        )
+                        Text(
+                            text = stringResource(R.string.measurement_evidence, row.evidence),
+                            style = MiuixTheme.textStyles.body2,
+                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        )
+                    }
+                }
+            }
+            item(key = "export") {
+                TextButton(
+                    text = stringResource(R.string.merge_export),
+                    onClick = actions::onExportMergedProfile,
+                    colors = ButtonDefaults.textButtonColorsPrimary(),
+                    modifier = Modifier
+                        .preferencePageItem()
+                        .fillMaxWidth(),
+                )
+            }
+            item(key = "bottom-space") {
+                Spacer(Modifier.height(24.dp).navigationBarsPadding())
+            }
+        }
+    }
+}
+
+/** Read-only list of the editor session's differences from the bundle. */
+@Composable
+internal fun ProfileDiffScreen(
+    state: GhostlockUiState,
+    actions: GhostlockActions,
+) {
+    val scrollBehavior = MiuixScrollBehavior(rememberTopAppBarState())
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = stringResource(R.string.profile_diff_title),
+                scrollBehavior = scrollBehavior,
+                navigationIcon = {
+                    IconButton(onClick = actions::onCloseProfileDiff) {
+                        Icon(
+                            imageVector = MiuixIcons.Back,
+                            contentDescription = stringResource(R.string.action_back),
+                        )
+                    }
+                },
+            )
+        },
+    ) { paddingValues ->
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .scrollEndHaptic()
+                .overScrollVertical()
+                .nestedScroll(scrollBehavior.nestedScrollConnection),
+            contentPadding = pageContentPadding(paddingValues),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            if (state.profileDiffRows.isEmpty()) {
+                item(key = "empty") {
+                    ProfileHintBanner(
+                        text = stringResource(R.string.profile_diff_empty),
+                        modifier = Modifier.preferencePageItem(),
+                    )
+                }
+            }
+            items(state.profileDiffRows, key = { it.path }) { row ->
+                Card(modifier = Modifier.preferencePageItem()) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text(
+                            text = row.path,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MiuixTheme.colorScheme.onSurface,
+                        )
+                        Text(
+                            text = buildString {
+                                append(stringResource(R.string.profile_diff_current))
+                                append(": ")
+                                append(row.current ?: "—")
+                                append("    ")
+                                append(stringResource(R.string.profile_diff_bundled))
+                                append(": ")
+                                append(row.bundled ?: "—")
+                            },
+                            style = MiuixTheme.textStyles.body2,
+                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        )
+                    }
+                }
+            }
+            item(key = "bottom-space") {
+                Spacer(Modifier.height(24.dp).navigationBarsPadding())
+            }
+        }
+    }
+}
+
+/**
+ * One-time cleanup of the pre-measured-db storage: list what is there, export a
+ * document (optionally with the stored override applied), and delete only after
+ * an explicit confirmation.
+ */
+@Composable
+internal fun LegacyCleanupScreen(
+    state: GhostlockUiState,
+    actions: GhostlockActions,
+) {
+    val scrollBehavior = MiuixScrollBehavior(rememberTopAppBarState())
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = stringResource(R.string.legacy_title),
+                scrollBehavior = scrollBehavior,
+                navigationIcon = {
+                    IconButton(onClick = actions::onCloseLegacyCleanup) {
+                        Icon(
+                            imageVector = MiuixIcons.Back,
+                            contentDescription = stringResource(R.string.action_back),
+                        )
+                    }
+                },
+            )
+        },
+    ) { paddingValues ->
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .scrollEndHaptic()
+                .overScrollVertical()
+                .nestedScroll(scrollBehavior.nestedScrollConnection),
+            contentPadding = pageContentPadding(paddingValues),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            item(key = "explainer") {
+                ProfileHintBanner(
+                    text = stringResource(R.string.legacy_explainer),
+                    modifier = Modifier.preferencePageItem(),
+                )
+            }
+            if (state.legacyOverridePresent) {
+                item(key = "override") {
+                    ProfileHintBanner(
+                        text = stringResource(R.string.legacy_override_present),
+                        warning = true,
+                        modifier = Modifier.preferencePageItem(),
+                    )
+                }
+            }
+            if (state.legacyProfiles.isEmpty()) {
+                item(key = "empty") {
+                    ProfileHintBanner(
+                        text = stringResource(R.string.legacy_empty),
+                        modifier = Modifier.preferencePageItem(),
+                    )
+                }
+            }
+            items(state.legacyProfiles, key = { it.name }) { profile ->
+                Card(modifier = Modifier.preferencePageItem()) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            text = profile.name,
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MiuixTheme.colorScheme.onSurface,
+                        )
+                        Text(
+                            text = if (profile.parseError) {
+                                stringResource(R.string.user_profile_parse_error)
+                            } else {
+                                releaseSummary(profile.releases) + " · " +
+                                    formatFileSize(profile.sizeBytes)
+                            },
+                            style = MiuixTheme.textStyles.body2,
+                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            TextButton(
+                                text = stringResource(R.string.legacy_export),
+                                onClick = {
+                                    actions.onLegacyExport(profile.name, applyOverride = false)
+                                },
+                                modifier = Modifier.weight(1f),
+                            )
+                            if (state.legacyOverridePresent) {
+                                TextButton(
+                                    text = stringResource(R.string.legacy_export_with_override),
+                                    onClick = {
+                                        actions.onLegacyExport(profile.name, applyOverride = true)
+                                    },
+                                    modifier = Modifier.weight(1f),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            item(key = "cleanup") {
+                TextButton(
+                    text = stringResource(R.string.legacy_cleanup),
+                    onClick = actions::onLegacyCleanupRequest,
+                    colors = ButtonDefaults.textButtonColorsPrimary(),
+                    modifier = Modifier
+                        .preferencePageItem()
+                        .fillMaxWidth(),
+                )
+            }
+            item(key = "bottom-space") {
+                Spacer(Modifier.height(24.dp).navigationBarsPadding())
+            }
+        }
+    }
+    OverlayDialog(
+        show = state.legacyCleanupConfirm,
+        title = stringResource(R.string.legacy_cleanup_title),
+        summary = stringResource(R.string.legacy_cleanup_message),
+        onDismissRequest = actions::onLegacyCleanupDismiss,
+        content = {
+            Row(modifier = Modifier.fillMaxWidth()) {
+                TextButton(
+                    modifier = Modifier.weight(1f),
+                    text = stringResource(R.string.cancel),
+                    onClick = actions::onLegacyCleanupDismiss,
+                )
+                Spacer(modifier = Modifier.width(12.dp))
+                TextButton(
+                    modifier = Modifier.weight(1f),
+                    text = stringResource(R.string.legacy_cleanup),
+                    colors = ButtonDefaults.textButtonColorsPrimary(),
+                    onClick = actions::onLegacyCleanupConfirm,
+                )
+            }
+        },
+    )
 }

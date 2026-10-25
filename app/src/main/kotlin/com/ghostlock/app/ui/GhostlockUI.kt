@@ -24,15 +24,20 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.CheckCircleOutline
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.RemoveCircleOutline
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -53,6 +58,10 @@ import androidx.compose.ui.unit.sp
 import com.ghostlock.app.R
 import com.ghostlock.app.domain.model.CpuPair
 import com.ghostlock.app.domain.model.ExecutionFieldValue
+import com.ghostlock.app.domain.model.ExternalProfileInfo
+import com.ghostlock.app.domain.model.MeasuredKernelInfo
+import com.ghostlock.app.domain.model.MeasurementMergeRow
+import com.ghostlock.app.domain.model.ProfileDiffRow
 import com.ghostlock.app.domain.model.ProfileFieldNode
 import com.ghostlock.app.domain.model.ProfileLayers
 import com.ghostlock.app.domain.model.RunLogEntry
@@ -88,6 +97,8 @@ import top.yukonga.miuix.kmp.overlay.OverlayBottomSheet
 import top.yukonga.miuix.kmp.overlay.OverlayDialog
 import top.yukonga.miuix.kmp.preference.ArrowPreference
 import top.yukonga.miuix.kmp.preference.OverlaySpinnerPreference
+import top.yukonga.miuix.kmp.preference.RadioButtonLocation
+import top.yukonga.miuix.kmp.preference.RadioButtonPreference
 import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.darkColorScheme
@@ -149,6 +160,9 @@ data class GhostlockUiState(
     val executionFields: List<ExecutionFieldValue> = emptyList(),
     val executionEditing: Map<String, String> = emptyMap(),
     val advancedScreenVisible: Boolean = false,
+    /** Read-only measurements screen state. */
+    val measurementsVisible: Boolean = false,
+    val measuredKernels: List<MeasuredKernelInfo> = emptyList(),
     val debugKernelLogEnabled: Boolean = true,
     val aboutVisible: Boolean = false,
     val parametersVisible: Boolean = false,
@@ -173,16 +187,26 @@ data class GhostlockUiState(
     /** Builtin releases sorted by similarity to the device kernel. */
     val builtinProfiles: List<String> = emptyList(),
     val loadConfigVisible: Boolean = false,
-    /** Verbatim documents in the user profile folder, newest first. */
-    val userProfiles: List<UserProfileFile> = emptyList(),
-    /** Loaded user document feeding the imported layer; null means none. */
+    /** External document selected for this kernel (applied or not). */
+    val externalProfile: ExternalProfileInfo? = null,
+    /** External document actually applied to the last resolution. */
     val activeUserProfile: String? = null,
     /** Which layers the last resolution applied, and which it deliberately did not. */
     val profileLayers: ProfileLayers? = null,
-    /** File name of the open user-profile detail screen, null when closed. */
-    val userProfileDetail: String? = null,
-    val userProfileRenameTarget: String? = null,
-    val userProfileDeleteTarget: String? = null,
+    /** The slab-stride choice sheet; non-null while a probe result awaits. */
+    val stridePicker: StridePickerUiState? = null,
+    /** Measured facts that would change the active profile. */
+    val mergeRows: List<MeasurementMergeRow> = emptyList(),
+    val mergePreviewVisible: Boolean = false,
+    /** Diff of the editor session against the bundle. */
+    val profileDiffVisible: Boolean = false,
+    val profileDiffRows: List<ProfileDiffRow> = emptyList(),
+    /** One-time legacy app-data cleanup. */
+    val legacyVisible: Boolean = false,
+    val legacyPresent: Boolean = false,
+    val legacyProfiles: List<UserProfileFile> = emptyList(),
+    val legacyOverridePresent: Boolean = false,
+    val legacyCleanupConfirm: Boolean = false,
 )
 
 enum class DialogType { NONE, LIST, INPUT, CONFIRM, NOTICE }
@@ -197,6 +221,9 @@ internal fun layerNoticeBody(layers: ProfileLayers): String = buildList {
     val imported = layers.imported
     if (imported != null && !layers.importedApplied) {
         add(stringResource(R.string.layer_import_not_applied, imported))
+    }
+    layers.external?.takeIf { !layers.externalApplied }?.let { name ->
+        add(stringResource(R.string.layer_external_not_applied, name))
     }
     if (layers.overridesPresent && !layers.overridesApplied) {
         add(stringResource(R.string.layer_overrides_not_applied))
@@ -216,9 +243,8 @@ interface GhostlockActions {
     fun onRunLogSelected(stamp: String)
     fun onRunLogPickerDismiss()
     fun onClearRunLogs()
-    fun onImportOffsetsHocon()
-    fun onImportOffsetsJson()
-    fun onDocumentsResult(request: DocumentRequest, uris: List<String>)
+    fun onSelectProfileFile()
+    fun onClearExternalProfile()
     fun onParseOta()
     fun onParseImage()
     fun onCpuPairSelected(index: Int)
@@ -233,6 +259,10 @@ interface GhostlockActions {
     fun onDialogExportLog()
     fun onOverwriteConfirm()
     fun onOverwriteDismiss()
+    fun onStrideOptionSelected(value: Int)
+    fun onStrideUse()
+    fun onStrideSkip()
+    fun onStridePickerDismiss()
     fun onExecutionFieldChanged(path: String, value: String)
     fun onRouteChanged(index: Int)
     fun onFallbackChanged(index: Int)
@@ -243,6 +273,8 @@ interface GhostlockActions {
     fun onRevertProfileEdits()
     fun onOpenAdvanced()
     fun onCloseAdvanced()
+    fun onOpenMeasurements()
+    fun onCloseMeasurements()
     fun onShowAbout()
     fun onCloseAbout()
     fun onDebugKernelLogChanged(enabled: Boolean)
@@ -250,17 +282,18 @@ interface GhostlockActions {
     fun onCloseParameters()
     fun onOpenLoadConfig()
     fun onCloseLoadConfig()
-    fun onOpenUserProfileDetail(name: String)
-    fun onCloseUserProfileDetail()
-    fun onLoadUserProfile(name: String)
-    fun onUnloadUserProfile()
-    fun onEditUserProfile(name: String)
-    fun onUserProfileRename(name: String)
-    fun onUserProfileExport(name: String)
-    fun onConvertUserProfile(name: String)
-    fun onUserProfileDelete(name: String)
-    fun onUserProfileDeleteConfirm()
-    fun onUserProfileDeleteDismiss()
+    fun onOpenMergePreview()
+    fun onCloseMergePreview()
+    fun onExportMergedProfile()
+    fun onOpenProfileDiff()
+    fun onCloseProfileDiff()
+    fun onRebaseToBundle()
+    fun onOpenLegacyCleanup()
+    fun onCloseLegacyCleanup()
+    fun onLegacyExport(name: String, applyOverride: Boolean)
+    fun onLegacyCleanupRequest()
+    fun onLegacyCleanupConfirm()
+    fun onLegacyCleanupDismiss()
     fun onOpenBuiltinProfiles()
     fun onCloseBuiltinProfiles()
     fun onSelectBuiltinProfile(release: String?)
@@ -275,35 +308,47 @@ internal sealed interface GhostlockScreen : NavKey {
     data object Main : GhostlockScreen
     data object Advanced : GhostlockScreen
     data object About : GhostlockScreen
+    data object Measurements : GhostlockScreen
     data object Parameters : GhostlockScreen
     data object LoadConfig : GhostlockScreen
     data object Builtin : GhostlockScreen
-    data class UserProfileDetail(val name: String) : GhostlockScreen
+    data object MergePreview : GhostlockScreen
+    data object ProfileDiff : GhostlockScreen
+    data object Legacy : GhostlockScreen
     data object ProfileOverride : GhostlockScreen
     data object AdvancedOverride : GhostlockScreen
 }
 
 internal fun navigationPath(state: GhostlockUiState): List<GhostlockScreen> {
     val path = mutableListOf<GhostlockScreen>(GhostlockScreen.Main)
+    if (state.legacyVisible) {
+        path += GhostlockScreen.Legacy
+        return path
+    }
+    if (state.mergePreviewVisible) {
+        path += GhostlockScreen.MergePreview
+        return path
+    }
     if (!state.advancedScreenVisible) return path
     path += GhostlockScreen.Advanced
     if (state.aboutVisible) {
         path += GhostlockScreen.About
         return path
     }
+    if (state.measurementsVisible) {
+        path += GhostlockScreen.Measurements
+        return path
+    }
     if (!state.parametersVisible) return path
     path += GhostlockScreen.Parameters
     if (state.loadConfigVisible) {
         path += GhostlockScreen.LoadConfig
-        when {
-            state.builtinScreenVisible -> path += GhostlockScreen.Builtin
-            state.userProfileDetail != null ->
-                path += GhostlockScreen.UserProfileDetail(state.userProfileDetail)
-        }
+        if (state.builtinScreenVisible) path += GhostlockScreen.Builtin
     }
     if (state.profileOverrideVisible) {
         path += GhostlockScreen.ProfileOverride
         if (state.advancedOverrideVisible) path += GhostlockScreen.AdvancedOverride
+        if (state.profileDiffVisible) path += GhostlockScreen.ProfileDiff
     }
     return path
 }
@@ -324,10 +369,13 @@ private fun closeScreen(screen: GhostlockScreen, actions: GhostlockActions) {
         GhostlockScreen.Main -> Unit
         GhostlockScreen.Advanced -> actions.onCloseAdvanced()
         GhostlockScreen.About -> actions.onCloseAbout()
+        GhostlockScreen.Measurements -> actions.onCloseMeasurements()
         GhostlockScreen.Parameters -> actions.onCloseParameters()
         GhostlockScreen.LoadConfig -> actions.onCloseLoadConfig()
         GhostlockScreen.Builtin -> actions.onCloseBuiltinProfiles()
-        is GhostlockScreen.UserProfileDetail -> actions.onCloseUserProfileDetail()
+        GhostlockScreen.MergePreview -> actions.onCloseMergePreview()
+        GhostlockScreen.ProfileDiff -> actions.onCloseProfileDiff()
+        GhostlockScreen.Legacy -> actions.onCloseLegacyCleanup()
         GhostlockScreen.ProfileOverride -> actions.onCloseProfileOverrides()
         GhostlockScreen.AdvancedOverride -> actions.onCloseAdvancedOverrides()
     }
@@ -365,7 +413,6 @@ internal fun GhostlockApp(
 
                             state.overwriteDialogVisible -> actions.onOverwriteDismiss()
                             state.dialogVisible -> actions.onDialogDismiss()
-                            state.userProfileDeleteTarget != null -> actions.onUserProfileDeleteDismiss()
                             else -> {
                                 val screen = backStack.lastOrNull() as? GhostlockScreen
                                 if (screen != null && screen != GhostlockScreen.Main) {
@@ -385,6 +432,9 @@ internal fun GhostlockApp(
                     entry<GhostlockScreen.About>(swipeDismiss = swipeBack) {
                         AboutScreen(onBack = actions::onCloseAbout)
                     }
+                    entry<GhostlockScreen.Measurements>(swipeDismiss = swipeBack) {
+                        MeasurementsScreen(state = state, actions = actions)
+                    }
                     entry<GhostlockScreen.Parameters>(swipeDismiss = swipeBack) {
                         ParameterScreen(state = state, actions = actions)
                     }
@@ -394,8 +444,14 @@ internal fun GhostlockApp(
                     entry<GhostlockScreen.Builtin>(swipeDismiss = swipeBack) {
                         BuiltinProfileScreen(state = state, actions = actions)
                     }
-                    entry<GhostlockScreen.UserProfileDetail>(swipeDismiss = swipeBack) { screen ->
-                        UserProfileDetailScreen(state = state, actions = actions, name = screen.name)
+                    entry<GhostlockScreen.MergePreview>(swipeDismiss = swipeBack) {
+                        MergePreviewScreen(state = state, actions = actions)
+                    }
+                    entry<GhostlockScreen.ProfileDiff>(swipeDismiss = swipeBack) {
+                        ProfileDiffScreen(state = state, actions = actions)
+                    }
+                    entry<GhostlockScreen.Legacy>(swipeDismiss = swipeBack) {
+                        LegacyCleanupScreen(state = state, actions = actions)
                     }
                     entry<GhostlockScreen.ProfileOverride>(swipeDismiss = swipeBack) {
                         ProfileOverrideScreen(state = state, actions = actions)
@@ -407,6 +463,7 @@ internal fun GhostlockApp(
                 GhostlockDialog(state = state, actions = actions)
                 GhostlockOverwriteDialog(state = state, actions = actions)
                 RunLogPickerDialog(state = state, actions = actions)
+                StridePickerDialog(state = state, actions = actions)
                 GhostlockExecutionSheet(state = state, actions = actions)
             }
         }
@@ -687,9 +744,201 @@ private fun RunLogPickerDialog(
     )
 }
 
+/**
+ * The slab-stride decision sheet: one recommendation with an evidence level in
+ * plain language, the alternatives as radio rows, and the raw table behind a
+ * "technical details" toggle. Dismissing it is the same as Skip.
+ */
+@Composable
+private fun StridePickerDialog(
+    state: GhostlockUiState,
+    actions: GhostlockActions,
+) {
+    val picker = state.stridePicker ?: return
+    val recommendation = picker.recommendation
+    var detailsExpanded by remember { mutableStateOf(false) }
+    OverlayDialog(
+        show = true,
+        title = stringResource(R.string.stride_title),
+        summary = stringResource(R.string.stride_subtitle, recommendation.samples),
+        onDismissRequest = actions::onStridePickerDismiss,
+        content = {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = recommendation.recommendedValue
+                                    ?.let { stringResource(R.string.stride_bytes, it) }
+                                    ?: stringResource(R.string.stride_none),
+                                modifier = Modifier.weight(1f),
+                                fontSize = 22.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = MiuixTheme.colorScheme.onSurface,
+                            )
+                            Text(
+                                text = stringResource(strideLevelRes(recommendation.level)),
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = if (recommendation.level == StrideEvidenceLevel.CONFIRMED ||
+                                    recommendation.level == StrideEvidenceLevel.CONSISTENT
+                                ) {
+                                    MiuixTheme.colorScheme.primary
+                                } else {
+                                    MiuixTheme.colorScheme.onSurfaceVariantSummary
+                                },
+                            )
+                        }
+                        Text(
+                            text = strideReasonText(recommendation.reason),
+                            style = MiuixTheme.textStyles.body2,
+                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        )
+                        recommendation.confirmedValue?.let { confirmed ->
+                            Text(
+                                text = stringResource(R.string.stride_confirmed_line, confirmed),
+                                style = MiuixTheme.textStyles.body2,
+                                color = MiuixTheme.colorScheme.primary,
+                            )
+                        }
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 280.dp)
+                        .verticalScroll(rememberScrollState()),
+                ) {
+                    recommendation.options.forEach { option ->
+                        RadioButtonPreference(
+                            title = stringResource(
+                                R.string.stride_option,
+                                option.value,
+                                option.matches,
+                                option.samples,
+                            ),
+                            selected = picker.selectedValue == option.value,
+                            onClick = { actions.onStrideOptionSelected(option.value) },
+                            radioButtonLocation = RadioButtonLocation.End,
+                        )
+                    }
+                }
+                TextButton(
+                    text = if (detailsExpanded) {
+                        "▾ " + stringResource(R.string.stride_details)
+                    } else {
+                        "▸ " + stringResource(R.string.stride_details)
+                    },
+                    onClick = { detailsExpanded = !detailsExpanded },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                if (detailsExpanded) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Text(
+                            text = stringResource(
+                                R.string.stride_details_measurements,
+                                recommendation.samples,
+                                recommendation.rounds,
+                            ),
+                            style = MiuixTheme.textStyles.body2,
+                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        )
+                        Text(
+                            text = stringResource(
+                                R.string.stride_details_gcd,
+                                recommendation.gcd.toString(16),
+                            ),
+                            style = MiuixTheme.textStyles.body2,
+                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        )
+                        recommendation.options.forEach { option ->
+                            Text(
+                                text = stringResource(
+                                    R.string.stride_details_candidate,
+                                    option.value,
+                                    option.matches,
+                                    option.samples,
+                                    option.objectsPerSlab,
+                                ),
+                                style = MiuixTheme.textStyles.body2,
+                                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            )
+                        }
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    TextButton(
+                        text = picker.selectedValue
+                            ?.let { stringResource(R.string.stride_use, it) }
+                            ?: stringResource(R.string.stride_use_none),
+                        enabled = picker.selectedValue != null,
+                        onClick = actions::onStrideUse,
+                        colors = ButtonDefaults.textButtonColorsPrimary(),
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(
+                        text = stringResource(R.string.stride_skip),
+                        onClick = actions::onStrideSkip,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                Text(
+                    text = stringResource(picker.footerRes),
+                    style = MiuixTheme.textStyles.body2,
+                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+            }
+        },
+    )
+}
+
+private fun strideLevelRes(level: StrideEvidenceLevel): Int = when (level) {
+    StrideEvidenceLevel.CONFIRMED -> R.string.stride_level_confirmed
+    StrideEvidenceLevel.CONSISTENT -> R.string.stride_level_consistent
+    StrideEvidenceLevel.MIXED -> R.string.stride_level_mixed
+    StrideEvidenceLevel.INSUFFICIENT -> R.string.stride_level_insufficient
+}
+
+@Composable
+private fun strideReasonText(reason: StrideReason): String = when (reason) {
+    is StrideReason.ConfirmedAgree -> stringResource(
+        R.string.stride_reason_confirmed_agree,
+        reason.samples,
+    )
+
+    is StrideReason.ConfirmedOnly -> stringResource(R.string.stride_reason_confirmed)
+    is StrideReason.Agree -> stringResource(R.string.stride_reason_agree, reason.samples)
+    is StrideReason.Partial -> stringResource(
+        R.string.stride_reason_partial,
+        reason.matches,
+        reason.samples,
+        reason.runnerUp,
+    )
+
+    StrideReason.Tie -> stringResource(R.string.stride_reason_tie)
+    is StrideReason.Single -> stringResource(
+        if (reason.samples > 0) R.string.stride_reason_single else R.string.stride_reason_none,
+    )
+}
+
 /** `20261009-212803 · Shizuku · interrupted · 42 KB` */
-private fun runLogLabel(context: Context, run: RunLogEntry): String {
-    val state = context.getString(
+private fun runLogLabel(context: Context, run: RunLogEntry): String {    val state = context.getString(
         when (run.state) {
             RunLogState.RUNNING -> R.string.run_log_state_running
             RunLogState.COMPLETED -> R.string.run_log_state_completed
@@ -756,6 +1005,17 @@ private fun MainContent(
                 modifier = Modifier.fillMaxWidth(),
             )
         }
+        if (state.mergeRows.isNotEmpty()) {
+            item(key = "merge") {
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    ArrowPreference(
+                        title = stringResource(R.string.merge_preview_title),
+                        summary = stringResource(R.string.merge_summary),
+                        onClick = actions::onOpenMergePreview,
+                    )
+                }
+            }
+        }
         item(key = "export-run-log") {
             TextButton(
                 modifier = Modifier.fillMaxWidth(),
@@ -776,6 +1036,19 @@ private fun MainContent(
                 onBlockedClick = actions::onProfileInvalid,
                 modifier = Modifier.fillMaxWidth(),
             )
+        }
+        /* The one-time legacy cleanup sits below the primary action, so it can
+         * never push the run button off a fresh screen. */
+        if (state.legacyPresent) {
+            item(key = "legacy") {
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    ArrowPreference(
+                        title = stringResource(R.string.legacy_present_title),
+                        summary = stringResource(R.string.legacy_present_summary),
+                        onClick = actions::onOpenLegacyCleanup,
+                    )
+                }
+            }
         }
     }
 }

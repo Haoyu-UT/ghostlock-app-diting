@@ -8,9 +8,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::Serialize;
+
 use crate::btf::Btf;
-use crate::derive::{PSELECT_ROUTE_NFDS, PselectLayout, RelSymbols, derive_pselect_layout};
+use crate::derive::{
+    MULTICAST_5X_BUFFER_SIZE, PSELECT_ROUTE_NFDS, PselectLayout, RelSymbols, WaiterLayout,
+    derive_pselect_layout, derive_sigreturn_layout, multicast_waiter_off,
+};
 use crate::error::ExtractError;
+use crate::family::{WAITER_LOCK, WAITER_TASK};
 use crate::kallsyms;
 use crate::symbols::{kernel_layout_verified, kernel_struct_macro};
 
@@ -33,9 +39,67 @@ impl Confidence {
 
 pub enum PselectOutcome {
     Derived(Box<PselectLayout>),
-    Infeasible(String),
+    Infeasible {
+        message: String,
+        numbers: BTreeMap<String, i64>,
+    },
     Failed(String),
     NotAttempted(&'static str),
+}
+
+/// Three-valued route feasibility. Unknown is not Infeasible: a route with no
+/// derivation may still be the only delivery, so the zero-feasible fallback may
+/// choose it (labelled); it is never auto-selected while a Feasible route exists.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Feasibility {
+    Feasible,
+    Infeasible,
+    Unknown,
+}
+
+impl Feasibility {
+    pub fn label(self) -> &'static str {
+        match self {
+            Feasibility::Feasible => "feasible",
+            Feasibility::Infeasible => "infeasible",
+            Feasibility::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RouteVerdict {
+    pub route: &'static str,
+    pub verdict: Feasibility,
+    pub reason: String,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub numbers: BTreeMap<String, i64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SelectionBasis {
+    /// The route's own derivation made it the single Feasible route.
+    Derived,
+    /// The zero-feasible frame rule nominated an Unknown route (heuristic).
+    Fallback,
+    /// The user forced the route with `--route`.
+    Forced,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum RouteSelection {
+    Chosen {
+        route: &'static str,
+        basis: SelectionBasis,
+        reason: String,
+    },
+    Ambiguous {
+        routes: Vec<&'static str>,
+    },
+    None {
+        reason: String,
+    },
 }
 
 pub struct PathCandidate {
@@ -58,6 +122,8 @@ pub struct Analysis {
     pub mm_struct_size: Option<u32>,
     pub primitive: Result<u64, String>,
     pub pselect: PselectOutcome,
+    /// Per-route verdicts; empty for a release outside the 5.10 route family.
+    pub verdicts: Vec<RouteVerdict>,
     pub paths: Vec<PathCandidate>,
     pub suggestion: Option<&'static str>,
     pub suggestion_confidence: Confidence,
@@ -194,6 +260,294 @@ pub fn suggest_route(
     suggest(pselect_derived, &available, family, major, minor)
 }
 
+/// Every 5.10 route's verdict, computed before any selection. The `do_futex`
+/// frame rule is deliberately absent here: it is only the zero-feasible
+/// fallback, so it cannot pre-empt a route the derivation did not guess.
+pub fn route_verdicts_5_10(
+    kernel: &[u8],
+    rel_symbols: &RelSymbols,
+    sorted_offsets: &[u64],
+    btf: Option<&Btf>,
+    pselect: &PselectOutcome,
+    allow_disasm: bool,
+) -> Vec<RouteVerdict> {
+    let mut verdicts = Vec::with_capacity(4);
+    match pselect {
+        PselectOutcome::Derived(layout) => {
+            let delta = layout.futex_waiter - layout.pselect_word0;
+            let numbers = BTreeMap::from([
+                ("pselect_word0".to_string(), layout.pselect_word0),
+                ("futex_waiter".to_string(), layout.futex_waiter),
+                ("buffer".to_string(), layout.pselect_buffer as i64),
+                ("waiter_local".to_string(), layout.waiter_local as i64),
+                ("delta".to_string(), delta),
+                ("waiter_shift".to_string(), layout.shift as i64 - 2),
+            ]);
+            verdicts.push(RouteVerdict {
+                route: "select_stack",
+                verdict: Feasibility::Feasible,
+                reason: format!("pselect/futex geometry derived ({})", layout.chain),
+                numbers,
+            });
+        }
+        PselectOutcome::Infeasible { message, numbers } => verdicts.push(RouteVerdict {
+            route: "select_stack",
+            verdict: Feasibility::Infeasible,
+            reason: message.clone(),
+            numbers: numbers.clone(),
+        }),
+        PselectOutcome::Failed(message) => verdicts.push(RouteVerdict {
+            route: "select_stack",
+            verdict: Feasibility::Unknown,
+            reason: message.clone(),
+            numbers: BTreeMap::new(),
+        }),
+        PselectOutcome::NotAttempted(reason) => verdicts.push(RouteVerdict {
+            route: "select_stack",
+            verdict: Feasibility::Unknown,
+            reason: (*reason).to_string(),
+            numbers: BTreeMap::new(),
+        }),
+    }
+    if allow_disasm {
+        verdicts.push(multicast_verdict_5_10(
+            kernel,
+            rel_symbols,
+            sorted_offsets,
+            btf,
+        ));
+    } else {
+        verdicts.push(RouteVerdict {
+            route: "multicast_waiter",
+            verdict: Feasibility::Unknown,
+            reason: "--no-disasm".to_string(),
+            numbers: BTreeMap::new(),
+        });
+    }
+    if allow_disasm {
+        verdicts.push(sigreturn_verdict_5_10(
+            kernel,
+            rel_symbols,
+            sorted_offsets,
+            btf,
+        ));
+    } else {
+        verdicts.push(RouteVerdict {
+            route: "sigreturn",
+            verdict: Feasibility::Unknown,
+            reason: "--no-disasm".to_string(),
+            numbers: BTreeMap::new(),
+        });
+    }
+    verdicts.push(RouteVerdict {
+        route: "tcp_zerocopy",
+        verdict: Feasibility::Unknown,
+        reason: "no 5.10 tcp geometry derivation".to_string(),
+        numbers: BTreeMap::new(),
+    });
+    verdicts
+}
+
+fn sigreturn_verdict_5_10(
+    kernel: &[u8],
+    rel_symbols: &RelSymbols,
+    sorted_offsets: &[u64],
+    btf: Option<&Btf>,
+) -> RouteVerdict {
+    let waiter = match btf {
+        Some(btf) => WaiterLayout::from_btf(btf),
+        None => Ok(crate::family::waiter_layout_5_10()),
+    };
+    let waiter = match waiter {
+        Ok(waiter) => waiter,
+        Err(err) => {
+            return RouteVerdict {
+                route: "sigreturn",
+                verdict: Feasibility::Unknown,
+                reason: err.to_string(),
+                numbers: BTreeMap::new(),
+            };
+        }
+    };
+    match derive_sigreturn_layout(
+        kernel,
+        rel_symbols,
+        sorted_offsets,
+        waiter.pi_tree_entry,
+    ) {
+        Ok(layout) => {
+            let numbers = BTreeMap::from([
+                ("off_sve".to_string(), layout.off_sve as i64),
+                ("off_plain".to_string(), layout.off_plain as i64),
+                ("strip_home".to_string(), layout.strip_home as i64),
+                ("copy_dst_sve".to_string(), layout.copy_dst_sve as i64),
+                (
+                    "copy_dst_plain".to_string(),
+                    layout.copy_dst_plain as i64,
+                ),
+                ("chain_sve".to_string(), layout.chain_sve as i64),
+                ("chain_plain".to_string(), layout.chain_plain as i64),
+            ]);
+            RouteVerdict {
+                route: "sigreturn",
+                verdict: Feasibility::Feasible,
+                reason: format!(
+                    "fpsimd copy spans the strip (off_plain={:#x}, off_sve={:#x})",
+                    layout.off_plain, layout.off_sve
+                ),
+                numbers,
+            }
+        }
+        Err(ExtractError::Infeasible { message, numbers }) => RouteVerdict {
+            route: "sigreturn",
+            verdict: Feasibility::Infeasible,
+            reason: message,
+            numbers,
+        },
+        Err(err) => RouteVerdict {
+            route: "sigreturn",
+            verdict: Feasibility::Unknown,
+            reason: err.to_string(),
+            numbers: BTreeMap::new(),
+        },
+    }
+}
+
+fn multicast_verdict_5_10(
+    kernel: &[u8],
+    rel_symbols: &RelSymbols,
+    sorted_offsets: &[u64],
+    btf: Option<&Btf>,
+) -> RouteVerdict {
+    let waiter = match btf {
+        Some(btf) => WaiterLayout::from_btf(btf),
+        None => Ok(crate::family::waiter_layout_5_10()),
+    };
+    let layout = match waiter {
+        Ok(layout) => layout,
+        Err(err) => {
+            return RouteVerdict {
+                route: "multicast_waiter",
+                verdict: Feasibility::Unknown,
+                reason: err.to_string(),
+                numbers: BTreeMap::new(),
+            };
+        }
+    };
+    let (task, lock) = match (layout.task, layout.lock) {
+        (Some(task), Some(lock)) => (task, lock),
+        // The fallback is the 5.10 codegen layout, valid only when the image
+        // carried no BTF at all; a BTF image missing these fields is Unknown.
+        _ if btf.is_none() => (WAITER_TASK, WAITER_LOCK),
+        _ => {
+            return RouteVerdict {
+                route: "multicast_waiter",
+                verdict: Feasibility::Unknown,
+                reason: "BTF rt_mutex_waiter task/lock missing".to_string(),
+                numbers: BTreeMap::new(),
+            };
+        }
+    };
+    match multicast_waiter_off(
+        kernel,
+        rel_symbols,
+        sorted_offsets,
+        MULTICAST_5X_BUFFER_SIZE as u64,
+        layout.pi_tree_entry,
+        lock,
+    ) {
+        Ok(geometry) => {
+            let window_end = geometry.waiter_off + lock + 8;
+            let numbers = BTreeMap::from([
+                ("waiter_off".to_string(), geometry.waiter_off as i64),
+                ("buffer_size".to_string(), MULTICAST_5X_BUFFER_SIZE),
+                ("task_offset".to_string(), task as i64),
+                ("lock_offset".to_string(), lock as i64),
+                ("window_end".to_string(), window_end as i64),
+                (
+                    "setsockopt_depth".to_string(),
+                    geometry.setsockopt_depth as i64,
+                ),
+                ("waiter_depth".to_string(), geometry.waiter_depth as i64),
+            ]);
+            RouteVerdict {
+                route: "multicast_waiter",
+                verdict: Feasibility::Feasible,
+                reason: format!(
+                    "copy window reaches the lock slot \
+                     (waiter_off=0x{:x}, buffer=0x{:x})",
+                    geometry.waiter_off, MULTICAST_5X_BUFFER_SIZE
+                ),
+                numbers,
+            }
+        }
+        Err(ExtractError::Infeasible { message, numbers }) => RouteVerdict {
+            route: "multicast_waiter",
+            verdict: Feasibility::Infeasible,
+            reason: message,
+            numbers,
+        },
+        Err(err) => RouteVerdict {
+            route: "multicast_waiter",
+            verdict: Feasibility::Unknown,
+            reason: err.to_string(),
+            numbers: BTreeMap::new(),
+        },
+    }
+}
+
+/// Select a route from the verdict set. Exactly one Feasible route wins
+/// without a prompt; more than one is ambiguous; zero may use the frame rule,
+/// but only for an Unknown route — never one proven Infeasible.
+pub fn select_route_5_10(
+    verdicts: &[RouteVerdict],
+    frame_hint: Option<(&'static str, String)>,
+) -> RouteSelection {
+    let feasible: Vec<&RouteVerdict> = verdicts
+        .iter()
+        .filter(|verdict| verdict.verdict == Feasibility::Feasible)
+        .collect();
+    match feasible.len() {
+        1 => {
+            let verdict = feasible[0];
+            RouteSelection::Chosen {
+                route: verdict.route,
+                basis: SelectionBasis::Derived,
+                reason: verdict.reason.clone(),
+            }
+        }
+        0 => {
+            let Some((route, hint_reason)) = frame_hint else {
+                return RouteSelection::None {
+                    reason: "no route is feasible and the frame rule nominated none".to_string(),
+                };
+            };
+            match verdicts.iter().find(|verdict| verdict.route == route) {
+                Some(verdict) if verdict.verdict != Feasibility::Infeasible => {
+                    RouteSelection::Chosen {
+                        route,
+                        basis: SelectionBasis::Fallback,
+                        reason: format!(
+                            "{hint_reason}; selected as the zero-feasible fallback (heuristic)"
+                        ),
+                    }
+                }
+                Some(_) => RouteSelection::None {
+                    reason: format!(
+                        "the frame rule nominated {route}, but its layout is proven infeasible"
+                    ),
+                },
+                None => RouteSelection::None {
+                    reason: format!("the frame rule nominated an unknown route {route}"),
+                },
+            }
+        }
+        _ => RouteSelection::Ambiguous {
+            routes: feasible.iter().map(|verdict| verdict.route).collect(),
+        },
+    }
+}
+
 pub fn build(input: Input<'_>) -> Analysis {
     let (kernel_major, kernel_minor) = parse_major_minor(input.release);
     let family = kernel_struct_macro(input.release);
@@ -221,20 +575,26 @@ pub fn build(input: Input<'_>) -> Analysis {
         mm_struct_size = btf.size("mm_struct");
     }
 
-    let pselect = match (input.allow_disasm, input.btf) {
-        (false, _) => PselectOutcome::NotAttempted("--no-disasm"),
-        (true, None) => PselectOutcome::NotAttempted("no embedded BTF"),
-        (true, Some(btf)) => match derive_pselect_layout(
+    let pselect = if !input.allow_disasm {
+        PselectOutcome::NotAttempted("--no-disasm")
+    } else if input.btf.is_some() || kernel_major == Some(5) {
+        // The 5.10 train carries no BTF; its waiter layout is the codegen
+        // constant, and callers only reach the None arm for a 5.x release.
+        match derive_pselect_layout(
             input.kernel,
             input.rel_symbols,
             input.sorted_offsets,
-            btf,
+            input.btf,
             PSELECT_ROUTE_NFDS,
         ) {
             Ok(layout) => PselectOutcome::Derived(Box::new(layout)),
-            Err(ExtractError::Infeasible(message)) => PselectOutcome::Infeasible(message),
+            Err(ExtractError::Infeasible { message, numbers }) => {
+                PselectOutcome::Infeasible { message, numbers }
+            }
             Err(err) => PselectOutcome::Failed(err.to_string()),
-        },
+        }
+    } else {
+        PselectOutcome::NotAttempted("no embedded BTF")
     };
 
     let paths = probe_paths(
@@ -243,9 +603,59 @@ pub fn build(input: Input<'_>) -> Analysis {
         input.rel_symbols,
         input.sorted_offsets,
     );
-    let pselect_derived = matches!(pselect, PselectOutcome::Derived(_));
-    let (suggestion, suggestion_confidence, suggestion_reasons) =
-        suggest_route(pselect_derived, &paths, input.release);
+    let verdicts = if kernel_major == Some(5) {
+        route_verdicts_5_10(
+            input.kernel,
+            input.rel_symbols,
+            input.sorted_offsets,
+            input.btf,
+            &pselect,
+            input.allow_disasm,
+        )
+    } else {
+        Vec::new()
+    };
+    let (suggestion, suggestion_confidence, suggestion_reasons) = if kernel_major == Some(5) {
+        let hint = if input.allow_disasm {
+            input.release.and_then(|release| {
+                crate::family::route_hint(
+                    input.kernel,
+                    input.rel_symbols,
+                    input.sorted_offsets,
+                    release,
+                )
+            })
+        } else {
+            None
+        };
+        match select_route_5_10(&verdicts, hint) {
+            RouteSelection::Chosen {
+                route,
+                basis,
+                reason,
+            } => (
+                Some(route),
+                if basis == SelectionBasis::Derived {
+                    Confidence::High
+                } else {
+                    Confidence::Low
+                },
+                vec![reason],
+            ),
+            RouteSelection::Ambiguous { routes } => (
+                None,
+                Confidence::Low,
+                vec![format!(
+                    "ambiguous: more than one feasible route: {}",
+                    routes.join(", ")
+                )],
+            ),
+            RouteSelection::None { reason } => (None, Confidence::Low, vec![reason]),
+        }
+    } else {
+        let pselect_derived = matches!(pselect, PselectOutcome::Derived(_));
+        suggest_route(pselect_derived, &paths, input.release)
+    };
 
     Analysis {
         release: input.release.map(str::to_string),
@@ -260,6 +670,7 @@ pub fn build(input: Input<'_>) -> Analysis {
         mm_struct_size,
         primitive: input.primitive.map_err(|err| err.to_string()),
         pselect,
+        verdicts,
         paths,
         suggestion,
         suggestion_confidence,
@@ -340,7 +751,7 @@ fn render_pselect(pselect: &PselectOutcome) -> String {
                 layout.waiter_local, layout.chain
             )
         }
-        PselectOutcome::Infeasible(message) => format!("not derivable: {message}"),
+        PselectOutcome::Infeasible { message, .. } => format!("not derivable: {message}"),
         PselectOutcome::Failed(message) => format!("derivation failed: {message}"),
         PselectOutcome::NotAttempted(reason) => format!("not attempted ({reason})"),
     }
@@ -420,6 +831,22 @@ pub fn render(analysis: &Analysis) -> String {
         lines.push(field(
             &format!("path {}", path.route),
             format!("{state} ({})", probes.join(" ")),
+        ));
+    }
+    for verdict in &analysis.verdicts {
+        let numbers: Vec<String> = verdict
+            .numbers
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        let detail = if numbers.is_empty() {
+            verdict.reason.clone()
+        } else {
+            format!("{} [{}]", verdict.reason, numbers.join(" "))
+        };
+        lines.push(field(
+            &format!("route {}", verdict.route),
+            format!("{} {detail}", verdict.verdict.label()),
         ));
     }
     lines.push("---------------------------------".to_string());
@@ -506,5 +933,89 @@ mod tests {
         assert!(route_depends_on_pselect_layout("select_stack"));
         assert!(!route_depends_on_pselect_layout("tcp_zerocopy"));
         assert!(!route_depends_on_pselect_layout("multicast_waiter"));
+    }
+
+    fn verdict(route: &'static str, value: Feasibility) -> RouteVerdict {
+        RouteVerdict {
+            route,
+            verdict: value,
+            reason: format!("{route} is {}", value.label()),
+            numbers: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn one_feasible_route_is_chosen_without_a_prompt() {
+        let verdicts = vec![
+            verdict("select_stack", Feasibility::Feasible),
+            verdict("multicast_waiter", Feasibility::Infeasible),
+            verdict("sigreturn", Feasibility::Unknown),
+            verdict("tcp_zerocopy", Feasibility::Unknown),
+        ];
+        match select_route_5_10(&verdicts, None) {
+            RouteSelection::Chosen { route, basis, .. } => {
+                assert_eq!(route, "select_stack");
+                assert_eq!(basis, SelectionBasis::Derived);
+            }
+            other => panic!("unexpected selection: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_feasible_routes_are_ambiguous() {
+        let verdicts = vec![
+            verdict("select_stack", Feasibility::Feasible),
+            verdict("multicast_waiter", Feasibility::Feasible),
+            verdict("sigreturn", Feasibility::Unknown),
+            verdict("tcp_zerocopy", Feasibility::Unknown),
+        ];
+        match select_route_5_10(&verdicts, None) {
+            RouteSelection::Ambiguous { routes } => {
+                assert_eq!(routes, vec!["select_stack", "multicast_waiter"]);
+            }
+            other => panic!("unexpected selection: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_feasible_uses_the_frame_rule_for_an_unknown_route() {
+        let verdicts = vec![
+            verdict("select_stack", Feasibility::Infeasible),
+            verdict("multicast_waiter", Feasibility::Infeasible),
+            verdict("sigreturn", Feasibility::Unknown),
+            verdict("tcp_zerocopy", Feasibility::Unknown),
+        ];
+        let hint = Some(("sigreturn", "do_futex frame 0x20".to_string()));
+        match select_route_5_10(&verdicts, hint) {
+            RouteSelection::Chosen { route, basis, .. } => {
+                assert_eq!(route, "sigreturn");
+                assert_eq!(basis, SelectionBasis::Fallback);
+            }
+            other => panic!("unexpected selection: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_feasible_never_selects_an_infeasible_frame_rule_route() {
+        let verdicts = vec![
+            verdict("select_stack", Feasibility::Infeasible),
+            verdict("multicast_waiter", Feasibility::Infeasible),
+            verdict("sigreturn", Feasibility::Unknown),
+            verdict("tcp_zerocopy", Feasibility::Unknown),
+        ];
+        let hint = Some(("select_stack", "do_futex frame 0xc0".to_string()));
+        assert!(matches!(
+            select_route_5_10(&verdicts, hint),
+            RouteSelection::None { .. }
+        ));
+    }
+
+    #[test]
+    fn no_feasible_route_and_no_hint_selects_nothing() {
+        let verdicts = vec![verdict("select_stack", Feasibility::Unknown)];
+        assert!(matches!(
+            select_route_5_10(&verdicts, None),
+            RouteSelection::None { .. }
+        ));
     }
 }

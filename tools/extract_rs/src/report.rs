@@ -66,9 +66,7 @@ pub fn build_report(
     if kernel_layout_verified(release)
         && crate::symbols::kernel_struct_macro(release) == Some("STRUCT_OFFSETS_6_1")
     {
-        // 0x400 is the device SLUB stride, not the BTF 0x3c0
         report["compact_waiter"] = json!(1);
-        report["mm_struct_sz"] = json!(0x400);
     }
     report
 }
@@ -208,26 +206,45 @@ pub fn conf_route_geometry(
     pselect_shift: Option<i64>,
     structs: &BTreeMap<String, Option<u32>>,
 ) -> Vec<(&'static str, i64)> {
+    conf_route_geometry_with_sigreturn(route, release, pselect_shift, None, structs)
+}
+
+/// The route's branch geometry, with the sigreturn offsets the extractor
+/// derived for this image. `None` falls back to the patch-range constants
+/// (a labelled heuristic in the caller's log).
+pub fn conf_route_geometry_with_sigreturn(
+    route: &str,
+    release: &str,
+    pselect_shift: Option<i64>,
+    sigreturn_offsets: Option<(i64, i64)>,
+    structs: &BTreeMap<String, Option<u32>>,
+) -> Vec<(&'static str, i64)> {
     let major = release
         .split('.')
         .next()
         .and_then(|part| part.parse::<u32>().ok());
-    // The diting 5.10 line has no BTF, so its route geometry cannot be derived
-    // from the pselect layout; the frame-depth rule selects the route and the
-    // family supplies the constants.
-    if crate::family::matches(release) {
+    // The 5.10 codegen constants apply to any 5.10 build; the route decision
+    // itself is made from the image's own geometry (or the family constant only
+    // as the labelled zero-feasible fallback, supplied by the caller).
+    if crate::family::is_5_10(release) {
         match route {
             "select_stack" => {
-                return vec![
-                    ("waiter_shift", crate::family::SELECT_WAITER_SHIFT),
-                    ("compact_waiter", crate::family::SELECT_COMPACT_WAITER),
-                ];
+                if let Some(shift) = pselect_shift {
+                    return vec![
+                        ("waiter_shift", shift),
+                        ("compact_waiter", crate::family::SELECT_COMPACT_WAITER),
+                    ];
+                }
             }
             "sigreturn" => {
-                return vec![
-                    ("waiter_off_sve", crate::family::SIGRETURN_OFF_SVE),
-                    ("waiter_off_plain", crate::family::SIGRETURN_OFF_PLAIN),
-                ];
+                if let Some((sve, plain)) = sigreturn_offsets
+                    .or_else(|| crate::family::sigreturn_offsets(release))
+                {
+                    return vec![
+                        ("waiter_off_sve", sve),
+                        ("waiter_off_plain", plain),
+                    ];
+                }
             }
             _ => {}
         }
@@ -381,76 +398,29 @@ pub fn render_conf(input: &ConfInputs<'_>) -> String {
         &[("to".to_string(), "\"none\"".to_string())],
     );
 
-    // The diting 5.10 execution block is identical in all eight bundled
-    // profiles (selected_cpus 4/5, the Batch-E race knobs, the 5 ms first
-    // walk). It is device behaviour, not image layout, but a profile without
-    // it runs on the upstream defaults, which are not the measured ones.
-    if crate::family::matches(release) {
-        lines.push("execution {".to_string());
-        lines.push("  selected_cpus {".to_string());
-        lines.push(format!("    main = {}", crate::family::SELECTED_CPUS.0));
-        lines.push(format!("    consumer = {}", crate::family::SELECTED_CPUS.1));
-        lines.push("  }".to_string());
-        lines.push("  race {".to_string());
-        lines.push(format!(
-            "    route_wait_ms = {}",
-            crate::family::ROUTE_WAIT_MS
-        ));
-        lines.push(format!(
-            "    setup_settle_us = {}",
-            crate::family::SETUP_SETTLE_US
-        ));
-        lines.push("  }".to_string());
-        lines.push("  routes {".to_string());
-        lines.push("    select_stack {".to_string());
-        lines.push(format!(
-            "      enter_delay_us = {}",
-            crate::family::SELECT_ENTER_DELAY_US
-        ));
-        lines.push("    }".to_string());
-        lines.push("  }".to_string());
-        lines.push("}".to_string());
-    }
+    // Execution tuning (`selected_cpus`, the race knobs, route timing) is
+    // device/runtime behaviour, not an image property. The extractor omits the
+    // block entirely; the app fills it from its tuning presets. Omitting the
+    // keys (rather than writing null) is the contract: a null inside a new
+    // route group survives the app's merge and blocks the preset.
 
-    // KernelSnitch: full universe. `collisions` is emitted for a verified
-    // train (and every 5.x kernel); `mm_struct_sz` only where it applies. An
-    // unverified release keeps both as `null` rather than omitting the block.
+    // KernelSnitch: `collisions` is emitted for a verified train (and every
+    // 5.x kernel). The mm_struct SLUB stride is deliberately not a profile
+    // value: the leak scans a stride-agnostic grid and the spray uses the
+    // native default, so the extractor never guesses a value it cannot derive.
+    // An unverified release keeps `collisions` as `null`.
     let mut snitch = Vec::new();
     if kernel_layout_verified(Some(release)) || major == Some(5) {
         match major {
-            Some(6) => {
-                // = kernelsnitch-6x.conf
-                snitch.push(("collisions".to_string(), "4".to_string()));
-                if crate::symbols::kernel_struct_macro(Some(release)) == Some("STRUCT_OFFSETS_6_1")
-                {
-                    // 0x400 is the device SLUB stride, not the BTF sizeof (0x3c0).
-                    snitch.push(("mm_struct_sz".to_string(), "1024".to_string()));
-                }
-            }
-            Some(5) => {
-                snitch.push(("collisions".to_string(), "8".to_string()));
-                // The diting 5.10 line's slab stride is 960; 1024 is the
-                // template default (and the measured 5.15 value).
-                let mm_struct_sz = if crate::family::matches(release) {
-                    crate::family::MM_STRUCT_SZ
-                } else {
-                    1024
-                };
-                snitch.push(("mm_struct_sz".to_string(), mm_struct_sz.to_string()));
-            }
+            Some(6) => snitch.push(("collisions".to_string(), "4".to_string())),
+            Some(5) => snitch.push(("collisions".to_string(), "8".to_string())),
             _ => {}
         }
     }
     push_conf_block(
         &mut lines,
         "kernelsnitch",
-        &[
-            ("collisions".to_string(), conf_lookup(&snitch, "collisions")),
-            (
-                "mm_struct_sz".to_string(),
-                conf_lookup(&snitch, "mm_struct_sz"),
-            ),
-        ],
+        &[("collisions".to_string(), conf_lookup(&snitch, "collisions"))],
     );
 
     let task: Vec<(String, String)> = CONF_TASK_FIELDS
@@ -523,7 +493,8 @@ pub fn optional_struct_fields() -> BTreeSet<&'static str> {
 mod tests {
     use super::{
         CONF_TASK_FIELDS, ConfExtraOffsets, ConfInputs, build_report, conf_cred_5x, conf_cred_6x,
-        conf_route_geometry, pselect_waiter_shift_for, render_conf,
+        conf_route_geometry, conf_route_geometry_with_sigreturn, pselect_waiter_shift_for,
+        render_conf,
     };
     use crate::derive::Cred5x;
     use std::collections::BTreeMap;
@@ -563,7 +534,7 @@ mod tests {
         assert!(out.contains("kernel_phys_load = 1073741824"));
         assert!(out.contains("route {\n  select_stack {\n    waiter_shift = -2\n  }\n}"));
         assert!(out.contains("collisions = 4"));
-        assert!(out.contains("mm_struct_sz = null"));
+        assert!(!out.contains("mm_struct_sz"));
         assert!(!out.contains("task_prio"));
         assert!(out.contains("  prio = 132"));
         assert!(out.contains("cred {"));
@@ -576,7 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn conf_61_writes_the_compact_waiter_and_slub_stride() {
+    fn conf_61_writes_the_compact_waiter() {
         let (symbols, structs) = conf_fixture();
         let geometry: Vec<(&'static str, i64)> = vec![("compact_waiter", 1)];
         let out = render_conf(&ConfInputs {
@@ -591,7 +562,7 @@ mod tests {
             extra_offsets: &no_extra_offsets(),
         });
         assert!(out.contains("tcp_zerocopy {\n    compact_waiter = 1"));
-        assert!(out.contains("mm_struct_sz = 1024"));
+        assert!(!out.contains("mm_struct_sz"));
         assert!(out.contains("kernel_phys_load = null"));
     }
 
@@ -634,7 +605,7 @@ mod tests {
         assert!(out.contains("lock_offset = 56"));
         assert!(out.contains("compact_waiter = 1"));
         assert!(out.contains("collisions = 8"));
-        assert!(out.contains("mm_struct_sz = 1024"));
+        assert!(!out.contains("mm_struct_sz"));
         assert!(out.contains("cred {"));
         assert!(out.contains("copy_size = 176"));
         assert!(out.contains("usage_value = 256"));
@@ -651,6 +622,36 @@ mod tests {
     #[test]
     fn conf_route_geometry_follows_the_measured_families() {
         let (_, structs) = conf_fixture();
+        // The 5.10 select_stack geometry follows the image-derived shift, not
+        // the family constant: a delta=8 image emits -1, and no shift means the
+        // caller (the verdict engine) must supply the labelled fallback.
+        assert_eq!(
+            conf_route_geometry("select_stack", "5.10.246-gki", Some(-1), &structs),
+            vec![("waiter_shift", -1), ("compact_waiter", 1)]
+        );
+        assert!(
+            conf_route_geometry("select_stack", "5.10.246-gki", None, &structs).is_empty()
+        );
+        // sigreturn has no BTF derivation dependency; the patch-range fallback
+        // differs by the strip home (0x1c0 vs 0x210).
+        assert_eq!(
+            conf_route_geometry("sigreturn", "5.10.246-gki", None, &structs),
+            vec![("waiter_off_sve", 256), ("waiter_off_plain", 240)]
+        );
+        assert_eq!(
+            conf_route_geometry("sigreturn", "5.10.81-android12-9", None, &structs),
+            vec![("waiter_off_sve", 336), ("waiter_off_plain", 320)]
+        );
+        assert_eq!(
+            conf_route_geometry_with_sigreturn(
+                "sigreturn",
+                "5.10.236-android12-9",
+                None,
+                Some((256, 240)),
+                &structs
+            ),
+            vec![("waiter_off_sve", 256), ("waiter_off_plain", 240)]
+        );
         assert_eq!(
             conf_route_geometry("select_stack", "6.6.89-android15-8", Some(-2), &structs),
             vec![("waiter_shift", -2)]
@@ -779,7 +780,7 @@ mod tests {
         });
         assert!(out.contains("kernelsnitch {"));
         assert!(out.contains("collisions = null"));
-        assert!(out.contains("mm_struct_sz = null"));
+        assert!(!out.contains("mm_struct_sz"));
     }
 
     #[test]
@@ -807,11 +808,11 @@ mod tests {
         assert!(out.contains("task_offset = 48"));
         assert!(out.contains("lock_offset = 56"));
         assert!(out.contains("compact_waiter = 1"));
-        // The 5.x KernelSnitch defaults are required to run and are emitted even
-        // without the "-android13-" train tag.
+        // The 5.x KernelSnitch collisions value is required to run and is
+        // emitted even without the "-android13-" train tag.
         assert!(out.contains("kernelsnitch"));
         assert!(out.contains("collisions = 8"));
-        assert!(out.contains("mm_struct_sz = 1024"));
+        assert!(!out.contains("mm_struct_sz"));
     }
 
     #[test]

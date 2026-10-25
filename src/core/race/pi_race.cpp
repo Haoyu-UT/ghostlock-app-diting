@@ -1,5 +1,7 @@
 #include "race/pi_race.h"
 
+#include <ctime>
+
 using namespace ghostlock;
 
 bool ghostlock::race::PiRace::reset(
@@ -109,6 +111,32 @@ int32_t ghostlock::race::PiRace::join() noexcept {
     }
     if (first_error == 0) request = nullptr;
     return first_error;
+}
+
+int32_t ghostlock::race::PiRace::wait_consumer_idle(uint32_t deadline_ms) noexcept {
+    /* Close the sequence first: the consumer's `go != seq` tests are what stop
+     * it from starting a call during the wait. */
+    consumer_go.store(0);
+    if (consumer_inflight.load() == 0) return 0;
+    struct timespec started{};
+    (void) clock_gettime(CLOCK_MONOTONIC, &started);
+    for (;;) {
+        struct timespec now{};
+        (void) clock_gettime(CLOCK_MONOTONIC, &now);
+        const int64_t elapsed_ms =
+            (static_cast<int64_t>(now.tv_sec) - static_cast<int64_t>(started.tv_sec)) * 1000 +
+            (static_cast<int64_t>(now.tv_nsec) - static_cast<int64_t>(started.tv_nsec)) / 1000000;
+        if (consumer_inflight.load() == 0) {
+            return static_cast<int32_t>(elapsed_ms);
+        }
+        if (elapsed_ms >= static_cast<int64_t>(deadline_ms)) return -1;
+        /* The spin hint only. No syscall, no sleep: see the declaration. */
+#if defined(__aarch64__)
+        __asm__ volatile("yield" ::: "memory");
+#else
+        __asm__ volatile("pause" ::: "memory");
+#endif
+    }
 }
 
 ghostlock::route::RouteStatus ghostlock::race::PiRace::outcome_with_counters(

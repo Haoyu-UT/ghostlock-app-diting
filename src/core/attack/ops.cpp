@@ -279,6 +279,9 @@ namespace ghostlock::attack {
             "  KSUD=$(find /data/app -path '*/com.resukisu.resukisu*/lib/arm64/libksud.so' 2>/dev/null | head -1)\n"
             "fi\n"
             "if [ ! -x \"$KSUD\" ]; then\n"
+            "  KSUD=$(find /data/app -path '*/org.bakasu.bakasu-*/lib/arm64/libksud.so' 2>/dev/null | head -1)\n"
+            "fi\n"
+            "if [ ! -x \"$KSUD\" ]; then\n"
             "  KSUD=$(find /data/app -path '*/com.kowx712.supermanager*/lib/arm64/libksud.so' 2>/dev/null | head -1)\n"
             "fi\n"
             "if [ -z \"$KSUD\" ]; then KSUD=/data/local/tmp/ksud; fi\n"
@@ -299,6 +302,21 @@ namespace ghostlock::attack {
             "else\n"
             "  rm -f \"$HOME_DIR/.ghostlock_iomem.new\"\n"
             "  echo '[!] iomem cache: /proc/iomem read failed' >>\"$LOG\"\n"
+            "fi\n"
+            /* measured-stride fact: /proc/slabinfo is root-only, so this is the
+             * one phase that can measure the mm_struct slab stride. The app
+             * ingests the file only after a completed run and keeps it as a
+             * fact; it is never applied to a profile automatically. Atomic like
+             * the iomem cache, and the app deletes the file before each run so
+             * its presence proves this run's root phase wrote it. */
+            "echo \"# $(uname -r)\" >\"$HOME_DIR/.ghostlock_slabinfo.new\"\n"
+            "if grep -q '^mm_struct ' /proc/slabinfo 2>/dev/null && grep '^mm_struct ' /proc/slabinfo >>\"$HOME_DIR/.ghostlock_slabinfo.new\" 2>/dev/null; then\n"
+            "  mv \"$HOME_DIR/.ghostlock_slabinfo.new\" \"$HOME_DIR/.ghostlock_slabinfo\"\n"
+            "  chmod 644 \"$HOME_DIR/.ghostlock_slabinfo\" 2>/dev/null\n"
+            "  echo \"[*] slabinfo: $(cat \"$HOME_DIR/.ghostlock_slabinfo\" | tail -1)\" >>\"$LOG\"\n"
+            "else\n"
+            "  rm -f \"$HOME_DIR/.ghostlock_slabinfo.new\"\n"
+            "  echo '[!] slabinfo: /proc/slabinfo mm_struct read failed' >>\"$LOG\"\n"
             "fi\n"
             /* debug archive: copy kernel/pstore/iomem evidence into the
              * --dump-kernel-log directory (empty disables the dump). */

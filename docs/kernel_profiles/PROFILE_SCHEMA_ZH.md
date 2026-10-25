@@ -62,7 +62,7 @@ route {
   select_stack { waiter_shift = -2 }
 }
 fallback { to = "none" }
-kernelsnitch { collisions = 4, mm_struct_sz = 4096 }
+kernelsnitch { collisions = 4, mm_struct_sz = 1024 }  # 跨度：仅测量后写入
 task_struct { prio = 132, cred = 2080, pi_lock = 2316 }
 cred { copy_size = 136, caps_offset = 48, caps_count = 5 }
 offset { init_task = 34464384, init_cred = 34538824 }
@@ -110,7 +110,7 @@ route { multicast_waiter { waiter_off = 96, buffer_size = 264 } }
 | `kernel_major` ∈ {5,6}、`cred.copy_size`、`cred.caps_count` 及凭据模板边界 | 必填 | 必填 | 必填 |
 | `route.tcp_zerocopy.compact_waiter` / `route.multicast_waiter.compact_waiter` | 必填 | | 必填 |
 | `route.select_stack.waiter_shift` | | 必填（0 合法） | |
-| `route.multicast_waiter.waiter_off`（>0）、`route.multicast_waiter.buffer_size`、`route.multicast_waiter.task_offset`、`route.multicast_waiter.lock_offset`、`offset.empty_zero_page`、`kernelsnitch.mm_struct_sz`、`cred.ref_count`（>0） | | | 必填 |
+| `route.multicast_waiter.waiter_off`（>0）、`route.multicast_waiter.buffer_size`、`route.multicast_waiter.task_offset`、`route.multicast_waiter.lock_offset`、`offset.empty_zero_page`、`cred.ref_count`（>0） | | | 必填 |
 
 凭据模板边界（通用）：`cred.usage_offset + 4 ≤ cred.copy_size`；`cred.caps_offset + cred.caps_count × 8 ≤ cred.copy_size`；`cred.ref_count ≤ 4`；每个 `cred.refN_image` 非零、`cred.refN_offset + 8 ≤ cred.copy_size`。`multicast_waiter` 还要求 `cred_copy_size ≥ 0xa0` 且 `route.multicast_waiter.waiter_off + route.multicast_waiter.lock_offset + 8 ≤ route.multicast_waiter.buffer_size`。
 
@@ -213,7 +213,7 @@ cred
 | 字段 | 含义 |
 |---|---|
 | `kernelsnitch.collisions` | 需要的 futex 碰撞数量 |
-| `kernelsnitch.mm_struct_sz` | `mm_struct` 的 SLUB 大小（未填写时使用内置默认） |
+| `kernelsnitch.mm_struct_sz` | `mm_struct` 的 SLUB 对象跨度；仅在测量后写入（生成时的选择器或 root 读取 `/proc/slabinfo`），绝不猜测；省略时使用编译默认值 `0x500`。它决定 spray 的每 slab 对象数（`ORDER3_SIZE / stride`），泄漏扫描本身仍与跨度无关。 |
 
 ## 5. execution 调优参数（advisory）
 
@@ -292,7 +292,8 @@ cred
   | `symbols` 对象（`off_*` 键） | `offset.*` 命名空间 |
   | `struct_fields` 对象（`task_*` 键） | `task_struct.*` 命名空间；`rt_mutex_waiter`/`cred_uid`/`seccomp_*` 等字段保留原处，不参与校验与比较 |
   | 顶层 `pselect_waiter_shift` | `route.select_stack.waiter_shift`；tcp 配置则保留为 `fallback.route.select_stack.waiter_shift` |
-  | 顶层 `compact_waiter` / `mm_struct_sz` | `route.tcp_zerocopy.compact_waiter` / `kernelsnitch.mm_struct_sz` |
+  | 顶层 `compact_waiter` | `route.tcp_zerocopy.compact_waiter` |
+  | 顶层 `mm_struct_sz` | `kernelsnitch.mm_struct_sz` |
   | `kimage_text_base` / `btf_size` / `kallsyms` | 丢弃 |
   | 无 `route` 字段 | 按 6.x 几何推断：`compact_waiter` → tcp，否则 select |
   | 无 cred 模板 | 写入内置 6.x 常量（`credential-6x.conf` / `kernelsnitch-6x.conf`）；5.x 凭据字段仍由作者提供 |

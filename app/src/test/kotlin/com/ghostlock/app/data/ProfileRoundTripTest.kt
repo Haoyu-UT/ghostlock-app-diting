@@ -18,7 +18,6 @@ class ProfileRoundTripTest {
         "cred.copy_size" to 0x88L,
         "offset.init_task" to 0x1000L,
         "kernelsnitch.collisions" to 7L,
-        "kernelsnitch.mm_struct_sz" to 0x4000L,
         "execution.recommended_cpus.main" to 0L,
         "execution.recommended_cpus.consumer" to 1L,
         "execution.stages.w1_attempts" to 3L,
@@ -87,7 +86,6 @@ class ProfileRoundTripTest {
         assertEquals(true, profile.supports(RouteKind.MULTICAST_WAITER))
         assertEquals(false, profile.supports(RouteKind.TCP_ZEROCOPY))
         assertEquals(true, profile.hasCompactWaiter())
-        assertEquals(0x4000u, profile.mmStructStride(fallback = 1u))
         assertEquals(264, profile.multicastLayout().waiterOffset)
         /* Consumer cadence rides its own execution section, not the multicast one. */
         val decoded = NativeProfileDocument.fromBinary(bytes)!!

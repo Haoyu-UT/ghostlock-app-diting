@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use thiserror::Error;
 
 /// Extraction failure. Mirrors Python's ExtractError.
@@ -5,9 +7,13 @@ use thiserror::Error;
 pub enum ExtractError {
     #[error("{0}")]
     Message(String),
-    /// The pselect/futex route cannot work on this kernel layout.
-    #[error("pselect route not feasible: {0}")]
-    Infeasible(String),
+    /// The selected route cannot work on this kernel layout. `numbers` carries
+    /// the derivation values that decided it, for the verdict report.
+    #[error("route not feasible: {message}")]
+    Infeasible {
+        message: String,
+        numbers: BTreeMap<String, i64>,
+    },
     /// The kernel lacks offsets the exploit chain needs.
     #[error("kernel missing required offsets: {0}")]
     Unsupported(String),
@@ -26,7 +32,20 @@ impl ExtractError {
     }
 
     pub fn infeasible(msg: impl Into<String>) -> Self {
-        ExtractError::Infeasible(msg.into())
+        ExtractError::Infeasible {
+            message: msg.into(),
+            numbers: BTreeMap::new(),
+        }
+    }
+
+    pub fn infeasible_with(
+        msg: impl Into<String>,
+        numbers: BTreeMap<String, i64>,
+    ) -> Self {
+        ExtractError::Infeasible {
+            message: msg.into(),
+            numbers,
+        }
     }
 
     pub fn unsupported(msg: impl Into<String>) -> Self {

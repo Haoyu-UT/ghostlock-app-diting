@@ -45,7 +45,6 @@
 <tr><td><code>cred.ref2_image</code></td><td></td><td>第 3 个引用槽对应的内核镜像偏移（5.x）。</td></tr>
 <tr><td><code>cred.ref3_image</code></td><td></td><td>第 4 个引用槽对应的内核镜像偏移（5.x）。</td></tr>
 <tr><th rowspan="13">waiter、堆与路线几何</th><td><code>route.multicast_waiter.compact_waiter</code></td><td><code>1</code></td><td>紧凑 waiter 布局标记（0/1），写在所属路由分支内（tcp 或 multicast）。</td><td rowspan="13">错误值会改变目标选择、结构边界或竞态时序，可能导致失败、死锁、内存破坏、黑屏或重启。</td><td rowspan="13">该值保持 5.x 已验证基线，但不是稳定 ABI；新设备必须用同一目标镜像逐项复核。</td></tr>
-<tr><td><code>kernelsnitch.mm_struct_sz</code></td><td></td><td><code>mm_struct</code> 的 SLUB 大小，KernelSnitch 搜堆时使用。</td></tr>
 <tr><td><code>route.select_stack.waiter_shift</code></td><td></td><td>select 等待栈上 waiter 的相对位移（0 合法，负值常见）；作为回退时写在 <code>fallback.route.select_stack</code>。</td></tr>
 <tr><td><code>route.multicast_waiter.waiter_off</code></td><td><code>96</code></td><td>多播缓冲区中 waiter 的偏移（必须大于 0）。</td></tr>
 <tr><td><code>route.multicast_waiter.buffer_size</code></td><td><code>264</code></td><td>伪造缓冲区大小，即注入字节串的长度。</td></tr>

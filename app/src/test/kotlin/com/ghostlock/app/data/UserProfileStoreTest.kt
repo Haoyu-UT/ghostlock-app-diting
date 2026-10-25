@@ -49,7 +49,6 @@ class UserProfileStoreTest {
         }
         kernelsnitch {
           collisions = 4
-          mm_struct_sz = 1024
         }
         task_struct {
           prio = 132

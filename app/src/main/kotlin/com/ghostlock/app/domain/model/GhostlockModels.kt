@@ -41,6 +41,46 @@ data class UserProfileFile(
     val version: Int = 2,
 )
 
+/** One root-measured fact, as the read-only measurements screen shows it. */
+data class MeasuredFactInfo(
+    /** Dotted profile path (`kernelsnitch.mm_struct_sz`). */
+    val key: String,
+    val value: Long,
+    /** Only `root-slabinfo` today; the screen shows it verbatim. */
+    val source: String,
+    /** The raw `/proc/slabinfo` line, the fact's basis. */
+    val evidence: String,
+    val measuredAt: Long,
+)
+
+/** Facts measured on one kernel release. */
+data class MeasuredKernelInfo(
+    val release: String,
+    val updatedAt: Long,
+    val facts: List<MeasuredFactInfo>,
+)
+
+/**
+ * One fact the measured database would change in the active profile. The home
+ * merge preview lists these; the export applies exactly these values.
+ */
+data class MeasurementMergeRow(
+    val path: String,
+    val profileValue: Long?,
+    val measuredValue: Long,
+    val source: String,
+    val evidence: String,
+    val measuredAt: Long,
+)
+
+/** What the one-time legacy cleanup found in app data. */
+data class LegacyProfileState(
+    val profiles: List<UserProfileFile> = emptyList(),
+    val overridePresent: Boolean = false,
+) {
+    val present: Boolean get() = profiles.isNotEmpty() || overridePresent
+}
+
 /** One editable advisory execution value (PROFILE-SUGGEST-01 / profile-ui). */
 data class ExecutionFieldValue(
     val path: String,
@@ -123,10 +163,22 @@ data class ProfileLayers(
     val build: String = "",
     /** Keys the resolved profile carries that no wire section declares. */
     val uncarriedKeys: List<String> = emptyList(),
+    /** External document selected for this release, when any. */
+    val external: String? = null,
+    val externalApplied: Boolean = false,
+    /** SAF URI of the selected document, for the run log's provenance line. */
+    val externalUri: String? = null,
+    val externalSha256: String? = null,
+    /** Lineage an app export recorded in its comment header. */
+    val externalParent: String? = null,
+    /** Why the selected external document could not be used. */
+    val externalError: String? = null,
 ) {
-    /** True when something on disk was deliberately not applied. */
+    /** True when something present was deliberately not applied. */
     val hasInactiveLayer: Boolean
-        get() = (imported != null && !importedApplied) || (overridesPresent && !overridesApplied)
+        get() = (imported != null && !importedApplied) ||
+            (overridesPresent && !overridesApplied) ||
+            externalError != null
 
     /**
      * Whether this state owes the user the start-up notice, given the build
@@ -139,6 +191,16 @@ data class ProfileLayers(
 
     /** Human-readable layer state; one clause per layer. */
     fun describe(): String = buildList {
+        external?.let { name ->
+            add(
+                if (externalApplied) {
+                    "external=$name applied (uri=${externalUri ?: "?"} " +
+                        "sha256=${externalSha256 ?: "unknown"})"
+                } else {
+                    "external=$name NOT APPLIED (${externalError ?: "unavailable"})"
+                },
+            )
+        }
         add(
             when {
                 builtinRelease == null -> "builtin=none"
@@ -167,6 +229,23 @@ data class ProfileLayers(
         add("build=$build")
     }.joinToString("; ")
 }
+
+/** The external profile document the user selected for this release. */
+data class ExternalProfileInfo(
+    val name: String,
+    val release: String,
+    val sha256: String,
+    /** Parent label/hash an app export recorded, when the document carries one. */
+    val parent: String? = null,
+)
+
+/** One field where the current profile differs from the bundled document. */
+data class ProfileDiffRow(
+    /** Dotted profile path. */
+    val path: String,
+    val current: Long?,
+    val bundled: Long?,
+)
 
 /** Resolved execution view for the advanced editor (controller-owned). */
 data class ProfileConfig(
@@ -242,15 +321,65 @@ sealed interface OffsetImportResult {
     data class Failed(val reason: String) : OffsetImportResult
 }
 
+/** One route verdict from the extractor's `--feasible-out` report. */
+data class RouteVerdict(
+    val route: String,
+    /** `feasible`, `infeasible` or `unknown`, as the extractor labels it. */
+    val verdict: String,
+    val reason: String,
+    val numbers: Map<String, Long> = emptyMap(),
+)
+
+/** One candidate from the unprivileged mm_struct slab-stride probe. */
+data class StrideCandidateOption(
+    val value: Int,
+    /** Rounds whose leaked offset is divisible by this stride. */
+    val votes: Int,
+    /** Nonzero-offset rounds: the denominator shown next to [votes]. */
+    val samples: Int,
+    /** `ORDER3_SIZE / value`, the spray shaping this candidate implies. */
+    val objectsPerSlab: Int,
+)
+
+/**
+ * The probe's evidence table. Candidates arrive sorted by votes (descending),
+ * then value; no vote threshold has been applied — the user weighs the counts.
+ */
+data class StrideProbe(
+    val candidates: List<StrideCandidateOption>,
+    val rounds: Int,
+    val samples: Int,
+    val gcd: Long,
+    /** One candidate holds every nonzero vote. */
+    val decided: Boolean,
+)
+
 sealed interface ParseResult {
     /** Fields only an xbl_config/uefi sidecar can supply (e.g.
      * `kernel_phys_load`) that the parsed profile is still missing. */
     data class Parsed(
         val releases: List<String>,
         val missing: Set<String> = emptySet(),
-        /** Name of the stored document, so the caller can auto-load it. */
+        /** Suggested export name, not a stored document. */
         val documentName: String? = null,
+        /** Route the extractor emitted, when its report names one. */
+        val route: String? = null,
+        /** The extractor's lock-anchor line (verdict and reason), if any. */
+        val anchor: String? = null,
+        /**
+         * The generated document itself. The app stores no profile: the caller
+         * probes it, applies the chosen stride in memory and requires an export
+         * before it can be selected for a run.
+         */
+        val documentText: String? = null,
     ) : ParseResult
+
+    /**
+     * More than one route is Feasible on this image. The extractor wrote the
+     * verdicts and exited 7 without a profile; the caller asks the user which
+     * route to generate and calls [parseSource] again with that route.
+     */
+    data class Ambiguous(val routes: List<RouteVerdict>) : ParseResult
 
     data class RequiresOverwrite(
         val releases: List<String>,

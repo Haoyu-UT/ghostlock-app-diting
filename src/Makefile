@@ -121,8 +121,8 @@ NATIVE_HOST_TESTS := \
   kernelsnitch_scan_bounds_test route_controller_test pi_race_test \
   tcp_zerocopy_route_test select_stack_route_test sigreturn_route_test \
   target_constants_test native_resource_test \
-  profile_binary_test futex_hash_test scan_grid_test number_parse_test \
-  runtime_paths_test handoff_probe_test victim_context_test \
+  profile_binary_test futex_hash_test scan_grid_test stride_verify_test \
+  number_parse_test runtime_paths_test handoff_probe_test victim_context_test \
   run_state_test address_space_test cpp_link_probe_test
 
 native-host-tests: $(addprefix $(HOST_BUILD_DIR)/,$(NATIVE_HOST_TESTS))
@@ -199,7 +199,7 @@ $(HOST_BUILD_DIR)/run_state_test: core/tests/run_state_test.cpp core/support/run
 
 $(HOST_BUILD_DIR)/address_space_test: core/tests/address_space_test.cpp core/memory/address_space.cpp core/memory/address_space.h core/profile/model.h
 	@mkdir -p $(HOST_BUILD_DIR)
-	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore core/tests/address_space_test.cpp core/memory/address_space.cpp -o $@
+	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore -DTARGET_CONFIG_H=\"kernel/target.h\" core/tests/address_space_test.cpp core/memory/address_space.cpp -o $@
 
 $(HOST_BUILD_DIR)/route_status_test: core/tests/route_status_test.cpp core/route/route_status.h
 	@mkdir -p $(HOST_BUILD_DIR)
@@ -277,6 +277,10 @@ $(HOST_BUILD_DIR)/futex_hash_test: core/tests/futex_hash_test.cpp core/kernelsni
 	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore $< -o $@
 
 $(HOST_BUILD_DIR)/scan_grid_test: core/tests/scan_grid_test.cpp core/kernelsnitch/scan_grid.h
+	@mkdir -p $(HOST_BUILD_DIR)
+	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore $< -o $@
+
+$(HOST_BUILD_DIR)/stride_verify_test: core/tests/stride_verify_test.cpp core/kernelsnitch/stride_verify.h
 	@mkdir -p $(HOST_BUILD_DIR)
 	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore $< -o $@
 

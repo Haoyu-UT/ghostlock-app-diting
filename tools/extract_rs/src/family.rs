@@ -48,13 +48,9 @@ pub const CRED_REF_OFFSETS: [u32; 3] = [128, 136, 144];
 /// which is the spelling `data_alias()` expects.
 pub const KIMAGE_TEXT_BASE: u64 = 0xffff_ffc0_8000_0000;
 
-pub const MM_STRUCT_SZ: u64 = 960;
 pub const COLLISIONS: u64 = 8;
-/// The measured execution knobs (identical in all eight bundled profiles).
-pub const SELECTED_CPUS: (u64, u64) = (4, 5);
-pub const ROUTE_WAIT_MS: u64 = 30;
-pub const SETUP_SETTLE_US: u64 = 10000;
-pub const SELECT_ENTER_DELAY_US: u64 = 5000;
+// Execution tuning (selected_cpus, race knobs, route timing) is app-owned; the
+// extractor does not emit it. See docs/analysis/extractor-5x-route-geometry-plan.md.
 /// `sizeof(struct rt_mutex)` under this train's lock-debug config; the anchor
 /// scan does not derive it (see `anchor-derivation-plan.md`).
 pub const ANCHOR_STRIDE: u64 = 32;
@@ -63,10 +59,62 @@ pub const SELECT_WAITER_SHIFT: i64 = -2;
 pub const SELECT_COMPACT_WAITER: i64 = 1;
 pub const SIGRETURN_OFF_SVE: i64 = 336; // 0x150
 pub const SIGRETURN_OFF_PLAIN: i64 = 320; // 0x140
+/// The 5.10.136+ strip home is 0x210 (not 0x1c0), so the same copy
+/// destination gives these offsets. Used only as a labelled patch-range
+/// fallback when the per-image derivation fails.
+pub const SIGRETURN_OFF_SVE_210: i64 = 0x100; // 256
+pub const SIGRETURN_OFF_PLAIN_210: i64 = 0x0f0; // 240
+
+/// The patch-range fallback for the sigreturn offsets, used only when the
+/// per-image derivation is unavailable. `43..=101` is the 0x1c0 strip-home
+/// range (0x150/0x140); `136..=246` is the 0x210 range (0x100/0xf0).
+pub fn sigreturn_offsets(release: &str) -> Option<(i64, i64)> {
+    if !is_5_10(release) {
+        return None;
+    }
+    let patch = release
+        .split('.')
+        .nth(2)?
+        .split('-')
+        .next()?
+        .parse::<u32>()
+        .ok()?;
+    match patch {
+        43..=101 => Some((SIGRETURN_OFF_SVE, SIGRETURN_OFF_PLAIN)),
+        136..=246 => Some((SIGRETURN_OFF_SVE_210, SIGRETURN_OFF_PLAIN_210)),
+        _ => None,
+    }
+}
+
+/// The 5.10 `struct rt_mutex_waiter` layout: `pi_tree_entry` at +0x18,
+/// `task` at +0x30, `lock` at +0x38, and no `wake_state` (a 5.15/6.x field).
+pub const WAITER_PI_TREE_ENTRY: u64 = 0x18;
+pub const WAITER_TASK: u64 = 0x30;
+pub const WAITER_LOCK: u64 = 0x38;
+
+/// The waiter layout used when an image carries no BTF. It is a property of
+/// the 5.10 codegen, not of the release suffix: callers must only reach this
+/// path for a 5.10 image.
+pub fn waiter_layout_5_10() -> crate::derive::WaiterLayout {
+    crate::derive::WaiterLayout {
+        pi_tree_entry: WAITER_PI_TREE_ENTRY,
+        task: Some(WAITER_TASK),
+        lock: Some(WAITER_LOCK),
+        wake_state: None,
+        source: "family-5.10",
+    }
+}
 
 /// The GKI android12-5.10 train the diting kernels are built from.
 pub fn matches(release: &str) -> bool {
     release.starts_with("5.10.") && release.contains("-android12-9-")
+}
+
+/// Any 5.10 build, regardless of the release suffix. The series predicate
+/// (IKCONFIG fingerprint) decides which template fields may be carried; this
+/// only identifies the codegen family whose waiter layout is a 5.10 constant.
+pub fn is_5_10(release: &str) -> bool {
+    release.starts_with("5.10.")
 }
 
 /// Fill the no-BTF struct universe from the family template.
@@ -126,7 +174,7 @@ pub fn route_hint(
     sorted_offsets: &[u64],
     release: &str,
 ) -> Option<(&'static str, String)> {
-    if !matches(release) {
+    if !is_5_10(release) {
         return None;
     }
     let frame = function_frame(kernel, rel, sorted_offsets, "do_futex")?;
@@ -167,10 +215,32 @@ mod tests {
         assert_eq!(CRED_CAPS_COUNT, 5);
         assert_eq!(CRED_CAPS_VALUE, 2199023255551);
         assert_eq!(CRED_REF_OFFSETS, [128, 136, 144]);
-        assert_eq!(MM_STRUCT_SZ, 960);
         assert_eq!(ANCHOR_STRIDE, 32);
         assert_eq!(SELECT_WAITER_SHIFT, -2);
         assert_eq!(SIGRETURN_OFF_SVE, 336);
         assert_eq!(SIGRETURN_OFF_PLAIN, 320);
+    }
+
+    #[test]
+    fn the_5_10_waiter_layout_has_no_wake_state() {
+        let layout = waiter_layout_5_10();
+        assert_eq!(layout.pi_tree_entry, 0x18);
+        assert_eq!(layout.task, Some(0x30));
+        assert_eq!(layout.lock, Some(0x38));
+        assert_eq!(layout.wake_state, None);
+        assert_eq!(layout.source, "family-5.10");
+    }
+
+    #[test]
+    fn sigreturn_fallbacks_follow_the_strip_home() {
+        assert_eq!(
+            sigreturn_offsets("5.10.81-android12-9-build"),
+            Some((SIGRETURN_OFF_SVE, SIGRETURN_OFF_PLAIN))
+        );
+        assert_eq!(
+            sigreturn_offsets("5.10.236-android12-9-build"),
+            Some((SIGRETURN_OFF_SVE_210, SIGRETURN_OFF_PLAIN_210))
+        );
+        assert_eq!(sigreturn_offsets("5.15.189-android13-build"), None);
     }
 }

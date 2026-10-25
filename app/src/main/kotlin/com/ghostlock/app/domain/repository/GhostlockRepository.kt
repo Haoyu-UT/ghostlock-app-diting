@@ -2,12 +2,18 @@ package com.ghostlock.app.domain.repository
 
 import com.ghostlock.app.domain.model.CpuPair
 import com.ghostlock.app.domain.model.DebugSettings
+import com.ghostlock.app.domain.model.ExternalProfileInfo
 import com.ghostlock.app.domain.model.KernelSnapshot
+import com.ghostlock.app.domain.model.LegacyProfileState
+import com.ghostlock.app.domain.model.MeasuredKernelInfo
+import com.ghostlock.app.domain.model.MeasurementMergeRow
 import com.ghostlock.app.domain.model.OffsetCandidate
 import com.ghostlock.app.domain.model.OffsetImportResult
 import com.ghostlock.app.domain.model.ParseResult
 import com.ghostlock.app.domain.model.ProfileConfig
+import com.ghostlock.app.domain.model.ProfileDiffRow
 import com.ghostlock.app.domain.model.RunLogEntry
+import com.ghostlock.app.domain.model.StrideProbe
 import com.ghostlock.app.domain.model.UserProfileFile
 
 interface GhostlockRepository {
@@ -33,15 +39,6 @@ interface GhostlockRepository {
 
     fun setShizukuEnabled(enabled: Boolean)
 
-    /**
-     * Imports one or more picked documents (file name -> text). Includes are
-     * resolved against the picked files first, then the bundled assets; a
-     * missing include fails the import so the user can pick it too.
-     */
-    suspend fun importOffsets(documents: Map<String, String>): OffsetImportResult
-
-    suspend fun confirmImport(documents: Map<String, String>): OffsetImportResult
-
     suspend fun parseSource(
         input: String,
         xblPath: String? = null,
@@ -50,67 +47,111 @@ interface GhostlockRepository {
          * kernel_phys_offset from its header. */
         vendorBootPath: String? = null,
         overwrite: Boolean = false,
+        /** Selects one route explicitly; null lets the extractor decide and
+         * returns [ParseResult.Ambiguous] when more than one is Feasible. */
+        route: String? = null,
         onLog: (String) -> Unit = {},
     ): ParseResult
+
+    /**
+     * Run the unprivileged mm_struct leak probe for an in-memory generated
+     * document and return its stride evidence table, or null when the probe
+     * cannot run. Only meaningful when [release] is the running kernel.
+     */
+    suspend fun probeStride(
+        release: String,
+        documentText: String,
+        pair: CpuPair,
+        onLog: (String) -> Unit = {},
+    ): StrideProbe?
+
+    /**
+     * Applies (or clears, with null) `kernelsnitch.mm_struct_sz` to the entry of
+     * [release] in an in-memory document and returns the rendered text.
+     */
+    fun applyStrideToDocument(
+        documentText: String,
+        release: String,
+        stride: Int?,
+    ): String?
+
+    /* ---- profile sources (measured-db storage model) ---- */
+
+    /** External document selected for the device release, or null. */
+    fun activeExternalProfile(): ExternalProfileInfo?
+
+    /**
+     * Selects the SD-card document [uri] for the running kernel. Null when it
+     * cannot be read or carries no entry for this release; the previous
+     * selection is then untouched.
+     */
+    suspend fun selectExternalProfile(uri: String): ProfileConfig?
+
+    /** Drops the external selection; the bundle (or builtin) applies again. */
+    suspend fun clearExternalProfile(): ProfileConfig
+
+    /** Renders the active source as the HOCON an export writes, lineage included. */
+    fun liveProfileDocument(): String?
+
+    /** Writes an exported profile into the document the user picked. */
+    suspend fun writeProfileDocument(uri: String, text: String): Boolean
+
+    /* ---- editing session: in-memory, export-only ---- */
+
+    /** Opens an isolated editing session on the active source. */
+    suspend fun beginEditSession(): ProfileConfig?
+
+    /** Controller of the open editing session, null when none is open. */
+    fun editSessionController(): ProfileConfigController?
+
+    /** Label of the source the session started from; null when none. */
+    fun editSessionTarget(): String?
+
+    /** Release the editing session targets. */
+    fun editSessionRelease(): String?
+
+    /** Renders the session's result; the caller writes it through SAF. */
+    fun editSessionDocument(): String?
+
+    /** Fields where the session result differs from the bundle. */
+    fun editSessionDiff(): List<ProfileDiffRow>
+
+    /** Moves the session's base to the bundle while keeping its edits. */
+    suspend fun rebaseEditSession(): ProfileConfig?
+
+    fun endEditSession()
+
+    /* ---- measured database ---- */
+
+    /** Per-kernel measured facts, read-only; never a precedence layer. */
+    suspend fun measurements(): List<MeasuredKernelInfo>
+
+    /** Facts that would change the active profile for the running kernel. */
+    suspend fun measurementMergeDiff(): List<MeasurementMergeRow>
+
+    /** The active profile with every measured fact applied, ready to export. */
+    fun mergedProfileDocument(): String?
+
+    /* ---- legacy app-data cleanup (one-time) ---- */
+
+    /** What a pre-measured-db install left in app data. */
+    suspend fun legacyState(): LegacyProfileState
+
+    /** Renders one legacy document, optionally with the stored override applied. */
+    fun legacyProfileDocument(name: String, applyOverride: Boolean): String?
+
+    /** Deletes the legacy documents and the override. Only after confirmation. */
+    suspend fun finishLegacyCleanup(): Boolean
+
+    /** Single authority for loading, editing and exporting profile config. */
+    fun profileController(): ProfileConfigController
 
     suspend fun readDocument(uri: String): String
 
     suspend fun cacheDocument(uri: String, fileName: String): String
 
-    suspend fun publishOffsets(candidate: OffsetCandidate): String
-
-    /** Verbatim user-imported documents, newest first. */
+    /** Legacy app-data documents, newest first (cleanup screen only). */
     suspend fun userProfiles(): List<UserProfileFile>
-
-    suspend fun deleteUserProfile(name: String): Boolean
-
-    /** Returns the resulting file name, or null when the rename failed. */
-    suspend fun renameUserProfile(name: String, newName: String): String?
-
-    /** Renders a stored document as HOCON, writes it to Downloads and shares it. */
-    suspend fun exportUserProfile(name: String): String
-
-    /**
-     * Converts a legacy stored document into the current layout, stores the
-     * result as a new user document and returns its file name.
-     */
-    suspend fun convertUserProfile(name: String): String?
-
-    /**
-     * Opens an isolated editing session for the saved profile [name] (null for
-     * the current builtin source) and returns its resolved configuration. The
-     * session never touches the live attack controller until committed.
-     */
-    suspend fun beginEditSession(name: String?): ProfileConfig?
-
-    /** Controller of the open editing session, null when none is open. */
-    fun editSessionController(): ProfileConfigController?
-
-    /** True when the session edits the profile the attack controller loads. */
-    fun editSessionIsLive(): Boolean
-
-    /** File name edited by the open session; null when it edits the builtin. */
-    fun editSessionTarget(): String?
-
-    /** Copies the session overrides into the live controller. */
-    suspend fun commitEditSession(): Boolean
-
-    /** Updates the edited document in place with the session result. */
-    suspend fun saveEditSessionInPlace(): Boolean
-
-    /** Stores the session result as a new saved profile; returns its name. */
-    suspend fun saveEditSessionAsNew(): String?
-
-    /** Renders the session result as HOCON, writes it to Downloads, shares it. */
-    suspend fun exportEditSession(): String
-
-    /** Release the editing session targets; a stored document uses its own. */
-    fun editSessionRelease(): String?
-
-    fun endEditSession()
-
-    /** Single authority for loading, editing and exporting profile config. */
-    fun profileController(): ProfileConfigController
 
     suspend fun debugSettings(): DebugSettings
 

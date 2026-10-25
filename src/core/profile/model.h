@@ -124,6 +124,9 @@ namespace ghostlock::profile {
         std::optional<uint64_t> kernel_phys_offset;
         std::optional<uint8_t> compact_waiter;
         std::optional<uint32_t> kernelsnitch_collisions;
+        /* The mm_struct SLUB object stride, written only from a measurement
+         * (the generation picker or the root slabinfo read). Absence means
+         * the compiled default and the stride-agnostic scan. */
         std::optional<uint32_t> mm_struct_sz;
     };
 

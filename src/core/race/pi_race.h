@@ -52,6 +52,16 @@ namespace ghostlock::race {
         /* waiter -> owner -> consumer join order; idempotent. */
         [[nodiscard]] int32_t join() noexcept;
 
+        /* How long a route gives the consumer's call to come back before it
+         * treats the walk as wedged: generous against the 30 ms stamp window.
+         * On timeout the route stops retrying; the lifecycle's 2 s disarm
+         * still runs afterwards. */
+        static constexpr uint32_t kConsumerDrainMs = 1000;
+
+        /* Close the handshake and wait for the consumer's call: elapsed ms, or
+         * -1 on deadline. Userspace only; "inflight == 0" is then settled. */
+        [[nodiscard]] int32_t wait_consumer_idle(uint32_t deadline_ms) noexcept;
+
         /* Testable counter merge used by run(): Ok with zero calls or zero
          * successes is not a routed attempt. */
         [[nodiscard]] static ghostlock::route::RouteStatus outcome_with_counters(

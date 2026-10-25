@@ -80,8 +80,8 @@ namespace ghostlock::kernelsnitch {
 
     struct kernelsnitch_shared_state {
         /* The leak's address grid: inner candidate step and outer slab step
-         * order (0 = 4 KiB). The profile's mm_struct_sz feeds spray sizing
-         * only; it is not these fields. */
+         * order (0 = 4 KiB). The native MM_STRUCT_SZ default feeds spray
+         * sizing only; it is not these fields. */
         volatile size_t scan_inner;
         volatile size_t scan_outer_order;
         volatile size_t verbose;

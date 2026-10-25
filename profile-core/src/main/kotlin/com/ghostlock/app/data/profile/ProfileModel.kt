@@ -20,7 +20,6 @@ data class CoreProfile(
     val route: RouteKind?,
     val fallback: RouteKind?,
     val kernelsnitchCollisions: UInt,
-    val mmStructSz: UInt,
     val recommendations: SparseExecutionValues,
 )
 

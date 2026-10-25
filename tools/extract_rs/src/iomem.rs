@@ -3,7 +3,7 @@
 //! runs on a rooted device, or with an explicit `--iomem` dump.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::error::Result;
 
@@ -78,36 +78,57 @@ pub fn parse(text: &str) -> IomemInfo {
     }
 }
 
-/// Reads and parses an iomem source. With no explicit path it tries, in order:
-/// `/proc/iomem` (readable only as root), then the root child's cached dump
-/// `$GHOSTLOCK_HOME/.ghostlock_iomem`, then `/data/local/tmp/.ghostlock_iomem`.
-/// The cached file starts with a `# <release>` line, which the parser ignores.
+/// True when a parsed dump carries usable physical addresses.
+///
+/// `/proc/iomem` is readable without `CAP_SYS_ADMIN` on a restricted kernel,
+/// but the range starts are zeroed (`00000000-00000000 : Kernel code`). Using
+/// that dump would write `kernel_phys_load = 0` and a zero DRAM base into the
+/// profile, so it must fall through to the root child's cached dump.
+fn usable(info: &IomemInfo) -> bool {
+    match info.dram_base {
+        Some(base) if base != 0 => info.kernel_code_start != Some(0),
+        _ => false,
+    }
+}
+
+/// Reads and parses `/proc/iomem`, or an explicit dump.
+///
+/// There is deliberately no cache: the only in-app dump would be written by the
+/// native's root child after a successful run, and a successful run already
+/// proves the base/offset were right — it cannot inform the first run. A fresh
+/// device therefore gets `None`, the profile leaves the phys pair `null`, and
+/// the native's compiled `P0_KERNEL_PHYS_LOAD` / `P0_PHYS_OFFSET` apply. A
+/// rooted analysis context gets the real values from `/proc/iomem` or
+/// `--iomem`; a dump with zeroed addresses is never used.
 pub fn load(provided: Option<&Path>) -> Result<Option<IomemInfo>> {
-    if let Some(path) = provided {
-        let text = fs::read_to_string(path).map_err(|err| {
-            crate::error::ExtractError::new(format!("cannot read iomem {}: {err}", path.display()))
-        })?;
-        return Ok(Some(parse(&text)));
-    }
-
-    let mut candidates: Vec<PathBuf> = vec![PathBuf::from("/proc/iomem")];
-    if let Ok(home) = std::env::var("GHOSTLOCK_HOME") {
-        if !home.is_empty() {
-            candidates.push(Path::new(&home).join(".ghostlock_iomem"));
+    let (text, source) = match provided {
+        Some(path) => {
+            let text = fs::read_to_string(path).map_err(|err| {
+                crate::error::ExtractError::new(format!(
+                    "cannot read iomem {}: {err}",
+                    path.display()
+                ))
+            })?;
+            (text, path.display().to_string())
         }
-    }
-    candidates.push(PathBuf::from("/data/local/tmp/.ghostlock_iomem"));
-
-    for candidate in candidates {
-        if let Ok(text) = fs::read_to_string(&candidate) {
-            let info = parse(&text);
-            if info.dram_base.is_some() {
-                eprintln!("info: iomem source {}", candidate.display());
-                return Ok(Some(info));
-            }
+        None => match fs::read_to_string("/proc/iomem") {
+            Ok(text) => (text, "/proc/iomem".to_string()),
+            Err(_) => return Ok(None),
+        },
+    };
+    let info = parse(&text);
+    if !usable(&info) {
+        if info.dram_base.is_some() || info.kernel_code_start.is_some() {
+            eprintln!(
+                "warning: iomem {source} has no usable addresses; leaving the phys pair unset"
+            );
         }
+        return Ok(None);
     }
-    Ok(None)
+    if provided.is_none() {
+        eprintln!("info: iomem source {source}");
+    }
+    Ok(Some(info))
 }
 
 #[cfg(test)]
@@ -140,5 +161,27 @@ a2a80000-d4cfffff : System RAM
         let info = parse(text);
         assert_eq!(info.dram_base, Some(0x4000_0000));
         assert_eq!(info.kernel_code_start, Some(0x4009_0000));
+        assert!(usable(&info));
     }
+
+    #[test]
+    fn zeroed_addresses_are_not_usable() {
+        // What an unprivileged `/proc/iomem` read looks like with
+        // kptr_restrict=2: the ranges are present, their starts are zero.
+        let text = "\
+00000000-00000000 : System RAM
+  00000000-00000000 : Kernel code
+";
+        let info = parse(text);
+        assert_eq!(info.dram_base, Some(0));
+        assert_eq!(info.kernel_code_start, Some(0));
+        assert!(!usable(&info));
+    }
+
+    #[test]
+    fn a_missing_kernel_code_range_still_has_a_usable_dram_base() {
+        let info = parse("40000000-4807ffff : System RAM\n");
+        assert!(usable(&info));
+    }
+
 }

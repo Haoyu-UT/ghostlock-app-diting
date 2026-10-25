@@ -35,11 +35,7 @@ class NativeDocumentEquivalenceTest {
         try {
             val controller = AndroidProfileConfigController(
                 context = context,
-                filesDir = root,
-                userProfiles = UserProfileStore(
-                    directory = root.resolve("user_profiles"),
-                    assetLoader = AssetConfigLoader(context),
-                ),
+                externalProfiles = FakeExternalProfileStore(),
                 preferences = context.getSharedPreferences("native-doc-equivalence", 0)
                     .also { it.edit().clear().commit() },
             )

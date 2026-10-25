@@ -417,3 +417,119 @@ rate is a measurement, not a model); (b) find a carrier outside the set measured
 starts at depth <= 0x1c0 with L >= 0x78 (the band's mouth is ~0x1c0-0x1c0+L-0x58); or (c) accept
 the floor at 5.10.136 and ship the three supported builds. What is *ruled out* is the cheapest
 idea -- parking the victim somewhere shallow after the stamp.
+
+## Rate by kernel: 5.10.81 vs 5.10.236 (2026-10-24)
+
+The sigreturn route is not uniformly bad; its rate tracks the strip's exposure to the
+context-switch writer, and that exposure changed with the kernel's frame geometry.
+
+**Measured rates.**
+
+| kernel / build | route | completed | failure census |
+|---|---|---|---|
+| 5.10.81 era rig (2026-10-13) | sigreturn | **4/5** | one deep W3 `TIF_SECCOMP` hang; no `+0x188` |
+| 5.10.236, legacy test profile (2026-10-17) | sigreturn | **8/15 (53 %)** | every failure `+0x188` |
+| 5.10.236, fork line 2×2 (2026-10-20) | sigreturn | **5/12 (42 %)** | 7/7 crashes `+0x188` |
+| 5.10.236, same 2×2 | select_stack | **11/11 (100 %)** | no select crash |
+
+The 81 row is `external/port/k81/era-rate/`; the 236 rows are
+`external/port/nice-route/RESULT-partial.md` and the legacy sigreturn test series. The route pooled
+11/11 vs 5/12 at p = 0.0046 (exploratory, partial series); the 81-vs-236 difference is directional
+but not statistically established at n = 5 vs 12/15 (Fisher p ≈ 0.2–0.35). The 236 select result is
+the strong, same-kernel comparison.
+
+**The geometry delta.** The strip depth below the syscall entry sp is **0x210 on 5.10.236** and
+**0x1c0 on 5.10.81/101** (the 0x50 is `do_futex`'s frame, 0x70 vs 0x20; carrier study above). The
+sigreturn copy destination is 0x300 on both, so `waiter_off_plain` is **0xf0 on 236** and
+**0x140 on 81** — the 236 strip is 0x50 closer to the copy destination / 0x50 deeper below the
+entry. The 236 extractor derives the same shift independently: `off_plain = 0xf0`,
+`off_sve = 0x100`, `copy_dst_plain = 0x300`, `strip_home = 0x210`; the 81/43 family is
+`0x140/0x150`. The route's copy loop and timing are unchanged (`copies=61 misses=0 drain=0ms`,
+500 µs on both), so the copy-count/interval levers are not the difference.
+
+**The failure class.** `external/port/strip-writer/`: the `+0x188` writer is an interrupt-triggered
+context switch on the victim's stack (`__switch_to`'s sp descends past the strip); the consumer's
+walk then reads the clobbered lock word. On 236 every sigreturn failure is that class; on the 81 era
+rig the single failure was a W3 hang and none of the 4/5 completed runs carried crash text. The
+236 strip is 0x50 deeper and the 236 kernel's entry/switch frames reach it (the strip-writer
+probes); the 81 frames (and the era userspace) evidently did not, or far less often. The exact
+frame-size split between the two kernels is not measured — the strip depth is, and the class is.
+
+**5.10.43.** The zeus 5.10.43 profile carries the 81-family sigreturn offsets (`0x150/0x140`) and
+was verified only as a profile (QEMU/on-device parity); it was never run as a chain. If it were, the
+geometry predicts 81-like behaviour, not 236-like — but this is unmeasured.
+
+**Consequence for the release.** On 236 the shipped route is **select_stack** (11/11 vs 5/12 in
+the same series); sigreturn remains for 81/101, where select is infeasible (the 0x50 frame gap).
+A future 236 sigreturn improvement is structural — move the strip out of any depth a kernel
+entry/switch frame traverses, which is what the select fd_set surface already does — not a timing
+knob; the EL0 copy interval is saturated at 500 µs.
+
+**Which line those numbers belong to.** The 11/11 is the **clean dev line** `port/diting-5.10` @
+`0cf2878`. The document-based release candidate does not contain that line (its routes lack the
+per-attempt `support::ghost_disarm` and the rest of `9bacaf6`), and its own 5-run document-line
+series measured **2/5** (2 box deaths after `Write 1`, 1 W2). That 2/5 is a document-line result,
+not a select-route result; the route ranking above stands on the clean line. The extractor plan's
+Priority 1 is to **port the clean line's missing fixes into the working branch** (at minimum
+`9bacaf6`'s per-attempt `support::ghost_disarm`, plus the bounded drain and W2 robustness) — the
+clean line stays the curated dev line; the working/release branch receives the fixes.
+
+**2026-10-24 post-mortem — the port was attempted, regressed, and was reverted.** On the same
+rig/day, the clean line re-read **5/5** with the S1 APK (`external/port/cleanline-recheck/`). The
+port of `9bacaf6`'s attempt protocol onto `feat/extractor-5x-geometry` was then A/B'd on fresh
+boots: pre-port completed (`ab-pre` 1/1 + the prior 2/5), while the ported build wedged in **all
+three** route-reaching runs (`r3`, `ab-post`, `ab-post2`): `pselect post-select ... drain=-1ms` /
+`pselect consumer still inflight` → dirty failure → box reset. Raising `kConsumerDrainMs` 1000 →
+3000 ms did not change it. The patch is saved at
+`external/port/extractor-5x-port/port-code-{1s,3s}.patch`; the working tree was reverted to
+`e510ea9`. The disarm/drain is **not** an independently transplantable fix: on the document line
+the consumer's call does not return while the route waits, whereas the clean line's returns in
+100–230 ms.
+
+**Top suspects for the line difference** (ranked; each postdates the 11/11):
+
+1. **Spray slab stride / object count.** The clean 236 profile carries
+   `kernelsnitch.mm_struct_sz = 960`; `prepare_kernel_page()` computes
+   `mm_objs_per_slab = ORDER3_SIZE / stride` = **34**. The document line removed the field
+   (`95016e9`) and now uses `MM_STRUCT_SZ = 0x500` → **25** objects/slab
+   (`src/core/support/util.cpp:667`). Every spray array scales (prepare 8×34 vs 8×25; spray
+   `(1+MM_PARTIALS)×`; pre/post), so the heap grooming and the leaked page differ. This is the
+   single most direct difference between today's 5/5 and the 2/5 series; the document runs'
+   page-prep rejections (`page ... stores an even byte over selinux_state.initialized`) are
+   consistent with the changed leak page.
+2. **KernelSnitch scan grid.** The clean line still scans with the profile stride (960, `MM_ORDER`)
+   in two passes and leaks in **~0.86–0.94 s** (native logs `+122ms` → `+982ms`). The document
+   line's `7f859eb` grid (`SCAN_PRIMARY_INNER=32`, `SCAN_LAST_RESORT_INNER=8`,
+   `SCAN_OUTER=4096`, four passes, `ranges=14 source=banks`) leaks in **~4.4–4.6 s**; the longer
+   scan changes the heap state at route time and the page that is leaked. The 4 KiB outer grid
+   also removed the slab-order assumption the clean line still relies on.
+3. **Attempt protocol (bounded drain + per-attempt disarm).** The clean line has it; the document
+   line lacks it. The port showed it is coupled to suspects 1–2: with 25 objects/slab and the
+   4.5 s scan, the consumer's walk does not return within 3 s while the route waits, and the
+   clean-line protocol turns that into a fatal dirty failure; the pre-port route retried and
+   completed. Re-port it only after the spray/scan baseline is restored.
+4. **Lower:** the fd fix (`072579c`), the anchor (`select_lock_anchor`), the consumer thread and
+   the profile's tuning values are present and equal on both lines (the profile value diff is the
+   stride only); the document line's added routes (multicast) are not selected by the 236 profile.
+
+**Next test, in order:** (a) force the 960 stride on the document line (temporarily, by restoring
+the profile field or the native default) and run a 5-run fresh-boot series; if the rate returns to
+the clean line's, the stride removal was the regression; (b) if not, restore the stride-based scan
+for the 5.10 profile and repeat; (c) then re-port the attempt protocol. The clean line stays
+curated and unchanged.
+
+**Result (2026-10-24, `external/port/stride960-recheck/`): forcing 960 gives 4/5.** r1 was a box
+reset at W2 attempt 1 (the old W2 class, not a select/page-prep failure); r2–r5 reached
+`KernelSU ready`. Page prep accepted 8–14 pages in every 960 run, against 0–1 in the zero-accept
+1280 fresh boots. The stride removal was the main regression; (b) is not needed for the recovery —
+the stride-agnostic scan stayed in place and still reached 4/5. Next (decided 2026-10-24): the
+**measured stride** — the candidate set (960/1024/1088/1216/1280) is probed by the leaked
+`mm_struct`'s offset in its 32 KiB slab (`leaked & (ORDER3_SIZE-1)` must be a multiple of the
+candidate); the clean-line logs already pick 960 and reject the rest. The generated profile carries
+the verified value (the QEMU harness reads `/proc/slabinfo` for host-side generation); at runtime
+the measured value is a per-kernel read-only DB entry, and the user applies it only by merging it
+into a profile and exporting that profile (the `PORT-PLAN.md` Priority 1 storage/measurement
+model). Use the value for the spray and an object-aligned first scan pass, with the full 32/8 grid
+as fallback; an unknown stride still tries with the compiled default. The attempt protocol is
+not re-ported now: the 4/5 came without it, and the earlier A/B showed it is not independently
+transplantable.

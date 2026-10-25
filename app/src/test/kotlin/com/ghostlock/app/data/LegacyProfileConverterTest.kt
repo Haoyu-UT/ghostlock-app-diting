@@ -29,7 +29,12 @@ class LegacyProfileConverterTest {
 
         assertFalse(entry.containsKey("kimage_text_base"))
         assertFalse(entry.containsKey("btf_size"))
-        assertEquals(0x400, entry["kernelsnitch"].asValueMap()!!["mm_struct_sz"])
+        /* The legacy flat SLUB stride key moves into the kernelsnitch block;
+         * the 6.x collisions default is seeded as before. */
+        val snitch = entry["kernelsnitch"].asValueMap()!!
+        assertEquals(4L, snitch["collisions"])
+        assertEquals(0x400, snitch["mm_struct_sz"])
+        assertFalse(entry.containsKey("mm_struct_sz"))
         assertEquals(132, entry["task_struct"].asValueMap()!!["prio"])
         assertEquals(33420800L, entry["offset"].asValueMap()!!["init_task"])
         assertEquals("tcp_zerocopy", entry["route"].asValueMap()!!.keys.first())

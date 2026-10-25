@@ -65,6 +65,8 @@ namespace ghostlock::route::tcp_zerocopy {
         std::atomic<int32_t> punch_phase;
         std::atomic<int32_t> punch_failed;
         int32_t route_won = 0;
+        /* A call that outlived the drain: destroy() retains every resource. */
+        int32_t consumer_stuck = 0;
         ghostlock::route::RouteStatus status{};
 
     private:

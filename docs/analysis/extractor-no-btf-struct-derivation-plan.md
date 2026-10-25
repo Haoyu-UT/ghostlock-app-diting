@@ -125,6 +125,106 @@ flowchart TD
 前置依赖：阶段 2/3 的锚点必须用**目标或同类镜像**核对（无 BTF 真值 vs BTF 真值对拍），
 需要 `5.15.180` 或任一可屏蔽 BTF 的镜像文件；无镜像只能停在阶段 1 + 单元测试。
 
+## 方法论的版本泛化性与边界（2026-10-23）
+
+本节回答审查者必然提出的问题：反汇编推导在多大程度上适用于其他内核版本。结论先行：
+**流水线是版本泛化的，锚点集是按 ABI 家族扩展的**；跨家族的输出在验证前一律是
+Unknown/省略，不会产出错误 profile。
+
+### 与版本无关的部分
+
+- **符号定位**：全部锚点经恢复的 kallsyms 定位后从镜像反汇编取得；基址与 KASLR
+  slide 均来自镜像本身，不写死地址。
+- **数据形状锚点**（`structs.rs`）：`comm` 取唯一 8 字节对齐、NUL 结尾的 `"swapper"`；
+  `real_cred`/`cred` 取两个相邻的 `init_cred` 指针；`sched_task_group` 取唯一的 root
+  task group 指针；`prio`/`normal_prio` 取唯一三个相等的 100..=139 优先级；caps 取
+  `init_cred` 中最长的等值掩码串。这些锚点只约束**关系**，偏移是输出而非输入：字段
+  移动位置仍可恢复，只要关系不变。
+- **栈帧算术**（`derive_pselect_layout`、`derive_sigreturn_layout`）：shift 与 sigreturn
+  偏移由镜像自身的 `sub sp`/`stp`/`adrp+add`/访存指令算出，编译器帧变化会随之变化。
+  固定常量只有分类器（`off + 0x58 <= 0x200`、`delta/8 <= 4`），它们描述 route 自己的
+  字表，不是内核布局。
+- **BTF 路径**：结构布局自描述、版本无关；反汇编推导只是无 BTF 时的回退。
+- **失败语义**：每个锚点可独立失败，失败即省略/Unknown，绝不猜测；模板与 patch-range
+  只在 IKCONFIG 指纹匹配时启用，且逐字段标记来源。版本漂移因此是安全退化，而不是
+  静默出错。
+
+### 需要按家族扩展的部分
+
+模式匹配器编码的是字段在机器码中的**用法**，不保证跨版本稳定：
+
+- `copy_process` 的 pid 锚点匹配 `ldr wD, [pid, #0x60]` + `str`：`0x60` 是 `struct pid`
+  内 `numbers[0].nr` 的 5.10 布局常量；该偏移变化则匹配不到。
+- PI 四连零存储编码 5.10 的两字 `plist_head`：要求 `waiters+8` 为 list head 第二字、
+  `pi_top_task = waiters+0x10`、`pi_blocked_on = top+8`，且 `pi_lock` 在 `waiters` 前
+  0x40 内；plist 或字段顺序改变即失效。
+- 辅助函数按**符号名**定位：`__arm64_sys_pselect6`、`core_sys_select`、`do_futex`、
+  `futex_wait_requeue_pi`、`__arm64_sys_rt_sigreturn`、`restore_sigframe`、
+  `restore_fpsimd_context`、`restore_sve_fpsimd_context`。内联、改名或新增辅助层会使
+  调用链校验失败并正确返回 Unknown（`do_pselect` 已按可选符号处理）。
+- `WaiterLayout` 无 BTF 时回退 `family::waiter_layout_5_10()`（`pi_tree 0x18`、
+  `task 0x30`、`lock 0x38`），由 `is_5_10(release)` 选择；5.15/6.1 需要补一行常量表。
+- `nf_logger` 的 `type` 偏移 8 与 `ULOG=1`/`MAX=2`/`NFPROTO_UNSPEC=0` 是本 ABI 世代的
+  结构事实。
+
+### 已测得的边界
+
+- 同一 ABI 家族内：14 个镜像（5.10.43–5.10.246，跨补丁版本、ROM 配置与构建变体）
+  全部通过 `tests/structs_ondevice.rs` 的逐字段对拍。
+- 同版本、不同编译配置即可破坏匹配器：自定义 LTO/`-Os` 的 5.10.236 只闭合 6 个字段
+  （`init_task` 数据锚点）；系列模板补齐其余字段，profile 仍正确——但 out-of-series
+  的同类镜像可能只能得到部分字段。
+- 编译器变体实测（2026-10-23，同一份源码与配置）：`-Os+FullLTO` 下 `copy_process` 的
+  9 个锚点全部失效、`init_task` 数据锚点与 cred caps 仍闭合（6/15），模板补齐；
+  `-Os+LTO_NONE+CFI off` 下模板因指纹不匹配（`CONFIG_CFI_CLANG`）而停用，输出只剩
+  6 个字段、路由全部 Unknown——这是设计允许的安全降级，不是错误值。
+- **限制及其可缓解性（2026-10-24，同日随后移除）**：`mm_struct_sz` 曾是 SLUB stride，不是
+  `sizeof(mm_struct)`，无法仅从 Image 推导（BTF 给 sizeof；slab 合并/对齐会改变对象大小，
+  6.1 为 0x3c0 对 1024）。**已在 `7f859eb` 把 leak 改为 stride-agnostic 扫描后，从 profile
+  契约中整体移除了该字段**：主路径 S=32、兜底 S=8、外层 4 KiB；spray sizing 使用 native 的
+  `MM_STRUCT_SZ` 默认值，提取器不再输出任何 stride 猜测。**设备实测（2026-10-24，
+  microbenchmark，40 GiB 直接映射跨度，6 线程）**：S=960 0.8 s，S=32 20 s，S=8 80 s；
+  外层 4 KiB 与 32 KiB 同价；tag 扫描（V=15）在 S=32 下 263 s；按 iomem RAM bank 过滤
+  （~13 GiB）可再降约 3×。设备门禁中 bank 过滤后实际 leak 为 0.9–4.0 s；错误的 profile
+  stride（1024）不再影响 leak 结果。设计与完整实测见
+  [`kernelsnitch-stride-fallback-plan.md`](kernelsnitch-stride-fallback-plan.md)。
+- **可部署性由另一组不变量决定**，与提取器的布局判断无关：vermagic、7,252 个导出符号的
+  CRC/class/namespace、`module_layout` CRC。测试镜像的 `meta.txt` 以
+  `deployable = yes/no` 标注；本轮只有 ksun-osize 满足（与 stock 的 vermagic/KMI 逐字节
+  一致，已 RAM boot 与烟测），另两个变体缺 `-ab14313284` 后缀或 CFI，仅供离线提取测试。
+- 跨家族（5.15/6.1）**未验证**：测试镜像库只含 5.10；6.1 设备有 BTF，提取走 BTF 路径，
+  反汇编锚点未在该家族上对拍。issue 213 的 `5.15.180` 是第一个跨家族候选。
+
+### 编译器变体：布局不变，模式会变
+
+编译器参数（`-Os`、LTO）改变的是指令选择与内联边界，不是 `offsetof`：
+
+- **结构布局由配置与源码 ABI 决定**，与优化级别无关。因此只要 IKCONFIG 指纹命中
+  已测系列，模板补齐的字段在任意编译参数下都正确——`ksun-osize` 正是如此：只闭合
+  6 个字段（全部来自 `init_task` 数据锚点），其余由系列模板补齐，profile 仍然正确。
+- **代码模式是编译器相关的假设**：LTO 跨符号内联、`-Os` 改用 `str wzr`/`stp`/重排，
+  `copy_process` 里"连续四条零存储"这类惯用法可以整体消失。数据形状锚点（`comm`、
+  相邻 cred 指针、相等优先级串）不受影响——`ksun-osize` 的 6 个字段即为证据。
+- **栈帧本质上编译器相关**，因此 route 几何从不查表，而是逐镜像从指令算出。
+
+所以限界只在**配置出系列 + 无 BTF + 非常规编译**三者叠加时出现：模板不可用、模式
+弱化，得到的是"部分字段"的 unverified candidate。缓解手段按代价排序：自建内核直接
+开 `CONFIG_DEBUG_INFO_BTF`（与编译器无关，直接移除无 BTF 路径）；谓词匹配 + 系列
+模板（已实现）；惯用法归一化（`wzr`/`xzr` 互换、接受 `stp` 成对存储、放宽符号窗口、
+内联缺失时按符号改反汇编被调函数）；按家族补锚点；以及可观测镜像上的运行时真值
+（QEMU `/proc/kallsyms` + `/proc/slabinfo`、kprobe 回读、自建内核的 DWARF）。
+四者皆不可得时没有自动解法——此时输出保持省略并标注未验证，这是拒绝，不是错误
+profile。
+
+### 检测与升级路径
+
+- **检测**：逐字段 `field_source` 日志 + IKCONFIG 系列谓词 + QEMU 内核真值对拍
+  （启动同一镜像，读 `/proc/kallsyms` 与 `/proc/slabinfo`，比对十项 offset 与锚点）。
+  反汇编推导在通过该对拍之前只是假设。
+- **升级一个新家族**：补 waiter 常量行 → 按该家族的符号名与代码形状调整锚点 → 用该
+  家族的 BTF 镜像屏蔽 BTF 做逐字段真值对拍 → QEMU 十项对拍。在此之前输出为
+  Unknown/省略的 unverified candidate，不会成为"已验证"。
+
 ## 明确保留
 
 - BTF 解析与 BTF 优先路径、`derive_pselect_layout` 的算法与不变量、`unverified candidate` 语义、
@@ -132,8 +232,52 @@ flowchart TD
 
 ## 进度
 
-- [ ] 阶段 1：`WaiterLayout` + waiter 字段交叉验证；`derive_pselect_layout` 去 BTF
-- [ ] 阶段 1：`nf_logger.type` 无 BTF 常量路径
-- [ ] 阶段 2：`task_struct` 主要字段推导（cred/real_cred/pid/tgid/tasks/prio/normal_prio/seccomp/comm + PI 组）
-- [ ] 阶段 3：`sched_task_group`、`atomic_flags`、`cred` 布局、`page`/`slab`/`mm_struct`
-- [ ] 真相机对拍与真机门禁归档
+- [x] 阶段 1：`WaiterLayout` + waiter 字段交叉验证；`derive_pselect_layout` 去 BTF
+- [x] 阶段 1：`nf_logger.type` 无 BTF 路径（2026-10-23）。**修正**：`type` 是
+      `struct nf_logger` 的第二字段，偏移 **8**（不是首字段 0）；无 BTF 用常量
+      `ULOG=1`/`MAX=2`/`NFPROTO_UNSPEC=0`，结构校验通过后取实测 KASLR 锚点
+      `loggers+0x10`（不是 ULOG 槽 `loggers+8`）。14 个镜像全部通过，值等于各
+      profile 的 `offset.slide_loggers_0_1`/`slide_nfulnl_logger`。
+- [x] 阶段 2：`task_struct` 主要字段推导（2026-10-21）：`init_task` 数据锚点恢复
+      `comm`/`cred`/`real_cred`/`sched_task_group`/`prio`/`normal_prio`，`copy_process`
+      锚点恢复 `pid`/`tgid`/`tasks` 与四个 PI 字段，共 13/15；`seccomp` 于 2026-10-23
+      增加 `__secure_computing`/`copy_seccomp` 锚点（见进度末条），现为 14/15；
+      `atomic_flags` 无稳定单锚点，按设计省略。**限制（2026-10-22）**：自定义 LTO/`-Os`
+      5.10.236 Image（`ksun-osize`）的 `copy_process` 模式改变，只闭合 6 个字段
+      （`init_task` 数据锚点）；系列指纹匹配时模板补齐其余字段，profile 仍正确，
+      但非默认编译器配置的 out-of-series 镜像可能只能得到部分字段。
+- [x] 阶段 3（部分）：`cred` 的 caps 与 refs 从 `init_cred` 推导（caps 40/5，refs
+      128/136/144，`copy_size` 仍为系列常量）；`atomic_flags`、`page`/`slab`/`mm_struct`
+      未推导。
+- [x] 5.10 真相机对拍（2026-10-21）：14 个测试镜像逐字段等于实测系列
+      （`tests/structs_ondevice.rs`）；BTF 屏蔽对拍与真机门禁未做（镜像库无带 BTF 的 5.10 镜像）。
+- [x] 跨家族对拍（2026-10-23）：新增 `tests/families_ondevice.rs`。6.1.138（POCO
+      `duchamp`，内置 BTF）对拍 app 的 bundled profile：`route`/`task_struct`/`cred`/
+      `kernelsnitch`/`offset` 的 51 个非空字段全部相等（`include` 展开后比较）；
+      `--no-disasm` 负向断言确认不会泄漏 5.10 的 `loggers+0x10`。镜像与 `meta.txt`
+      入 `external/test-kernels/6.1.138-android14-11-g44bda9e8f6e9-ab13792638/`
+      （`profile.conf` 为同 release 的 bundled 资产，上游来源、非本仓库真机验证）。
+- [x] `loggers` 无 BTF 回退按家族门控（2026-10-23）：`symbols::loggers_anchor_fallback`。
+      有 BTF 时用枚举索引（`loggers+ulog*8`，6.1 实测 `+8`）；5.10 系列保留实测
+      `+0x10` 并记为 heuristic；其他家族无 BTF 时省略，不再输出外来常量。65 个提取器
+      单测、14 镜像 `structs_ondevice`、6.1 跨家族对拍全绿。
+- [x] BTF 屏蔽真值对拍（2026-10-23）：4 个 Pixel 7 `panther` 5.10 镜像
+      （5.10.157/189/209/214，内置 BTF）→ `tests/btf_truth_ondevice.rs`。结果：
+      实测系列的 15/15 字段等于镜像 BTF；已推导字段全部等于 BTF；cred caps
+      `0x28/5`、refs `[128,136,144]` 与 BTF 一致。**新发现**：这些 vendor 编译器下
+      `copy_process` 锚点只闭合 6/15（全部是 `init_task` 数据锚点），而 IKCONFIG 指纹
+      仍然匹配、模板补齐其余字段——模式对编译器比预想更敏感，`init_task` 数据锚点
+      是目前唯一跨代码生成稳定的来源。profile 仍正确；out-of-series 镜像需注意覆盖度。
+- [x] 代码生成矩阵（2026-10-23）：从 `external/diting-mcast` 已有的 vmlinux 生成并入库
+      三个变体（ksun `-Os+FullLTO+CFI+KSU`、full-osize `-Os+FullLTO+CFI`、
+      full-none-os `-Os+LTO_NONE+CFI off`）。新增 `tests/codegen_ondevice.rs`，以
+      `meta.txt` 的 `series`/`template`/`min_derived_task_fields` 驱动：所有非空
+      `task_struct` 值必须等于实测系列（soundness），`template:` 只允许在指纹匹配时出现，
+      指纹不匹配只允许 derived/null，`nf_logger` 失败必须标 heuristic，`--no-disasm`
+      也必须标 heuristic。三个变体全部通过，每个变体都保留了 6 个 `init_task` 数据锚点。
+- [x] `task_seccomp` 锚点（2026-10-23）：主锚点是 `__secure_computing` 里
+      `current->seccomp.mode` 的 32 位载入（`mrs x, SP_EL0` 后 `ldr w, [x, #0x848]`），
+      `copy_seccomp` 的 16 字节结构拷贝（`ldr`/`ldp` 成对、偏移差 8）为回退，
+      `__seccomp_filter` 为第二候选。14 个 5.10 镜像全部闭合为 **2120**；4 个 panther
+      镜像的 BTF 真值也是 2120，推导值与之一致；3 个代码生成变体同样闭合（7 个字段）。
+      **gotcha**：反汇编器把 SP_EL0 输出为编码名 `s3_0_c4_c1_0`，不是别名 `sp_el0`。
