@@ -45,6 +45,16 @@ is uncommitted for the operator to review):
   follows the merger's rule (`LegacyProfileExport`): same branch merges field-wise, a different
   branch replaces; nulls keep the document's value. Verified on the device with the repaired
   export, then the legacy data was exported and deleted.
+- **Stride picker (extractor branch, then rebased)** — the old English list of
+  `N/M rounds · X objects/slab` rows became an evidence-led sheet in `6301413` on
+  `feat/extractor-5x-geometry`: one recommendation, a level (Confirmed / Consistent / Mixed /
+  Insufficient) with a localized reason, radio alternatives, the raw table behind technical
+  details, and Skip as its own action. `feat/measured-db` was committed (`23c00ec`) and rebased
+  onto it; the rebased flow keeps the sheet, uses the export footer, and feeds it the
+  root-measured fact (`rootMeasuredStride`) so a kernel with a DB fact shows **Confirmed**.
+  Device-checked on versionCode 651: the sheet rendered `960 字节 / 已确认`, the reason, the
+  alternatives, the details expander, and the SAF export on "Use"; record `stride-picker-zh.png`
+  in `external/port/measured-db-2026-10-25/`.
 
 
 ## Why
