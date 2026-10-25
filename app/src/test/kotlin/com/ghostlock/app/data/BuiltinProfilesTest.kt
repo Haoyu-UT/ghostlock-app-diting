@@ -48,11 +48,7 @@ class BuiltinProfilesTest {
         try {
             val controller = AndroidProfileConfigController(
                 context = context,
-                filesDir = root,
-                userProfiles = UserProfileStore(
-                    directory = root.resolve("user_profiles"),
-                    assetLoader = AssetConfigLoader(context),
-                ),
+                externalProfiles = FakeExternalProfileStore(),
                 preferences = context.getSharedPreferences("builtin-profiles", 0)
                     .also { it.edit().clear().commit() },
             )
@@ -110,11 +106,7 @@ class BuiltinProfilesTest {
         try {
             val controller = AndroidProfileConfigController(
                 context = context,
-                filesDir = root,
-                userProfiles = UserProfileStore(
-                    directory = root.resolve("user_profiles"),
-                    assetLoader = AssetConfigLoader(context),
-                ),
+                externalProfiles = FakeExternalProfileStore(),
                 preferences = context.getSharedPreferences("editor-fields", 0)
                     .also { it.edit().clear().commit() },
             )

@@ -36,16 +36,16 @@ class ControllerInternalsTest {
     ) = runBlocking {
         val root = Files.createTempDirectory(name).toFile()
         try {
+            /* These tests drive the UI projections through edits, so they need
+             * a session controller: the live one has no edit layer at all. */
             val controller = AndroidProfileConfigController(
                 context = context,
-                filesDir = root,
-                userProfiles = UserProfileStore(
-                    directory = root.resolve("user_profiles"),
-                    assetLoader = AssetConfigLoader(context),
-                ),
+                externalProfiles = FakeExternalProfileStore(),
                 preferences = context.getSharedPreferences(name, 0)
                     .also { it.edit().clear().commit() },
                 deviceCodename = device,
+                overrideStore = MemoryOverrideStore(),
+                forcedSelection = ProfileSelection.Bundled(release),
             )
             block(controller)
         } finally {
@@ -96,7 +96,7 @@ class ControllerInternalsTest {
     fun `switching routes prunes the previous branch from the override`() =
         withController("controller-tree-prune") { controller ->
             controller.updateRoute(release, pair, "multicast_waiter")
-            val snapshot = controller.overridesSnapshot(release)
+            val snapshot = controller.overrideSnapshot(release)
             val branches = snapshot["route"].asValueMap()?.keys.orEmpty()
             assertEquals(listOf("multicast_waiter"), branches.toList())
             assertFalse(snapshot["fallback"].asValueMap()?.containsKey("route") == true)

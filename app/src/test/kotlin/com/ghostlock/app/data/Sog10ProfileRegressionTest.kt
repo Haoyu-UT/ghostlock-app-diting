@@ -27,11 +27,7 @@ class Sog10ProfileRegressionTest {
         try {
             val controller = AndroidProfileConfigController(
                 context = context,
-                filesDir = root,
-                userProfiles = UserProfileStore(
-                    directory = root.resolve("user_profiles"),
-                    assetLoader = AssetConfigLoader(context),
-                ),
+                externalProfiles = FakeExternalProfileStore(),
                 preferences = context.getSharedPreferences("sog10-profile", 0)
                     .also { it.edit().clear().commit() },
             )

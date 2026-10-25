@@ -5,12 +5,17 @@ import androidx.core.net.toUri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.ghostlock.app.R
+import com.ghostlock.app.data.MeasuredProfileStore
 import com.ghostlock.app.domain.model.CpuPair
+import com.ghostlock.app.domain.model.ExternalProfileInfo
 import com.ghostlock.app.domain.model.KernelSnapshot
+import com.ghostlock.app.domain.model.LegacyProfileState
 import com.ghostlock.app.domain.model.LogTone
-import com.ghostlock.app.domain.model.OffsetImportResult
+import com.ghostlock.app.domain.model.MeasuredKernelInfo
+import com.ghostlock.app.domain.model.MeasurementMergeRow
 import com.ghostlock.app.domain.model.ParseResult
 import com.ghostlock.app.domain.model.ProfileConfig
+import com.ghostlock.app.domain.model.ProfileDiffRow
 import com.ghostlock.app.domain.model.RunLogEntry
 import com.ghostlock.app.domain.model.ProfileFieldNode
 import com.ghostlock.app.domain.model.RouteVerdict
@@ -19,7 +24,6 @@ import com.ghostlock.app.domain.model.StrideProbe
 import com.ghostlock.app.domain.repository.GhostlockRepository
 import com.ghostlock.app.domain.repository.ProfileConfigController
 import com.ghostlock.app.domain.usecase.FormatLogUseCase
-import com.ghostlock.app.domain.usecase.ImportOffsetsUseCase
 import com.ghostlock.app.domain.usecase.LoadKernelSnapshotUseCase
 import com.ghostlock.app.domain.usecase.ParseSourceUseCase
 import com.ghostlock.app.domain.usecase.ReadDocumentUseCase
@@ -51,7 +55,7 @@ sealed interface GhostlockEffect {
 
 private const val OverwriteSummaryLimit = 12
 
-enum class DocumentRequest { ImportOffsetsHocon, ImportOffsetsJson, BootImage, XblImage, PayloadImage, UefiImage, VendorBootImage }
+enum class DocumentRequest { SelectProfile, BootImage, XblImage, PayloadImage, UefiImage, VendorBootImage }
 
 /** Options offered by [promptBootAttach], in display order. VENDOR_BOOT is
  * only ever added to that list for MediaTek devices */
@@ -68,7 +72,6 @@ class GhostlockViewModel(
     private var running = false
     private val loadKernelSnapshot = LoadKernelSnapshotUseCase(repository)
     private val selectCpuPairUseCase = SelectCpuPairUseCase(repository)
-    private val importOffsetsUseCase = ImportOffsetsUseCase(repository)
     private val parseSourceUseCase = ParseSourceUseCase(repository)
     private val readDocumentUseCase = ReadDocumentUseCase(repository)
     private val runExploitUseCase = RunExploitUseCase(repository)
@@ -96,8 +99,22 @@ class GhostlockViewModel(
     /** The generated document and its stride evidence, held while the picker is up. */
     private var pendingStrideParse: ParseResult.Parsed? = null
     private var pendingStrideProbe: StrideProbe? = null
+    /** In-memory generated document; never stored until the user exports it. */
     private var pendingStrideDocument: String? = null
+    private var pendingStrideName: String? = null
     private var pendingStrideRelease: String? = null
+
+    /** The document text and behaviour waiting for the user's export destination. */
+    private data class PendingProfileWrite(
+        val text: String,
+        val suggestedName: String,
+        /** Offer to select the written document for the next run. */
+        val selectAfterWrite: Boolean,
+    )
+
+    private var pendingProfileWrite: PendingProfileWrite? = null
+    /** URI of a just-written profile awaiting the "use it?" confirmation. */
+    private var pendingSelectUri: String? = null
 
     /** The layer notice is decided once per process, from the first resolution. */
     private var layerNoticeChecked = false
@@ -111,6 +128,7 @@ class GhostlockViewModel(
             markInterruptedRunLogs()
             applyRecommendedShizuku()
             maybeSuggestShizukuForW3()
+            refreshLegacyState()
         }
     }
 
@@ -187,6 +205,7 @@ class GhostlockViewModel(
         val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) ?: return
         viewModelScope.launch(Dispatchers.IO) {
             applyExecutionConfig(profileController.load(snapshot.kernelRelease, pair), preserveEditing)
+            refreshMergeRows()
         }
     }
 
@@ -202,12 +221,32 @@ class GhostlockViewModel(
                 profileRoute = config.route,
                 profileFallback = config.fallbackTo,
                 activeBuiltinProfile = profileController.activeBuiltinRelease(),
-                activeUserProfile = profileController.activeUserProfile(),
+                externalProfile = profileController.activeExternalProfile(),
+                activeUserProfile = config.layers
+                    ?.takeIf { it.externalApplied }
+                    ?.external,
                 profileLayers = config.layers,
                 customCpuPair = customCpuPairOf(config),
             )
         }
         if (!preserveEditing) maybeRaiseLayerNotice(config)
+    }
+
+    /** Recomputes the facts the home merge would change; cheap, runs on IO. */
+    private suspend fun refreshMergeRows() {
+        val rows = runCatching { repository.measurementMergeDiff() }.getOrDefault(emptyList())
+        mutableState.update { it.copy(mergeRows = rows) }
+    }
+
+    private suspend fun refreshLegacyState() {
+        val legacy = runCatching { repository.legacyState() }.getOrNull() ?: LegacyProfileState()
+        mutableState.update {
+            it.copy(
+                legacyPresent = legacy.present,
+                legacyProfiles = legacy.profiles,
+                legacyOverridePresent = legacy.overridePresent,
+            )
+        }
     }
 
     /**
@@ -276,6 +315,7 @@ class GhostlockViewModel(
             it.copy(
                 advancedScreenVisible = true,
                 aboutVisible = false,
+                measurementsVisible = false,
                 parametersVisible = false,
                 loadConfigVisible = false,
                 builtinScreenVisible = false,
@@ -299,6 +339,7 @@ class GhostlockViewModel(
             it.copy(
                 advancedScreenVisible = false,
                 aboutVisible = false,
+                measurementsVisible = false,
                 parametersVisible = false,
                 loadConfigVisible = false,
                 builtinScreenVisible = false,
@@ -306,6 +347,19 @@ class GhostlockViewModel(
                 advancedOverrideVisible = false,
             )
         }
+    }
+
+    /** Opens the read-only measured-facts screen and refreshes its store. */
+    fun onOpenMeasurements() {
+        mutableState.update { it.copy(measurementsVisible = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            val kernels = runCatching { repository.measurements() }.getOrDefault(emptyList())
+            mutableState.update { it.copy(measuredKernels = kernels) }
+        }
+    }
+
+    fun onCloseMeasurements() {
+        mutableState.update { it.copy(measurementsVisible = false) }
     }
 
     fun onOpenParameters() {
@@ -334,52 +388,33 @@ class GhostlockViewModel(
         }
     }
 
-    /** Opens the configuration-loading screen and refreshes the stored list. */
+    /** Opens the configuration-loading screen (source selection). */
     fun onOpenLoadConfig() {
         mutableState.update {
             it.copy(
                 loadConfigVisible = true,
                 builtinScreenVisible = false,
-                userProfileDetail = null,
                 profileOverrideVisible = false,
                 advancedOverrideVisible = false,
             )
         }
-        viewModelScope.launch(Dispatchers.IO) { refreshUserProfiles() }
+        viewModelScope.launch(Dispatchers.IO) { refreshLegacyState() }
     }
 
     fun onCloseLoadConfig() {
-        mutableState.update {
-            it.copy(loadConfigVisible = false, builtinScreenVisible = false, userProfileDetail = null)
-        }
+        mutableState.update { it.copy(loadConfigVisible = false, builtinScreenVisible = false) }
     }
 
-    fun onOpenUserProfileDetail(name: String) {
-        mutableState.update { it.copy(userProfileDetail = name, builtinScreenVisible = false) }
+    /** Picks an SD-card profile document; selecting it wins over the bundle. */
+    fun onSelectProfileFile() {
+        send(GhostlockEffect.PickDocument(DocumentRequest.SelectProfile))
     }
 
-    fun onCloseUserProfileDetail() {
-        mutableState.update { it.copy(userProfileDetail = null) }
-    }
-
-    /** Loads a stored document into the imported layer. */
-    fun onLoadUserProfile(name: String) = selectUserProfile(name)
-
-    /** Unloads the imported layer, back to built-in plus overrides. */
-    fun onUnloadUserProfile() = selectUserProfile(null)
-
-    /**
-     * Loads the document and opens the shared parameter-override editor, so
-     * "modify" reuses the exact same UI as the parameter overrides.
-     */
-
-    private fun selectUserProfile(name: String?) {
+    private fun selectExternalProfile(uri: String) {
         val snapshot = kernelSnapshot ?: return
         val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) ?: return
         viewModelScope.launch(Dispatchers.IO) {
-            val config = runCatching {
-                profileController.selectUserProfile(name, snapshot.kernelRelease, pair)
-            }.getOrNull()
+            val config = runCatching { repository.selectExternalProfile(uri) }.getOrNull()
             if (config == null) {
                 send(GhostlockEffect.Toast(R.string.user_profile_load_failed))
                 return@launch
@@ -387,119 +422,149 @@ class GhostlockViewModel(
             applyExecutionConfig(config, preserveEditing = false)
             applyAdvancedConfig(config, preserveEditing = false)
             refreshSnapshot()
-            send(
-                GhostlockEffect.Toast(
-                    if (name != null) R.string.user_profile_loaded
-                    else R.string.user_profile_unloaded,
-                ),
-            )
+            refreshMergeRows()
+            send(GhostlockEffect.Toast(R.string.user_profile_loaded))
         }
     }
 
-    private suspend fun refreshUserProfiles() {
-        val profiles = runCatching { repository.userProfiles() }.getOrDefault(emptyList())
-        mutableState.update { it.copy(userProfiles = profiles) }
-    }
-
-    /** Renames a stored document through the shared text-input dialog. */
-    fun onUserProfileRename(name: String) {
-        mutableState.update {
-            it.copy(
-                userProfileRenameTarget = name,
-                dialogVisible = true,
-                dialogType = DialogType.INPUT,
-                dialogTitleRes = R.string.user_profile_rename,
-                dialogMessageRes = R.string.user_profile_rename_hint,
-                dialogInput = name,
-                dialogConfirmLabelRes = R.string.user_profile_rename_confirm,
-            )
-        }
-    }
-
-    private fun renameUserProfile(name: String, newName: String) {
+    fun onClearExternalProfile() {
         viewModelScope.launch(Dispatchers.IO) {
-            val renamed = runCatching { repository.renameUserProfile(name, newName) }.getOrNull()
-            refreshUserProfiles()
-            if (renamed != null) {
-                mutableState.update { state ->
-                    state.copy(
-                        activeUserProfile = if (state.activeUserProfile == name) {
-                            renamed
-                        } else {
-                            state.activeUserProfile
-                        },
-                        userProfileDetail = if (state.userProfileDetail == name) {
-                            renamed
-                        } else {
-                            state.userProfileDetail
-                        },
-                    )
-                }
+            val config = runCatching { repository.clearExternalProfile() }.getOrNull()
+            if (config == null) {
+                send(GhostlockEffect.Toast(R.string.user_profile_load_failed))
+                return@launch
             }
-            send(
-                GhostlockEffect.Toast(
-                    if (renamed != null) R.string.user_profile_renamed
-                    else R.string.user_profile_rename_failed,
-                ),
-            )
+            applyExecutionConfig(config, preserveEditing = false)
+            applyAdvancedConfig(config, preserveEditing = false)
+            refreshSnapshot()
+            refreshMergeRows()
+            send(GhostlockEffect.Toast(R.string.user_profile_unloaded))
         }
     }
 
-    /** Renders the stored document as HOCON and shares it. */
-    fun onUserProfileExport(name: String) {
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching { repository.exportUserProfile(name) }
-                .onSuccess { uri -> send(GhostlockEffect.Share(uri)) }
-                .onFailure {
-                    android.util.Log.e("GhostLock", "export user profile failed", it)
-                    send(GhostlockEffect.Toast(R.string.export_failed))
-                }
-        }
-    }
+    /* ---- measured-db merge ---- */
 
-    /** Converts a legacy document into a current-layout copy in the store. */
-    fun onConvertUserProfile(name: String) {
+    fun onOpenMergePreview() {
         viewModelScope.launch(Dispatchers.IO) {
-            val converted = runCatching { repository.convertUserProfile(name) }.getOrNull()
-            refreshUserProfiles()
-            send(
-                GhostlockEffect.Toast(
-                    if (converted != null) R.string.user_profile_converted
-                    else R.string.user_profile_convert_failed,
-                ),
-            )
-        }
-    }
-
-    fun onUserProfileDelete(name: String) {
-        mutableState.update { it.copy(userProfileDeleteTarget = name) }
-    }
-
-    fun onUserProfileDeleteConfirm() {
-        val name = state.value.userProfileDeleteTarget ?: return
-        mutableState.update { it.copy(userProfileDeleteTarget = null) }
-        viewModelScope.launch(Dispatchers.IO) {
-            val ok = runCatching { repository.deleteUserProfile(name) }.getOrDefault(false)
-            refreshUserProfiles()
-            if (ok) {
-                mutableState.update { current ->
-                    current.copy(
-                        activeUserProfile = current.activeUserProfile?.takeIf { it != name },
-                        userProfileDetail = current.userProfileDetail?.takeIf { it != name },
-                    )
-                }
-                refreshSnapshot()
+            refreshMergeRows()
+            if (state.value.mergeRows.isEmpty()) {
+                send(GhostlockEffect.Toast(R.string.merge_nothing))
+                return@launch
             }
+            mutableState.update { it.copy(mergePreviewVisible = true) }
+        }
+    }
+
+    fun onCloseMergePreview() {
+        mutableState.update { it.copy(mergePreviewVisible = false) }
+    }
+
+    fun onExportMergedProfile() {
+        val snapshot = kernelSnapshot ?: return
+        val text = repository.mergedProfileDocument()
+        if (text == null) {
+            send(GhostlockEffect.Toast(R.string.export_failed))
+            return
+        }
+        requestProfileWrite(
+            PendingProfileWrite(
+                text = text,
+                suggestedName = exportDocumentName(snapshot.kernelRelease),
+                selectAfterWrite = true,
+            ),
+        )
+    }
+
+    /* ---- editor diff/rebase ---- */
+
+    fun onOpenProfileDiff() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val rows = runCatching { repository.editSessionDiff() }.getOrDefault(emptyList())
+            mutableState.update { it.copy(profileDiffRows = rows, profileDiffVisible = true) }
+        }
+    }
+
+    fun onCloseProfileDiff() {
+        mutableState.update { it.copy(profileDiffVisible = false) }
+    }
+
+    fun onRebaseToBundle() {
+        val snapshot = kernelSnapshot ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val config = runCatching { repository.rebaseEditSession() }.getOrNull()
+            if (config == null) {
+                send(GhostlockEffect.Toast(R.string.execution_save_failed))
+                return@launch
+            }
+            applyExecutionConfig(config, preserveEditing = false)
+            applyAdvancedConfig(config, preserveEditing = false)
+            val rows = runCatching { repository.editSessionDiff() }.getOrDefault(emptyList())
+            mutableState.update {
+                it.copy(
+                    editTargetName = repository.editSessionTarget()
+                        ?: snapshot.kernelRelease,
+                    profileDiffRows = rows,
+                )
+            }
+            send(GhostlockEffect.Toast(R.string.profile_rebased))
+        }
+    }
+
+    /* ---- legacy app-data cleanup ---- */
+
+    fun onOpenLegacyCleanup() {
+        mutableState.update { it.copy(legacyVisible = true) }
+        viewModelScope.launch(Dispatchers.IO) { refreshLegacyState() }
+    }
+
+    fun onCloseLegacyCleanup() {
+        mutableState.update { it.copy(legacyVisible = false, legacyCleanupConfirm = false) }
+    }
+
+    fun onLegacyExport(name: String, applyOverride: Boolean) {
+        val text = repository.legacyProfileDocument(name, applyOverride)
+        if (text == null) {
+            send(GhostlockEffect.Toast(R.string.export_failed))
+            return
+        }
+        requestProfileWrite(
+            PendingProfileWrite(
+                text = text,
+                /* A distinct name: the same release may already be exported as
+                 * the active profile, and the cleanup export must not replace it. */
+                suggestedName = "${name.substringBeforeLast('.').ifEmpty { "profile" }}" +
+                    "-legacy.conf",
+                selectAfterWrite = false,
+            ),
+        )
+    }
+
+    fun onLegacyCleanupRequest() {
+        mutableState.update { it.copy(legacyCleanupConfirm = true) }
+    }
+
+    fun onLegacyCleanupDismiss() {
+        mutableState.update { it.copy(legacyCleanupConfirm = false) }
+    }
+
+    fun onLegacyCleanupConfirm() {
+        mutableState.update { it.copy(legacyCleanupConfirm = false) }
+        viewModelScope.launch(Dispatchers.IO) {
+            val ok = runCatching { repository.finishLegacyCleanup() }.getOrDefault(false)
+            refreshLegacyState()
+            if (ok) mutableState.update { it.copy(legacyVisible = false) }
             send(
                 GhostlockEffect.Toast(
-                    if (ok) R.string.user_profile_deleted else R.string.user_profile_delete_failed,
+                    if (ok) R.string.legacy_cleanup_done else R.string.legacy_cleanup_failed,
                 ),
             )
         }
     }
 
-    fun onUserProfileDeleteDismiss() {
-        mutableState.update { it.copy(userProfileDeleteTarget = null) }
+    /** Queues a document and opens the system destination dialog for it. */
+    private fun requestProfileWrite(write: PendingProfileWrite) {
+        pendingProfileWrite = write
+        send(GhostlockEffect.CreateProfileDocument(write.suggestedName))
     }
 
     fun onShowAbout() {
@@ -557,30 +622,64 @@ class GhostlockViewModel(
         mutableState.update { it.copy(debugKernelLogEnabled = enabled) }
     }
 
-    /** Saves the merged profile through the system document dialog. */
+    /** Exports the active profile through the system document dialog. */
     fun onExportProfile() {
-        val release = kernelSnapshot?.kernelRelease ?: return
-        send(GhostlockEffect.CreateProfileDocument(exportDocumentName(release)))
+        val snapshot = kernelSnapshot ?: return
+        val text = repository.liveProfileDocument()
+        if (text == null) {
+            send(GhostlockEffect.Toast(R.string.export_failed))
+            return
+        }
+        requestProfileWrite(
+            PendingProfileWrite(
+                text = text,
+                suggestedName = exportDocumentName(snapshot.kernelRelease),
+                selectAfterWrite = false,
+            ),
+        )
     }
 
     fun onExportProfileDocumentPicked(documentUri: String?) {
-        if (documentUri.isNullOrBlank()) return
-        val snapshot = kernelSnapshot ?: return
-        val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) ?: return
+        val write = pendingProfileWrite
+        pendingProfileWrite = null
+        if (write == null) return
+        if (documentUri.isNullOrBlank()) {
+            /* A cancelled export loses the document by design: the editor says
+             * so before opening the picker (measured-db-plan §4). */
+            send(GhostlockEffect.Toast(R.string.export_cancelled))
+            return
+        }
         viewModelScope.launch(Dispatchers.IO) {
-            val ok = profileController.export(snapshot.kernelRelease, pair, documentUri)
-            send(
-                GhostlockEffect.Toast(
-                    if (ok) R.string.override_export_done else R.string.export_failed,
-                ),
-            )
+            val ok = repository.writeProfileDocument(documentUri, write.text)
+            if (!ok) {
+                send(GhostlockEffect.Toast(R.string.export_failed))
+                return@launch
+            }
+            if (!write.selectAfterWrite) {
+                send(GhostlockEffect.Toast(R.string.override_export_done))
+                return@launch
+            }
+            pendingSelectUri = documentUri
+            mutableState.update {
+                it.copy(
+                    dialogVisible = true,
+                    dialogType = DialogType.CONFIRM,
+                    dialogTitleRes = R.string.profile_exported_title,
+                    dialogMessageRes = R.string.profile_use_question,
+                    dialogMessage = "",
+                    dialogConfirmLabelRes = R.string.profile_use_confirm,
+                    dialogDocUrl = null,
+                    dialogExportLog = false,
+                    dialogLayerNotice = null,
+                )
+            }
         }
     }
 
     private fun exportDocumentName(release: String): String =
         "${release.replace(Regex("[^A-Za-z0-9._-]"), "_")}.conf"
 
-    /* ---- editing session: draft edits plus an isolated controller ---- */
+    /* ---- editing session: in-memory, export is the only save ---- */
 
     private fun currentPair(): CpuPair? {
         val snapshot = kernelSnapshot ?: return null
@@ -589,25 +688,8 @@ class GhostlockViewModel(
 
     /** Opens the editor for the profile the attack controller currently loads. */
     fun onOpenProfileOverrides() {
-        openEditSession(profileController.activeUserProfile(), fromDetail = false)
-    }
-
-    /**
-     * Opens the editor for the stored document [name] without loading it into
-     * the attack controller: a private session controller resolves the edits.
-     */
-    fun onEditUserProfile(name: String) {
-        val profile = state.value.userProfiles.firstOrNull { it.name == name }
-        if (profile?.version == 1) {
-            send(GhostlockEffect.Toast(R.string.user_profile_legacy_hint))
-            return
-        }
-        openEditSession(name, fromDetail = true)
-    }
-
-    private fun openEditSession(name: String?, fromDetail: Boolean) {
         viewModelScope.launch(Dispatchers.IO) {
-            val config = runCatching { repository.beginEditSession(name) }.getOrNull()
+            val config = runCatching { repository.beginEditSession() }.getOrNull()
             if (config == null) {
                 send(GhostlockEffect.Toast(R.string.user_profile_load_failed))
                 return@launch
@@ -619,9 +701,8 @@ class GhostlockViewModel(
                     builtinScreenVisible = false,
                     advancedOverrideVisible = false,
                     profileOverrideVisible = true,
-                    editTargetName = name,
-                    userProfileDetail = if (fromDetail) it.userProfileDetail else null,
-                    loadConfigVisible = if (fromDetail) it.loadConfigVisible else false,
+                    editTargetName = repository.editSessionTarget(),
+                    loadConfigVisible = false,
                 )
             }
         }
@@ -659,8 +740,8 @@ class GhostlockViewModel(
         session.updateRoute(release, pair, mutableState.value.profileRoute)
         session.updateFallback(release, pair, mutableState.value.profileFallback)
         /* General edits share the execution.* tree paths. The advanced rebuild
-         * replaces the whole override entry, so the drafts must be merged in or
-         * the general edits would be dropped. */
+         * replaces the whole edit map, so the drafts must be merged in or the
+         * general edits would be dropped. */
         val drafts = mutableState.value.profileOverrideEditing +
                 mutableState.value.executionEditing
         val advanced = drafts.mapNotNull { (path, text) ->
@@ -670,84 +751,40 @@ class GhostlockViewModel(
     }
 
     /**
-     * Commits the draft: a loaded profile gets the overrides written back to
-     * the live controller, an unloaded one is stored as a new profile.
+     * Exports the edited session. There is no other save: the document on the
+     * SD card is the profile, and an unexported edit is lost.
      */
-    fun onSaveProfileEdits() {
-        val pair = currentPair() ?: return
-        viewModelScope.launch(Dispatchers.IO) {
-            val config = commitDraftToSession()
-            if (config == null) {
-                send(GhostlockEffect.Toast(R.string.execution_save_failed))
-                return@launch
-            }
-            if (repository.editSessionIsLive()) {
-                val committed = runCatching { repository.commitEditSession() }
-                    .getOrDefault(false)
-                if (!committed) {
-                    send(GhostlockEffect.Toast(R.string.execution_save_failed))
-                    return@launch
-                }
-                val live = runCatching { profileController.load(config.release, pair) }.getOrNull()
-                if (live != null) {
-                    applyExecutionConfig(live, preserveEditing = false)
-                    applyAdvancedConfig(live, preserveEditing = false)
-                }
-                send(GhostlockEffect.Toast(R.string.profile_saved))
-            } else if (repository.editSessionTarget() != null) {
-                /* Editing a stored document that is not loaded: Save updates
-                 * that document in place, Save as creates a copy. */
-                val saved = runCatching { repository.saveEditSessionInPlace() }
-                    .getOrDefault(false)
-                refreshUserProfiles()
-                send(
-                    GhostlockEffect.Toast(
-                        if (saved) R.string.profile_saved else R.string.execution_save_failed,
-                    ),
-                )
-            } else {
-                val name = repository.saveEditSessionAsNew()
-                refreshUserProfiles()
-                send(
-                    GhostlockEffect.Toast(
-                        if (name != null) R.string.profile_saved_as_new
-                        else R.string.execution_save_failed,
-                    ),
-                )
-            }
-        }
-    }
-
-    /** Stores the session result as a new saved profile. */
-    fun onSaveProfileAs() {
+    private fun exportEditSession(selectAfterWrite: Boolean) {
         viewModelScope.launch(Dispatchers.IO) {
             if (commitDraftToSession() == null) {
                 send(GhostlockEffect.Toast(R.string.execution_save_failed))
                 return@launch
             }
-            val name = repository.saveEditSessionAsNew()
-            refreshUserProfiles()
-            send(
-                GhostlockEffect.Toast(
-                    if (name != null) R.string.profile_saved_as_new
-                    else R.string.execution_save_failed,
+            val snapshot = kernelSnapshot ?: return@launch
+            val text = repository.editSessionDocument()
+            if (text == null) {
+                send(GhostlockEffect.Toast(R.string.export_failed))
+                return@launch
+            }
+            val stem = repository.editSessionTarget()
+                ?.substringBeforeLast('.')
+                ?.takeIf { it.isNotEmpty() }
+                ?: snapshot.kernelRelease.replace(Regex("[^A-Za-z0-9._-]"), "_")
+            requestProfileWrite(
+                PendingProfileWrite(
+                    text = text,
+                    suggestedName = "$stem.conf",
+                    selectAfterWrite = selectAfterWrite,
                 ),
             )
         }
     }
 
-    /** Renders the session result as HOCON and shares it. */
-    fun onExportProfileEdits() {
-        viewModelScope.launch(Dispatchers.IO) {
-            if (commitDraftToSession() == null) {
-                send(GhostlockEffect.Toast(R.string.export_failed))
-                return@launch
-            }
-            runCatching { repository.exportEditSession() }
-                .onSuccess { uri -> send(GhostlockEffect.Share(uri)) }
-                .onFailure { send(GhostlockEffect.Toast(R.string.export_failed)) }
-        }
-    }
+    fun onSaveProfileEdits() = exportEditSession(selectAfterWrite = true)
+
+    fun onSaveProfileAs() = exportEditSession(selectAfterWrite = true)
+
+    fun onExportProfileEdits() = exportEditSession(selectAfterWrite = true)
 
     /** Opens the builtin picker; overrides stay keyed to the device kernel. */
     fun onOpenBuiltinProfiles() {
@@ -788,9 +825,8 @@ class GhostlockViewModel(
         val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) ?: return
         viewModelScope.launch(Dispatchers.IO) {
             /* The controller keeps a single active source: picking a builtin
-             * unloads whatever user document was loaded before. */
+             * also clears the external selection (last explicit choice wins). */
             val config = runCatching {
-                profileController.selectUserProfile(null, snapshot.kernelRelease, pair)
                 profileController.selectBuiltin(release, snapshot.kernelRelease, pair)
             }.getOrNull()
             if (config == null) {
@@ -800,6 +836,7 @@ class GhostlockViewModel(
             applyExecutionConfig(config, preserveEditing = false)
             applyAdvancedConfig(config, preserveEditing = false)
             refreshSnapshot()
+            refreshMergeRows()
             send(GhostlockEffect.Toast(R.string.load_builtin_done))
         }
     }
@@ -878,7 +915,8 @@ class GhostlockViewModel(
                 profileRoute = config.route,
                 profileFallback = config.fallbackTo,
                 activeBuiltinProfile = profileController.activeBuiltinRelease(),
-                activeUserProfile = profileController.activeUserProfile(),
+                externalProfile = profileController.activeExternalProfile(),
+                activeUserProfile = config.layers?.takeIf { it.externalApplied }?.external,
                 profileLayers = config.layers,
             )
         }
@@ -1000,12 +1038,6 @@ class GhostlockViewModel(
         send(GhostlockEffect.Toast(R.string.copied))
     }
 
-    fun importOffsetsHocon() =
-        send(GhostlockEffect.PickDocument(DocumentRequest.ImportOffsetsHocon))
-
-    fun importOffsetsJson() =
-        send(GhostlockEffect.PickDocument(DocumentRequest.ImportOffsetsJson))
-
     fun parseOffsets() {
         parseDialogStage = ParseDialogStage.Mode
         mutableState.update {
@@ -1060,26 +1092,12 @@ class GhostlockViewModel(
 
     fun onDocumentResult(request: DocumentRequest, uri: String) {
         when (request) {
+            DocumentRequest.SelectProfile -> selectExternalProfile(uri)
             DocumentRequest.BootImage -> stageBoot(uri)
             DocumentRequest.XblImage -> stageXbl(uri)
             DocumentRequest.UefiImage -> stageUefi(uri)
             DocumentRequest.VendorBootImage -> stageVendorBoot(uri)
             DocumentRequest.PayloadImage -> stagePayload(uri)
-            DocumentRequest.ImportOffsetsHocon, DocumentRequest.ImportOffsetsJson -> Unit
-        }
-    }
-
-    /** Multi-picked documents (a profile plus any include dependencies). */
-    fun onDocumentsResult(request: DocumentRequest, uris: List<String>) {
-        when (request) {
-            DocumentRequest.ImportOffsetsHocon, DocumentRequest.ImportOffsetsJson ->
-                importDocuments(uris)
-
-            DocumentRequest.BootImage -> uris.firstOrNull()?.let(::stageBoot)
-            DocumentRequest.XblImage -> uris.firstOrNull()?.let(::stageXbl)
-            DocumentRequest.UefiImage -> uris.firstOrNull()?.let(::stageUefi)
-            DocumentRequest.VendorBootImage -> uris.firstOrNull()?.let(::stageVendorBoot)
-            DocumentRequest.PayloadImage -> uris.firstOrNull()?.let(::stagePayload)
         }
     }
 
@@ -1123,14 +1141,45 @@ class GhostlockViewModel(
         }
     }
 
+    /**
+     * Applies the chosen stride in memory and asks the user where to export the
+     * generated document. Nothing is stored by the app; the export is the save.
+     */
+    private fun finishGeneratedProfile(
+        document: String,
+        name: String?,
+        release: String,
+        stride: Int?,
+    ) {
+        val text = if (stride != null) {
+            repository.applyStrideToDocument(document, release, stride) ?: run {
+                appendLog("stride: could not update the generated document")
+                document
+            }
+        } else {
+            document
+        }
+        if (stride != null) appendLog("stride: kernelsnitch.mm_struct_sz = $stride")
+        val suggested = name?.takeIf { it.endsWith(".conf") }
+            ?: exportDocumentName(release)
+        requestProfileWrite(
+            PendingProfileWrite(
+                text = text,
+                suggestedName = suggested,
+                selectAfterWrite = true,
+            ),
+        )
+    }
+
     fun onDialogInputChange(value: String) = mutableState.update { it.copy(dialogInput = value) }
 
     fun onDialogConfirm(value: String) {
         val dialogType = state.value.dialogType
-        val renameTarget = state.value.userProfileRenameTarget
+        val selectUri = pendingSelectUri
+        pendingSelectUri = null
         dismissDialog(clearConfirmation = false)
         when {
-            renameTarget != null -> renameUserProfile(renameTarget, value)
+            selectUri != null -> selectExternalProfile(selectUri)
             dialogType == DialogType.INPUT -> parseUrl(value)
             dialogType == DialogType.CONFIRM -> toggleShizuku(true)
             else -> Unit
@@ -1144,6 +1193,7 @@ class GhostlockViewModel(
             parseDialogStage = ParseDialogStage.Mode
             appendLog("result: route choice cancelled")
         }
+        pendingSelectUri = null
         dismissDialog()
     }
 
@@ -1156,7 +1206,6 @@ class GhostlockViewModel(
         }
     }
 
-    /** Applies the selected stride to the generated document, then loads it. */
     fun onStrideUse() {
         val value = state.value.stridePicker?.selectedValue ?: return
         finishStride(value)
@@ -1167,40 +1216,40 @@ class GhostlockViewModel(
     /** Dismissing the sheet means the same as Skip, with the same log line. */
     fun onStridePickerDismiss() = finishStride(null)
 
+    /**
+     * Applies the chosen stride to the in-memory generated document and asks
+     * where to export it — in the measured-db model the export is the save.
+     */
     private fun finishStride(value: Int?) {
         val parse = pendingStrideParse
         val document = pendingStrideDocument
+        val name = pendingStrideName
         val release = pendingStrideRelease
         pendingStrideParse = null
         pendingStrideProbe = null
         pendingStrideDocument = null
+        pendingStrideName = null
         pendingStrideRelease = null
         mutableState.update { it.copy(stridePicker = null) }
         if (document == null || release == null) return
         if (value == null) {
             appendLog("stride left unset (native default + stride-agnostic scan)")
-            selectUserProfile(document)
-            parse?.takeIf { it.missing.isNotEmpty() }?.let(::showMissingSidecarNotice)
-            return
+        } else {
+            appendLog("stride chosen: $value")
         }
-        appendLog("stride chosen: $value")
-        viewModelScope.launch(Dispatchers.IO) {
-            val ok = runCatching {
-                repository.applyStrideToProfile(document, release, value)
-            }.getOrDefault(false)
-            withContext(Dispatchers.Main) {
-                appendLog(
-                    if (ok) {
-                        "stride: wrote kernelsnitch.mm_struct_sz = $value"
-                    } else {
-                        "stride: could not update the profile"
-                    },
-                )
-                selectUserProfile(document)
-                parse?.takeIf { it.missing.isNotEmpty() }?.let(::showMissingSidecarNotice)
-            }
-        }
+        finishGeneratedProfile(document, name, release, value)
+        parse?.takeIf { it.missing.isNotEmpty() }?.let(::showMissingSidecarNotice)
     }
+
+    /** The root-measured stride for this kernel, when the measured DB has one. */
+    private suspend fun rootMeasuredStride(release: String): Int? = runCatching {
+        repository.measurements()
+            .firstOrNull { it.release == release }
+            ?.facts
+            ?.firstOrNull { it.key == MeasuredProfileStore.KeyMmStructSz }
+            ?.value
+            ?.toInt()
+    }.getOrNull()
 
     /** "Export log & report" from the failed-run notice: dismiss, then the picker. */
     fun onDialogExportLog() {
@@ -1244,78 +1293,15 @@ class GhostlockViewModel(
                 profileInvalidPaths = loaded?.invalidPaths ?: emptySet(),
                 executionHasProfile = loaded?.hasProfile ?: false,
                 profileLayers = loaded?.layers,
+                externalProfile = profileController.activeExternalProfile(),
+                activeUserProfile = loaded?.layers?.takeIf { it.externalApplied }?.external,
                 customCpuPair = loaded?.let(::customCpuPairOf),
             )
         }
         /* At start-up, and from the resolution the run button was just judged
          * on — the same one a run uses (§C.12b). */
         loaded?.let(::maybeRaiseLayerNotice)
-    }
-
-    private fun importDocuments(uris: List<String>) {
-        if (uris.isEmpty() || !beginOperation(showLogSheet = false)) return
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val documents = linkedMapOf<String, String>()
-                uris.forEach { uri ->
-                    val name = uri.toUri().lastPathSegment?.let(Uri::decode)
-                        ?: uri.substringAfterLast('/')
-                    documents[name] = readDocumentUseCase(uri)
-                }
-                handleImportResult(importOffsetsUseCase(documents), documents)
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: Exception) {
-                appendLog("import offsets failed: ${error.message}")
-                appendLog("result: import failed")
-                showNotice(R.string.import_result_title, R.string.import_failed)
-            } finally {
-                endOperation()
-            }
-        }
-    }
-
-    private suspend fun handleImportResult(
-        result: OffsetImportResult,
-        documents: Map<String, String>,
-    ) {
-        when (result) {
-            is OffsetImportResult.RequiresOverwrite -> {
-                pendingConfirmation = PendingConfirmation.Import(documents)
-                showOverwriteDialog(result.releases)
-            }
-
-            is OffsetImportResult.Imported -> {
-                refreshSnapshot()
-                refreshUserProfiles()
-                appendLog("profile imported: ${result.releases.joinToString()}")
-                appendLog("result: offsets imported successfully")
-                val deviceRelease = state.value.kernelRelease
-                val matchesDevice = deviceRelease.isEmpty() ||
-                        result.releases.any { it == deviceRelease }
-                showNotice(
-                    R.string.import_result_title,
-                    if (matchesDevice) R.string.import_success else R.string.import_no_match,
-                )
-            }
-
-            OffsetImportResult.AlreadyPresent -> {
-                appendLog("result: offsets already present")
-                showNotice(R.string.import_result_title, R.string.offsets_already_exist)
-            }
-
-            is OffsetImportResult.MissingIncludes -> {
-                appendLog("import offsets missing includes: ${result.files.joinToString()}")
-                appendLog("result: import failed")
-                showNotice(R.string.import_result_title, R.string.import_missing_includes)
-            }
-
-            is OffsetImportResult.Failed -> {
-                appendLog("import offsets failed: ${result.reason}")
-                appendLog("result: import failed")
-                showNotice(R.string.import_result_title, R.string.import_failed)
-            }
-        }
+        refreshMergeRows()
     }
 
     private fun pickPayload() {
@@ -1557,41 +1543,48 @@ class GhostlockViewModel(
                 }
 
                 is ParseResult.Parsed -> {
+                    val document = result.documentText
+                    if (document == null) {
+                        appendLog("result: the extractor produced no document")
+                        showNotice(R.string.parse_result_title, R.string.parse_failed)
+                        return
+                    }
                     refreshSnapshot()
-                    refreshUserProfiles()
+                    refreshLegacyState()
                     result.route?.let { appendLog("route: $it") }
                     result.anchor?.let {
                         appendLog(
                             "anchor: " + it.removePrefix("info: ").removePrefix("warning: "),
                         )
                     }
-                    appendLog("offsets exported: ${result.releases.joinToString()}")
-                    appendLog("result: offsets parsed successfully")
+                    appendLog("profile generated: ${result.releases.joinToString()}")
+                    appendLog("result: profile generated; export it to use it")
                     /* The live stride probe only makes sense for the running
                      * kernel; a profile generated for another image skips it. */
                     val runningRelease = kernelSnapshot?.kernelRelease
                     val pair = kernelSnapshot?.let { snapshot ->
                         snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair)
                     }
-                    val documentName = result.documentName
-                    val strideProbe = if (documentName != null && runningRelease != null &&
-                        pair != null && runningRelease in result.releases
+                    val strideProbe = if (runningRelease != null && pair != null &&
+                        runningRelease in result.releases
                     ) {
                         appendLog("stride: probing the mm_struct slab on the running kernel")
                         runCatching {
-                            repository.probeStride(runningRelease, documentName, pair, ::appendLog)
+                            repository.probeStride(runningRelease, document, pair, ::appendLog)
                         }.getOrNull()
                     } else {
                         null
                     }
-                    val stridePickerShown =
-                        strideProbe != null && documentName != null && runningRelease != null
-                    if (strideProbe != null && documentName != null && runningRelease != null) {
+                    if (strideProbe != null && runningRelease != null) {
                         pendingStrideParse = result
                         pendingStrideProbe = strideProbe
-                        pendingStrideDocument = documentName
+                        pendingStrideDocument = document
+                        pendingStrideName = result.documentName
                         pendingStrideRelease = runningRelease
-                        val recommendation = recommendStride(strideProbe)
+                        val recommendation = recommendStride(
+                            strideProbe,
+                            confirmedValue = rootMeasuredStride(runningRelease),
+                        )
                         appendLog(
                             "stride: ${strideProbe.candidates.size} candidate(s), " +
                                 "gcd=0x${strideProbe.gcd.toString(16)}, " +
@@ -1602,27 +1595,24 @@ class GhostlockViewModel(
                                 stridePicker = StridePickerUiState(
                                     recommendation = recommendation,
                                     selectedValue = recommendation.recommendedValue,
-                                    footerRes = R.string.stride_footer_saved,
+                                    footerRes = R.string.stride_footer_export,
                                 ),
                                 executionSheetVisible = false,
                             )
                         }
-                    } else if (documentName != null) {
-                        /* Auto-load the just-saved document so the parsed profile
-                         * takes effect without a manual trip to the profile list. */
-                        appendLog("auto-loading parsed profile: $documentName")
-                        selectUserProfile(documentName)
+                    } else {
+                        finishGeneratedProfile(
+                            document,
+                            result.documentName,
+                            runningRelease ?: result.releases.firstOrNull() ?: "profile",
+                            null,
+                        )
                     }
                     if (result.missing.isNotEmpty()) {
                         appendLog(
                             "warning: missing ${result.missing.joinToString()}; " +
                                     "run the MediaTek extractor or attach xbl_config.img / uefi.img",
                         )
-                        /* The notice would overwrite the stride picker; defer it
-                         * until the picker is resolved. */
-                        if (!stridePickerShown) showMissingSidecarNotice(result)
-                    } else if (result.documentName == null) {
-                        showNotice(R.string.parse_result_title, R.string.parse_success)
                     }
                 }
 
@@ -1665,20 +1655,6 @@ class GhostlockViewModel(
         val confirmation = pendingConfirmation ?: return
         pendingConfirmation = null
         when (confirmation) {
-            is PendingConfirmation.Import -> {
-                if (!beginOperation(showLogSheet = false)) return
-                viewModelScope.launch(Dispatchers.IO) {
-                    try {
-                        handleImportResult(
-                            importOffsetsUseCase.overwrite(confirmation.documents),
-                            confirmation.documents,
-                        )
-                    } finally {
-                        endOperation()
-                    }
-                }
-            }
-
             is PendingConfirmation.Parse -> viewModelScope.launch(Dispatchers.IO) {
                 runParse(
                     confirmation.input,
@@ -1739,7 +1715,6 @@ class GhostlockViewModel(
                 dialogConfirmLabelRes = R.string.parse_start,
                 dialogDocUrl = null,
                 dialogLayerNotice = null,
-                userProfileRenameTarget = null,
             )
         }
     }
@@ -1805,7 +1780,6 @@ class GhostlockViewModel(
     }
 
     private sealed interface PendingConfirmation {
-        data class Import(val documents: Map<String, String>) : PendingConfirmation
         data class Parse(
             val input: String,
             val xblPath: String?,

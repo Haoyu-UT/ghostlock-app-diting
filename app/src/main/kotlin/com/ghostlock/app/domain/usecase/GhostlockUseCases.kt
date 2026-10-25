@@ -11,11 +11,6 @@ class SelectCpuPairUseCase(private val repository: GhostlockRepository) {
     operator fun invoke(index: Int) = repository.selectCpuPair(index)
 }
 
-class ImportOffsetsUseCase(private val repository: GhostlockRepository) {
-    suspend operator fun invoke(documents: Map<String, String>) = repository.importOffsets(documents)
-    suspend fun overwrite(documents: Map<String, String>) = repository.confirmImport(documents)
-}
-
 class ParseSourceUseCase(private val repository: GhostlockRepository) {
     suspend operator fun invoke(
         input: String,
