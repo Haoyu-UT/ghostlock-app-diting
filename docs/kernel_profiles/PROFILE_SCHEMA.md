@@ -83,7 +83,7 @@ route {
   select_stack { waiter_shift = -2 }
 }
 fallback { to = "none" }
-kernelsnitch { collisions = 4, mm_struct_sz = 1024 }  # stride: measured only
+kernelsnitch { collisions = 4, mm_struct_sz = 1024 }  # stride: bundled value or measured
 task_struct { prio = 132, cred = 2080, pi_lock = 2316 }
 cred { copy_size = 136, caps_offset = 48, caps_count = 5 }
 offset { init_task = 34464384, init_cred = 34538824 }
@@ -250,7 +250,7 @@ affected by route choice:
 | Field | Meaning |
 |---|---|
 | `kernelsnitch.collisions` | Number of futex collisions needed |
-| `kernelsnitch.mm_struct_sz` | SLUB object stride of `mm_struct`; written only from a measurement (the generation picker or the root slabinfo read), never a heuristic; omitted = the compiled default `0x500`. It sizes the spray (`ORDER3_SIZE / stride` objects per slab); the leak itself stays stride-agnostic. |
+| `kernelsnitch.mm_struct_sz` | SLUB object stride of `mm_struct`. Bundled profiles carry their kernel family's measured value (5.10: 960; 5.15/6.1: 1024; 6.6/6.12: 1280, QEMU-confirmed); a generated profile writes it only from a measurement (the generation picker or the root slabinfo read), never a heuristic. Omitted = the compiled default `0x500`. It sizes the spray (`ORDER3_SIZE / stride` objects per slab); the leak itself stays stride-agnostic. |
 
 ## 5. execution tuning (advisory)
 

@@ -132,6 +132,12 @@ class BuiltinProfilesTest {
                 }
                 assertTrue("${entry.release}: kernelsnitch.collisions missing",
                     "kernelsnitch.collisions" in paths)
+                /* The spray sizes from this value; a profile that silently
+                 * drops the declared key falls back to the compiled 1280
+                 * (25 objects/slab) without saying so. The bundled set must
+                 * carry the family value (or an explicit null). */
+                assertTrue("${entry.release}: kernelsnitch.mm_struct_sz missing",
+                    "kernelsnitch.mm_struct_sz" in paths)
                 assertTrue("${entry.release}: route branch missing",
                     paths.any { it.startsWith("route.") })
                 /* Execution tuning belongs to the general page, never here. */

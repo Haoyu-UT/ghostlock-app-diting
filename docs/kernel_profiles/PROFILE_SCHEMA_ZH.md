@@ -62,7 +62,7 @@ route {
   select_stack { waiter_shift = -2 }
 }
 fallback { to = "none" }
-kernelsnitch { collisions = 4, mm_struct_sz = 1024 }  # 跨度：仅测量后写入
+kernelsnitch { collisions = 4, mm_struct_sz = 1024 }  # 跨度：内置值或测量后写入
 task_struct { prio = 132, cred = 2080, pi_lock = 2316 }
 cred { copy_size = 136, caps_offset = 48, caps_count = 5 }
 offset { init_task = 34464384, init_cred = 34538824 }
@@ -213,7 +213,7 @@ cred
 | 字段 | 含义 |
 |---|---|
 | `kernelsnitch.collisions` | 需要的 futex 碰撞数量 |
-| `kernelsnitch.mm_struct_sz` | `mm_struct` 的 SLUB 对象跨度；仅在测量后写入（生成时的选择器或 root 读取 `/proc/slabinfo`），绝不猜测；省略时使用编译默认值 `0x500`。它决定 spray 的每 slab 对象数（`ORDER3_SIZE / stride`），泄漏扫描本身仍与跨度无关。 |
+| `kernelsnitch.mm_struct_sz` | `mm_struct` 的 SLUB 对象跨度。内置配置携带各自内核家族的实测值（5.10：960；5.15/6.1：1024；6.6/6.12：1280，已用 QEMU 确认）；生成的配置只在测量后写入（生成时的选择器或 root 读取 `/proc/slabinfo`），绝不猜测。省略时使用编译默认值 `0x500`。它决定 spray 的每 slab 对象数（`ORDER3_SIZE / stride`），泄漏扫描本身仍与跨度无关。 |
 
 ## 5. execution 调优参数（advisory）
 
