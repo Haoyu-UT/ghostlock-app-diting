@@ -791,18 +791,15 @@ fn run(cli: &Cli) -> Result<i32> {
         }
     }
 
-    let route_verdicts = if release_major == Some(5) {
-        analysis::route_verdicts_5_10(
-            &boot.kernel,
-            &rel_symbols,
-            &sorted_offsets,
-            btf.as_ref(),
-            &pselect_outcome,
-            !cli.no_disasm,
-        )
-    } else {
-        Vec::new()
-    };
+    let route_verdicts = analysis::route_verdicts(
+        &boot.kernel,
+        &rel_symbols,
+        &sorted_offsets,
+        btf.as_ref(),
+        &pselect_outcome,
+        !cli.no_disasm,
+        release_major,
+    );
     if cli.format == "conf" {
         for verdict in &route_verdicts {
             eprintln!(
@@ -896,97 +893,84 @@ fn run(cli: &Cli) -> Result<i32> {
                 "--no-disasm with --format conf requires --route",
             ));
         }
-        let route = if release_major == Some(5) {
-            if let Some(forced) = cli.route.as_deref() {
-                match route_verdicts
-                    .iter()
-                    .find(|verdict| verdict.route == forced)
-                {
-                    Some(verdict)
-                        if verdict.verdict == analysis::Feasibility::Infeasible =>
-                    {
+        let route = if let Some(forced) = cli.route.as_deref() {
+            match route_verdicts
+                .iter()
+                .find(|verdict| verdict.route == forced)
+            {
+                Some(verdict) if verdict.verdict == analysis::Feasibility::Infeasible => {
+                    eprintln!(
+                        "error: forced route {forced} is infeasible on this kernel: {}",
+                        verdict.reason
+                    );
+                    return Ok(3);
+                }
+                Some(verdict) => {
+                    if verdict.verdict == analysis::Feasibility::Unknown {
                         eprintln!(
-                            "error: forced route {forced} is infeasible on this kernel: {}",
+                            "warning: forced route {forced} is unverified (unknown): {}",
                             verdict.reason
                         );
-                        return Ok(3);
                     }
-                    Some(verdict) => {
-                        if verdict.verdict == analysis::Feasibility::Unknown {
-                            eprintln!(
-                                "warning: forced route {forced} is unverified (unknown): {}",
-                                verdict.reason
-                            );
-                        }
-                        Some(forced.to_string())
-                    }
-                    None => {
-                        eprintln!("error: unknown route {forced}");
-                        return Ok(3);
-                    }
+                    Some(forced.to_string())
                 }
-            } else {
-                let hint = family::route_hint(
-                    &boot.kernel,
-                    &rel_symbols,
-                    &sorted_offsets,
-                    release_text,
-                );
-                match analysis::select_route_5_10(&route_verdicts, hint) {
-                    analysis::RouteSelection::Chosen {
-                        route,
-                        basis,
-                        reason,
-                    } => {
-                        eprintln!("info: route {route} selected ({basis:?}): {reason}");
-                        Some(route.to_string())
-                    }
-                    analysis::RouteSelection::Ambiguous { routes } => {
-                        if let Some(path) = &cli.feasible_out {
-                            write_feasible_out(path, release_text, &route_verdicts, None)?;
-                        }
-                        eprintln!(
-                            "error: more than one feasible route ({}); pass --route",
-                            routes.join(", ")
-                        );
-                        return Ok(7);
-                    }
-                    analysis::RouteSelection::None { reason } => {
-                        eprintln!("warning: {reason}");
-                        None
-                    }
+                None => {
+                    eprintln!("error: unknown route {forced}");
+                    return Ok(3);
                 }
             }
         } else {
-            match cli.route.as_deref() {
-                Some(route) => Some(route.to_string()),
-                None => match family::route_hint(
+            /* The fallback nomination: the 5.10 frame rule, or the family
+             * heuristic for the other families. The verdict set decides first;
+             * the nomination only breaks a zero-feasible tie. */
+            let fallback = if release_major == Some(5) {
+                family::route_hint(
                     &boot.kernel,
                     &rel_symbols,
                     &sorted_offsets,
                     release_text,
-                ) {
-                    Some((hint, reason)) => {
-                        eprintln!("info: {reason}");
-                        Some(hint.to_string())
+                )
+            } else {
+                let paths = analysis::probe_paths(
+                    &symbols,
+                    &boot.kernel,
+                    &rel_symbols,
+                    &sorted_offsets,
+                );
+                let pselect_derived =
+                    matches!(pselect_outcome, analysis::PselectOutcome::Derived(_));
+                let (suggested, _, reasons) = analysis::suggest_route(
+                    pselect_derived,
+                    &paths,
+                    release.as_deref(),
+                );
+                suggested.map(|route| {
+                    (route, reasons.first().cloned().unwrap_or_default())
+                })
+            };
+            match analysis::select_route(&route_verdicts, fallback) {
+                analysis::RouteSelection::Chosen {
+                    route,
+                    basis,
+                    reason,
+                } => {
+                    eprintln!("info: route {route} selected ({basis:?}): {reason}");
+                    Some(route.to_string())
+                }
+                analysis::RouteSelection::Ambiguous { routes } => {
+                    if let Some(path) = &cli.feasible_out {
+                        write_feasible_out(path, release_text, &route_verdicts, None)?;
                     }
-                    None => {
-                        let paths = analysis::probe_paths(
-                            &symbols,
-                            &boot.kernel,
-                            &rel_symbols,
-                            &sorted_offsets,
-                        );
-                        let pselect_derived =
-                            matches!(pselect_outcome, analysis::PselectOutcome::Derived(_));
-                        let (suggested, _, _) = analysis::suggest_route(
-                            pselect_derived,
-                            &paths,
-                            release.as_deref(),
-                        );
-                        suggested.map(str::to_string)
-                    }
-                },
+                    eprintln!(
+                        "error: more than one feasible route ({}); pass --route",
+                        routes.join(", ")
+                    );
+                    return Ok(7);
+                }
+                analysis::RouteSelection::None { reason } => {
+                    eprintln!("warning: {reason}");
+                    None
+                }
             }
         };
         if let Some(path) = &cli.feasible_out {
