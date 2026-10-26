@@ -392,6 +392,13 @@ sealed interface ParseResult {
         val route: String? = null,
         /** The extractor's lock-anchor line (verdict and reason), if any. */
         val anchor: String? = null,
+        /** Extractor's canonical phys source (`xbl_config FDT`, `uefi memory
+         * map`, `vendor_boot …`, `iomem`, `MediaTek DRAM base`, `unset`). */
+        val physSource: String? = null,
+        /** The parsed document carries `kernel_phys_load`. */
+        val physLoadPresent: Boolean = false,
+        /** The parsed document carries `kernel_phys_offset`. */
+        val physOffsetPresent: Boolean = false,
         /**
          * The generated document itself. The app stores no profile: the caller
          * probes it, applies the chosen stride in memory and requires an export

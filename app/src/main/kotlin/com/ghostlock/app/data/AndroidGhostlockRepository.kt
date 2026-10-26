@@ -15,6 +15,7 @@ import com.ghostlock.app.domain.model.DebugSettings
 import com.ghostlock.app.domain.model.ExternalProfileInfo
 import com.ghostlock.app.domain.model.KernelSnapshot
 import com.ghostlock.app.domain.model.LegacyProfileState
+import com.ghostlock.app.domain.model.physSourceFromLines
 import com.ghostlock.app.domain.model.MeasuredFactInfo
 import com.ghostlock.app.domain.model.MeasuredKernelInfo
 import com.ghostlock.app.domain.model.MeasurementMergeRow
@@ -311,6 +312,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         xblPath: String?,
         uefiPath: String?,
         vendorBootPath: String?,
+        dtboPath: String?,
         overwrite: Boolean,
         route: String?,
         onLog: (String) -> Unit,
@@ -356,6 +358,10 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 if (vendorBootPath != null) {
                     add("--vendor-boot")
                     add(vendorBootPath)
+                }
+                if (dtboPath != null) {
+                    add("--dtbo")
+                    add(dtboPath)
                 }
                 /* --format conf: the extractor output is already the flattened
                  * profile (no includes, credential template inlined), so the
@@ -449,6 +455,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 documentName = name,
                 route = report?.chosen ?: route,
                 anchor = anchorLine(captured),
+                physSource = physSourceFromLines(captured),
+                physLoadPresent = filtered.any { it.getLongAt("kernel_phys_load") != null },
+                physOffsetPresent = filtered.any { it.getLongAt("kernel_phys_offset") != null },
                 documentText = document,
             )
         } catch (error: CancellationException) {

@@ -26,7 +26,10 @@
 
 ### 在 App 中
 
-开始解析，选择手机的 `boot.img`；在联发科设备上出现附加选项时附加对应的 `vendor_boot.img`。解析出的 profile 会包含这两个物理地址；随后照常完成解析流程。（App 暂不支持附加 `dtbo.img`；若 `vendor_boot` 不带 DTB，请使用下方电脑命令。）
+开始解析，选择手机的 `boot.img`。联发科设备随后会提示提供 `vendor_boot.img`（推荐），请附加它。
+若该 `vendor_boot` 没有可用的 `/memory`（或你跳过了它），App 会继续提示提供 `dtbo.img`。
+只要其中一个镜像提供了值，解析出的 profile 就会包含这两个物理地址；随后照常完成解析流程。
+两个都跳过时 `kernel_phys_offset` 会为空，运行会在 W1 失败。
 
 ### 在电脑上
 

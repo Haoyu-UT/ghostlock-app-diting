@@ -53,6 +53,9 @@ interface GhostlockRepository {
         /** vendor_boot.img (MediaTek only); derives kernel_phys_load from
          * its header and kernel_phys_offset from its embedded DTB /memory. */
         vendorBootPath: String? = null,
+        /** dtbo.img (MediaTek only): the DTB fallback when vendor_boot carries
+         * no usable /memory (`dtb_size = 0` or no root memory node). */
+        dtboPath: String? = null,
         overwrite: Boolean = false,
         /** Selects one route explicitly; null lets the extractor decide and
          * returns [ParseResult.Ambiguous] when more than one is Feasible. */

@@ -35,11 +35,12 @@ bootloader takes the DTB from elsewhere — supply the phone's `dtbo.img` with
 
 ### In the app
 
-Start a parse, choose the phone's `boot.img`, and on a MediaTek device attach
-the matching `vendor_boot.img` when the attach options appear. The parsed
-profile then contains both physical values; finish the parse flow as usual.
-(The app has no `dtbo.img` attach yet; if the `vendor_boot` carries no DTB, use
-the PC command below.)
+Start a parse and choose the phone's `boot.img`. On a MediaTek device the app
+then asks for `vendor_boot.img` (recommended) — attach it. If the `vendor_boot`
+carries no usable `/memory` (or you skip it), the app asks for `dtbo.img` next.
+The parsed profile then contains both physical values if either image supplied
+them; finish the parse flow as usual. Skipping both leaves
+`kernel_phys_offset` empty, and the run fails at W1.
 
 ### On a PC
 

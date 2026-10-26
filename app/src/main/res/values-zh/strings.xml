@@ -33,6 +33,15 @@
     <string name="parse_attach_uefi">附加 uefi.img</string>
     <string name="parse_attach_xbl_uefi">附加 xbl_config.img + uefi.img</string>
     <string name="parse_attach_vendor_boot">附加 vendor_boot.img（联发科）</string>
+    <string name="parse_phys_vendor_boot_title">联发科机型：建议提供 vendor_boot.img</string>
+    <string name="parse_phys_xbl_title">高通机型：建议提供 xbl_config.img</string>
+    <string name="parse_phys_dtbo_title">vendor_boot 中没有可用的 /memory，建议提供 dtbo.img</string>
+    <string name="parse_phys_uefi_title">xbl_config 未能提供内核物理地址，建议提供 uefi.img</string>
+    <string name="parse_phys_attach_vendor_boot">附加 vendor_boot.img（推荐）</string>
+    <string name="parse_phys_attach_xbl">附加 xbl_config.img（推荐）</string>
+    <string name="parse_phys_attach_uefi">附加 uefi.img（推荐）</string>
+    <string name="parse_phys_attach_dtbo">附加 dtbo.img（推荐）</string>
+    <string name="parse_phys_skip">跳过（物理地址可能不完整）</string>
     <string name="parse_url_title">完整包链接</string>
     <string name="parse_url_hint">粘贴完整 OTA zip 链接</string>
     <string name="parse_start">开始解析</string>

@@ -33,6 +33,15 @@
     <string name="parse_attach_uefi">Attach uefi.img</string>
     <string name="parse_attach_xbl_uefi">Attach xbl_config.img + uefi.img</string>
     <string name="parse_attach_vendor_boot">Attach vendor_boot.img (MediaTek only)</string>
+    <string name="parse_phys_vendor_boot_title">MediaTek: vendor_boot.img recommended</string>
+    <string name="parse_phys_xbl_title">Qualcomm: xbl_config.img recommended</string>
+    <string name="parse_phys_dtbo_title">vendor_boot has no usable /memory; dtbo.img recommended</string>
+    <string name="parse_phys_uefi_title">xbl_config did not supply the kernel load; uefi.img recommended</string>
+    <string name="parse_phys_attach_vendor_boot">Attach vendor_boot.img (recommended)</string>
+    <string name="parse_phys_attach_xbl">Attach xbl_config.img (recommended)</string>
+    <string name="parse_phys_attach_uefi">Attach uefi.img (recommended)</string>
+    <string name="parse_phys_attach_dtbo">Attach dtbo.img (recommended)</string>
+    <string name="parse_phys_skip">Skip (physical values may stay incomplete)</string>
     <string name="parse_url_title">Full package URL</string>
     <string name="parse_url_hint">Paste full OTA zip URL</string>
     <string name="parse_start">Start</string>

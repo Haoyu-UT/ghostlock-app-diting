@@ -1,10 +1,17 @@
 # MTK `kernel_phys_offset` from the vendor_boot DTB — plan and result
 
-**Status: implemented on `feat/extractor-mtk-phys` (2026-10-25), host-gated. Tooling only;
-no device gate is required and no route/attack-path code changed.** Branch cut from `document`
-@ `9c96125`. Supersedes the D3 open decision in
-[`kernel-phys-offset-plan.md`](kernel-phys-offset-plan.md) (that plan added the profile field;
-this one fills it from the stock image).
+**Status: merged into `document` at `39b667d` (2026-10-26), host-gated and cross-checked on two
+real MediaTek images. Tooling only; no device gate is required and no route/attack-path code
+changed.** Branch `feat/extractor-mtk-phys` was cut from `document` @ `9c96125`. Supersedes the D3
+open decision in [`kernel-phys-offset-plan.md`](kernel-phys-offset-plan.md) (that plan added the
+profile field; this one fills it from the stock image).
+
+**App integration (2026-10-26).** The parse flow now asks for the platform images with
+mandatory/recommended semantics: `boot.img` is the input; MediaTek recommends `vendor_boot` and, if
+that carries no usable `/memory`, `dtbo`; Qualcomm recommends `xbl_config` and, if that did not
+supply the load, `uefi`. The extractor prints a canonical `info: phys_source=…` line the app uses
+to decide the next prompt. Device-tested on the Qualcomm branch; the MediaTek prompt decision is
+unit-tested. Record: `external/port/parse-phys-prompts-2026-10-26/`.
 
 ## Problem
 

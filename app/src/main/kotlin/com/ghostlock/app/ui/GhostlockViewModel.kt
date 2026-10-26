@@ -14,7 +14,11 @@ import com.ghostlock.app.domain.model.LogTone
 import com.ghostlock.app.domain.model.MeasuredKernelInfo
 import com.ghostlock.app.domain.model.MeasurementMergeRow
 import com.ghostlock.app.domain.model.ParseResult
+import com.ghostlock.app.domain.model.PhysImage
+import com.ghostlock.app.domain.model.PhysPromptState
 import com.ghostlock.app.domain.model.ProfileConfig
+import com.ghostlock.app.domain.model.nextPhysImage
+import com.ghostlock.app.domain.model.sourceSuppliesLoad
 import com.ghostlock.app.domain.model.ProfileDiffRow
 import com.ghostlock.app.domain.model.RunLogEntry
 import com.ghostlock.app.domain.model.ProfileFieldNode
@@ -56,13 +60,22 @@ sealed interface GhostlockEffect {
 
 private const val OverwriteSummaryLimit = 12
 
-enum class DocumentRequest { SelectProfile, BootImage, XblImage, PayloadImage, UefiImage, VendorBootImage }
+enum class DocumentRequest {
+    SelectProfile, BootImage, XblImage, PayloadImage, UefiImage, VendorBootImage, DtboImage,
+}
 
-/** Options offered by [promptBootAttach], in display order. VENDOR_BOOT is
- * only ever added to that list for MediaTek devices */
-private enum class AttachOption { NONE, XBL, UEFI, XBL_UEFI, VENDOR_BOOT }
+/** The parse pass in flight: the input plus the images attached so far. */
+private data class ParseRequest(
+    val input: String,
+    val xblPath: String? = null,
+    val uefiPath: String? = null,
+    val vendorBootPath: String? = null,
+    val dtboPath: String? = null,
+    val overwrite: Boolean = false,
+    val route: String? = null,
+)
 
-private enum class ParseDialogStage { Mode, Attach, Route }
+private enum class ParseDialogStage { Mode, PhysImage, Route }
 
 class GhostlockViewModel(
     private val repository: GhostlockRepository,
@@ -83,18 +96,19 @@ class GhostlockViewModel(
     val effects = effectChannel.receiveAsFlow()
 
     private var kernelSnapshot: KernelSnapshot? = null
-    private var pendingParseWithXbl = false
-    private var pendingParseWithUefi = false
-    private var pendingParseWithVendorBoot = false
-    private var pendingBootPath: String? = null
-    private var pendingXblPath: String? = null
-    private var pendingUefiPath: String? = null
-    private var pendingVendorBootPath: String? = null
-    private var pendingAttachOptions: List<AttachOption> = emptyList()
+    private var pendingParse: ParseRequest? = null
+    /** The platform's recommended images already offered this session. */
+    private var physVendorBootOffered = false
+    private var physXblOffered = false
+    private var physUefiOffered = false
+    private var physDtboOffered = false
+    /** The phys prompt on screen and the parsed result waiting behind it. */
+    private var pendingPhysImage: PhysImage? = null
+    private var pendingPhysAfter: ParseResult.Parsed? = null
     private var parseDialogStage = ParseDialogStage.Mode
     private var pendingConfirmation: PendingConfirmation? = null
-    /** Inputs of the pass that reported Ambiguous, re-run with the picked route. */
-    private var pendingRouteParse: PendingRouteParse? = null
+    /** The pass that reported Ambiguous, re-run with the picked route. */
+    private var pendingRouteParse: ParseRequest? = null
     private var pendingRouteChoices: List<RouteVerdict> = emptyList()
 
     /** The generated document and its stride evidence, held while the picker is up. */
@@ -1073,6 +1087,7 @@ class GhostlockViewModel(
     }
 
     fun parseOffsets() {
+        resetParseSession()
         parseDialogStage = ParseDialogStage.Mode
         mutableState.update {
             it.copy(
@@ -1088,27 +1103,14 @@ class GhostlockViewModel(
         }
     }
 
-    /** boot.img was chosen: let the user attach xbl_config / uefi (optional),
-     * or, on a MediaTek device, a vendor_boot.img instead */
-    private fun promptBootAttach() {
-        parseDialogStage = ParseDialogStage.Attach
-        val options = buildList {
-            add(AttachOption.NONE to R.string.parse_attach_none)
-            add(AttachOption.XBL to R.string.parse_attach_xbl)
-            add(AttachOption.UEFI to R.string.parse_attach_uefi)
-            add(AttachOption.XBL_UEFI to R.string.parse_attach_xbl_uefi)
-            if (isMediaTek()) add(AttachOption.VENDOR_BOOT to R.string.parse_attach_vendor_boot)
-        }
-        pendingAttachOptions = options.map { it.first }
-        mutableState.update {
-            it.copy(
-                dialogVisible = true,
-                dialogType = DialogType.LIST,
-                dialogTitleRes = R.string.parse_boot_attach_title,
-                dialogItems = emptyList(),
-                dialogItemResIds = options.map { it.second },
-            )
-        }
+    private fun resetParseSession() {
+        pendingParse = null
+        physVendorBootOffered = false
+        physXblOffered = false
+        physUefiOffered = false
+        physDtboOffered = false
+        pendingPhysImage = null
+        pendingPhysAfter = null
     }
 
     fun promptParseUrl() {
@@ -1131,6 +1133,7 @@ class GhostlockViewModel(
             DocumentRequest.XblImage -> stageXbl(uri)
             DocumentRequest.UefiImage -> stageUefi(uri)
             DocumentRequest.VendorBootImage -> stageVendorBoot(uri)
+            DocumentRequest.DtboImage -> stageDtbo(uri)
             DocumentRequest.PayloadImage -> stagePayload(uri)
         }
     }
@@ -1140,16 +1143,29 @@ class GhostlockViewModel(
         when (parseDialogStage) {
             ParseDialogStage.Mode -> when (index) {
                 0 -> pickPayload()
-                1 -> promptBootAttach()
+                1 -> pickBoot()
             }
 
-            ParseDialogStage.Attach -> when (pendingAttachOptions.getOrNull(index)) {
-                AttachOption.NONE -> pickBoot(withXbl = false, withUefi = false, withVendorBoot = false)
-                AttachOption.XBL -> pickBoot(withXbl = true, withUefi = false, withVendorBoot = false)
-                AttachOption.UEFI -> pickBoot(withXbl = false, withUefi = true, withVendorBoot = false)
-                AttachOption.XBL_UEFI -> pickBoot(withXbl = true, withUefi = true, withVendorBoot = false)
-                AttachOption.VENDOR_BOOT -> pickBoot(withXbl = false, withUefi = false, withVendorBoot = true)
-                null -> Unit
+            ParseDialogStage.PhysImage -> {
+                val image = pendingPhysImage
+                if (image == null || index > 1) {
+                    // no-op; keep the dialog state intact
+                } else if (index == 0) {
+                    when (image) {
+                        PhysImage.VENDOR_BOOT -> send(GhostlockEffect.PickDocument(DocumentRequest.VendorBootImage))
+                        PhysImage.XBL -> send(GhostlockEffect.PickDocument(DocumentRequest.XblImage))
+                        PhysImage.UEFI -> send(GhostlockEffect.PickDocument(DocumentRequest.UefiImage))
+                        PhysImage.DTBO -> send(GhostlockEffect.PickDocument(DocumentRequest.DtboImage))
+                    }
+                } else {
+                    val after = pendingPhysAfter
+                    pendingPhysImage = null
+                    if (after != null) {
+                        viewModelScope.launch(Dispatchers.IO) { advancePhys(after) }
+                    } else {
+                        launchParse()
+                    }
+                }
             }
 
             ParseDialogStage.Route -> {
@@ -1160,16 +1176,8 @@ class GhostlockViewModel(
                 parseDialogStage = ParseDialogStage.Mode
                 if (parse != null && route != null) {
                     appendLog("route chosen: $route")
-                    viewModelScope.launch(Dispatchers.IO) {
-                        runParse(
-                            input = parse.input,
-                            xblPath = parse.xblPath,
-                            uefiPath = parse.uefiPath,
-                            vendorBootPath = parse.vendorBootPath,
-                            overwrite = parse.overwrite,
-                            route = route,
-                        )
-                    }
+                    pendingParse = parse.copy(route = route)
+                    launchParse()
                 }
             }
         }
@@ -1341,47 +1349,39 @@ class GhostlockViewModel(
     }
 
     private fun pickPayload() {
-        pendingParseWithXbl = false
-        pendingParseWithUefi = false
         send(GhostlockEffect.Toast(R.string.parse_pick_payload_hint))
         send(GhostlockEffect.PickDocument(DocumentRequest.PayloadImage))
     }
 
-    private fun pickBoot(withXbl: Boolean, withUefi: Boolean, withVendorBoot: Boolean = false) {
-        pendingParseWithXbl = withXbl
-        pendingParseWithUefi = withUefi
-        pendingParseWithVendorBoot = withVendorBoot
-        pendingXblPath = null
-        pendingUefiPath = null
-        pendingVendorBootPath = null
-        if (withXbl) send(GhostlockEffect.Toast(R.string.parse_pick_boot_hint))
+    private fun pickBoot() {
         send(GhostlockEffect.PickDocument(DocumentRequest.BootImage))
+    }
+
+    /** The input image is staged; ask for the platform's recommended image
+     * before the first pass. */
+    private fun beginParseInput(input: String) {
+        pendingParse = ParseRequest(input)
+        val first = when {
+            isMediaTek() -> PhysImage.VENDOR_BOOT
+            isQualcomm() -> PhysImage.XBL
+            else -> null
+        }
+        if (first == null) launchParse() else showPhysPrompt(first, after = null)
+    }
+
+    private fun launchParse() {
+        val request = pendingParse ?: return
+        pendingPhysImage = null
+        pendingPhysAfter = null
+        viewModelScope.launch(Dispatchers.IO) { runParse(request) }
     }
 
     private fun stageBoot(uri: String) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val bootPath = readDocumentUseCase.cache(uri, "boot.img")
-                pendingBootPath = bootPath
                 appendLog("boot.img ready: $bootPath")
-                when {
-                    pendingParseWithXbl -> {
-                        send(GhostlockEffect.Toast(R.string.parse_pick_xbl_hint))
-                        send(GhostlockEffect.PickDocument(DocumentRequest.XblImage))
-                    }
-
-                    pendingParseWithUefi -> {
-                        send(GhostlockEffect.Toast(R.string.parse_pick_uefi_hint))
-                        send(GhostlockEffect.PickDocument(DocumentRequest.UefiImage))
-                    }
-
-                    pendingParseWithVendorBoot -> {
-                        send(GhostlockEffect.Toast(R.string.parse_pick_vendor_boot_hint))
-                        send(GhostlockEffect.PickDocument(DocumentRequest.VendorBootImage))
-                    }
-
-                    else -> runParse(bootPath)
-                }
+                beginParseInput(bootPath)
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
@@ -1392,19 +1392,18 @@ class GhostlockViewModel(
         }
     }
 
-    private fun stageXbl(uri: String) {
+    /** Caches one recommended image and re-runs the pass with it attached. */
+    private fun stageSidecar(
+        uri: String,
+        name: String,
+        update: (ParseRequest, String) -> ParseRequest,
+    ) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val bootPath = requireNotNull(pendingBootPath) { "boot.img is not staged" }
-                val xblPath = readDocumentUseCase.cache(uri, "xbl_config.img")
-                pendingXblPath = xblPath
-                appendLog("xbl_config.img ready: $xblPath")
-                if (pendingParseWithUefi) {
-                    send(GhostlockEffect.Toast(R.string.parse_pick_uefi_hint))
-                    send(GhostlockEffect.PickDocument(DocumentRequest.UefiImage))
-                } else {
-                    runParse(bootPath, xblPath = xblPath)
-                }
+                val path = readDocumentUseCase.cache(uri, name)
+                appendLog("$name ready: $path")
+                pendingParse = pendingParse?.let { update(it, path) }
+                launchParse()
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
@@ -1415,50 +1414,24 @@ class GhostlockViewModel(
         }
     }
 
-    private fun stageUefi(uri: String) {
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val bootPath = requireNotNull(pendingBootPath) { "boot.img is not staged" }
-                val uefiPath = readDocumentUseCase.cache(uri, "uefi.img")
-                pendingUefiPath = uefiPath
-                appendLog("uefi.img ready: $uefiPath")
-                runParse(bootPath, xblPath = pendingXblPath, uefiPath = uefiPath)
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: Exception) {
-                appendLog("parse error: ${error.message}")
-                appendLog("result: parse failed")
-                showNotice(R.string.parse_result_title, R.string.parse_failed)
-            }
-        }
-    }
+    private fun stageXbl(uri: String) =
+        stageSidecar(uri, "xbl_config.img") { request, path -> request.copy(xblPath = path) }
 
-    /** vendor_boot.img was chosen (MediaTek only): parses boot.img + this
-     * directly, no xbl_config/uefi/root needed. */
-    private fun stageVendorBoot(uri: String) {
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val bootPath = requireNotNull(pendingBootPath) { "boot.img is not staged" }
-                val vendorBootPath = readDocumentUseCase.cache(uri, "vendor_boot.img")
-                pendingVendorBootPath = vendorBootPath
-                appendLog("vendor_boot.img ready: $vendorBootPath")
-                runParse(bootPath, vendorBootPath = vendorBootPath)
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: Exception) {
-                appendLog("parse error: ${error.message}")
-                appendLog("result: parse failed")
-                showNotice(R.string.parse_result_title, R.string.parse_failed)
-            }
-        }
-    }
+    private fun stageUefi(uri: String) =
+        stageSidecar(uri, "uefi.img") { request, path -> request.copy(uefiPath = path) }
+
+    private fun stageVendorBoot(uri: String) =
+        stageSidecar(uri, "vendor_boot.img") { request, path -> request.copy(vendorBootPath = path) }
+
+    private fun stageDtbo(uri: String) =
+        stageSidecar(uri, "dtbo.img") { request, path -> request.copy(dtboPath = path) }
 
     private fun stagePayload(uri: String) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val payloadPath = readDocumentUseCase.cache(uri, "payload.bin")
                 appendLog("payload.bin ready: $payloadPath")
-                runParse(payloadPath)
+                beginParseInput(payloadPath)
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
@@ -1478,7 +1451,11 @@ class GhostlockViewModel(
             return
         }
         appendLog("parse OTA: $url")
-        viewModelScope.launch(Dispatchers.IO) { runParse(url) }
+        pendingParse = ParseRequest(url)
+        /* A remote payload's xbl_config is auto-extracted; a MediaTek payload's
+         * vendor_boot is not, so the follow-up asks for it. */
+        physXblOffered = isQualcomm()
+        launchParse()
     }
 
     /** Confirm/notice popup for an extractor outcome; unlike a Toast it waits
@@ -1516,28 +1493,27 @@ class GhostlockViewModel(
                 soc.contains("dimensity") || soc.contains("helio")
     }
 
+    private fun isQualcomm(): Boolean {
+        val soc = kernelSnapshot?.socName?.lowercase(Locale.ROOT).orEmpty()
+        return soc.contains("qualcomm") || soc.contains("qti") || soc.contains("snapdragon")
+    }
+
     private fun mediatekDocUrl(): String =
         "https://github.com/YuKongA/ghostlock-app/blob/main/docs/kernel_profiles/" +
                 if (Locale.getDefault().language == "zh") "MEDIATEK_ZH.md" else "MEDIATEK.md"
 
-    private suspend fun runParse(
-        input: String,
-        xblPath: String? = null,
-        uefiPath: String? = null,
-        vendorBootPath: String? = null,
-        overwrite: Boolean = false,
-        route: String? = null,
-    ) {
+    private suspend fun runParse(request: ParseRequest) {
         if (!beginOperation()) return
         try {
             when (
                 val result = parseSourceUseCase(
-                    input, xblPath, uefiPath, vendorBootPath, overwrite, route, ::appendLog,
+                    request.input, request.xblPath, request.uefiPath,
+                    request.vendorBootPath, request.dtboPath,
+                    request.overwrite, request.route, ::appendLog,
                 )
             ) {
                 is ParseResult.RequiresOverwrite -> {
-                    pendingConfirmation =
-                        PendingConfirmation.Parse(input, xblPath, uefiPath, vendorBootPath, route)
+                    pendingConfirmation = PendingConfirmation.Parse(request)
                     showOverwriteDialog(result.releases)
                 }
 
@@ -1554,9 +1530,7 @@ class GhostlockViewModel(
                         /* The choice is the user's: both routes are derived from
                          * the image, and which one runs is a device fact. The
                          * second pass forces the pick with --route. */
-                        pendingRouteParse = PendingRouteParse(
-                            input, xblPath, uefiPath, vendorBootPath, overwrite,
-                        )
+                        pendingRouteParse = request
                         pendingRouteChoices = feasible
                         parseDialogStage = ParseDialogStage.Route
                         mutableState.update {
@@ -1578,79 +1552,7 @@ class GhostlockViewModel(
                     }
                 }
 
-                is ParseResult.Parsed -> {
-                    val document = result.documentText
-                    if (document == null) {
-                        appendLog("result: the extractor produced no document")
-                        showNotice(R.string.parse_result_title, R.string.parse_failed)
-                        return
-                    }
-                    refreshSnapshot()
-                    refreshLegacyState()
-                    result.route?.let { appendLog("route: $it") }
-                    result.anchor?.let {
-                        appendLog(
-                            "anchor: " + it.removePrefix("info: ").removePrefix("warning: "),
-                        )
-                    }
-                    appendLog("profile generated: ${result.releases.joinToString()}")
-                    appendLog("result: profile generated; export it to use it")
-                    /* The live stride probe only makes sense for the running
-                     * kernel; a profile generated for another image skips it. */
-                    val runningRelease = kernelSnapshot?.kernelRelease
-                    val pair = kernelSnapshot?.let { snapshot ->
-                        snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair)
-                    }
-                    val strideProbe = if (runningRelease != null && pair != null &&
-                        runningRelease in result.releases
-                    ) {
-                        appendLog("stride: probing the mm_struct slab on the running kernel")
-                        runCatching {
-                            repository.probeStride(runningRelease, document, pair, ::appendLog)
-                        }.getOrNull()
-                    } else {
-                        null
-                    }
-                    if (strideProbe != null && runningRelease != null) {
-                        pendingStrideParse = result
-                        pendingStrideProbe = strideProbe
-                        pendingStrideDocument = document
-                        pendingStrideName = result.documentName
-                        pendingStrideRelease = runningRelease
-                        val recommendation = recommendStride(
-                            strideProbe,
-                            confirmedValue = rootMeasuredStride(runningRelease),
-                        )
-                        appendLog(
-                            "stride: ${strideProbe.candidates.size} candidate(s), " +
-                                "gcd=0x${strideProbe.gcd.toString(16)}, " +
-                                "rounds=${strideProbe.rounds}, samples=${strideProbe.samples}",
-                        )
-                        mutableState.update {
-                            it.copy(
-                                stridePicker = StridePickerUiState(
-                                    recommendation = recommendation,
-                                    selectedValue = recommendation.recommendedValue,
-                                    footerRes = R.string.stride_footer_export,
-                                ),
-                                executionSheetVisible = false,
-                            )
-                        }
-                    } else {
-                        finishGeneratedProfile(
-                            document,
-                            result.documentName,
-                            runningRelease ?: result.releases.firstOrNull() ?: "profile",
-                            null,
-                        )
-                    }
-                    if (result.missing.isNotEmpty()) {
-                        appendLog(
-                            "warning: missing ${result.missing.joinToString()}; " +
-                                    "run the MediaTek extractor or attach xbl_config.img / uefi.img",
-                        )
-                    }
-                }
+                is ParseResult.Parsed -> advancePhys(result)
 
                 ParseResult.AlreadyPresent -> {
                     appendLog("result: offsets already present")
@@ -1665,6 +1567,153 @@ class GhostlockViewModel(
             }
         } finally {
             endOperation()
+        }
+    }
+
+    /**
+     * The platform's image advice: ask for the next recommended image while
+     * one can still fill the physical pair, otherwise finish the pass.
+     */
+    private suspend fun advancePhys(result: ParseResult.Parsed) {
+        val next = nextPhysImage(physState(result))
+        if (next != null) {
+            showPhysPrompt(next, after = result)
+            return
+        }
+        if (isMediaTek() && !result.physOffsetPresent) {
+            appendLog(
+                "warning: kernel_phys_offset is still missing; attach a vendor_boot/dtbo " +
+                    "with /memory or fill it manually",
+            )
+        }
+        if (isQualcomm() && !sourceSuppliesLoad(result.physSource)) {
+            appendLog(
+                "warning: kernel_phys_load was not supplied by xbl_config/uefi; " +
+                    "attach uefi.img or fill it manually",
+            )
+        }
+        finishParsed(result)
+    }
+
+    private fun physState(result: ParseResult.Parsed) = PhysPromptState(
+        mediaTek = isMediaTek(),
+        qualcomm = isQualcomm(),
+        physSource = result.physSource,
+        offsetPresent = result.physOffsetPresent,
+        vendorBootOffered = physVendorBootOffered,
+        xblOffered = physXblOffered,
+        uefiOffered = physUefiOffered,
+        dtboOffered = physDtboOffered,
+    )
+
+    /** One per-platform prompt: attach the recommended image or skip it. */
+    private fun showPhysPrompt(image: PhysImage, after: ParseResult.Parsed?) {
+        pendingPhysImage = image
+        pendingPhysAfter = after
+        when (image) {
+            PhysImage.VENDOR_BOOT -> physVendorBootOffered = true
+            PhysImage.XBL -> physXblOffered = true
+            PhysImage.UEFI -> physUefiOffered = true
+            PhysImage.DTBO -> physDtboOffered = true
+        }
+        val title = when (image) {
+            PhysImage.VENDOR_BOOT -> R.string.parse_phys_vendor_boot_title
+            PhysImage.XBL -> R.string.parse_phys_xbl_title
+            PhysImage.UEFI -> R.string.parse_phys_uefi_title
+            PhysImage.DTBO -> R.string.parse_phys_dtbo_title
+        }
+        val attach = when (image) {
+            PhysImage.VENDOR_BOOT -> R.string.parse_phys_attach_vendor_boot
+            PhysImage.XBL -> R.string.parse_phys_attach_xbl
+            PhysImage.UEFI -> R.string.parse_phys_attach_uefi
+            PhysImage.DTBO -> R.string.parse_phys_attach_dtbo
+        }
+        parseDialogStage = ParseDialogStage.PhysImage
+        mutableState.update {
+            it.copy(
+                dialogVisible = true,
+                dialogType = DialogType.LIST,
+                dialogTitleRes = title,
+                dialogItems = emptyList(),
+                dialogItemResIds = listOf(attach, R.string.parse_phys_skip),
+                dialogCurrentItemIndex = -1,
+                executionSheetVisible = false,
+            )
+        }
+    }
+
+    /** The Parsed branch once the image advice is satisfied. */
+    private suspend fun finishParsed(result: ParseResult.Parsed) {
+        val document = result.documentText
+        if (document == null) {
+            appendLog("result: the extractor produced no document")
+            showNotice(R.string.parse_result_title, R.string.parse_failed)
+            return
+        }
+        refreshSnapshot()
+        refreshLegacyState()
+        result.route?.let { appendLog("route: $it") }
+        result.anchor?.let {
+            appendLog(
+                "anchor: " + it.removePrefix("info: ").removePrefix("warning: "),
+            )
+        }
+        appendLog("profile generated: ${result.releases.joinToString()}")
+        appendLog("result: profile generated; export it to use it")
+        /* The live stride probe only makes sense for the running kernel; a
+         * profile generated for another image skips it. */
+        val runningRelease = kernelSnapshot?.kernelRelease
+        val pair = kernelSnapshot?.let { snapshot ->
+            snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair)
+        }
+        val strideProbe = if (runningRelease != null && pair != null &&
+            runningRelease in result.releases
+        ) {
+            appendLog("stride: probing the mm_struct slab on the running kernel")
+            runCatching {
+                repository.probeStride(runningRelease, document, pair, ::appendLog)
+            }.getOrNull()
+        } else {
+            null
+        }
+        if (strideProbe != null && runningRelease != null) {
+            pendingStrideParse = result
+            pendingStrideProbe = strideProbe
+            pendingStrideDocument = document
+            pendingStrideName = result.documentName
+            pendingStrideRelease = runningRelease
+            val recommendation = recommendStride(
+                strideProbe,
+                confirmedValue = rootMeasuredStride(runningRelease),
+            )
+            appendLog(
+                "stride: ${strideProbe.candidates.size} candidate(s), " +
+                    "gcd=0x${strideProbe.gcd.toString(16)}, " +
+                    "rounds=${strideProbe.rounds}, samples=${strideProbe.samples}",
+            )
+            mutableState.update {
+                it.copy(
+                    stridePicker = StridePickerUiState(
+                        recommendation = recommendation,
+                        selectedValue = recommendation.recommendedValue,
+                        footerRes = R.string.stride_footer_export,
+                    ),
+                    executionSheetVisible = false,
+                )
+            }
+        } else {
+            finishGeneratedProfile(
+                document,
+                result.documentName,
+                runningRelease ?: result.releases.firstOrNull() ?: "profile",
+                null,
+            )
+        }
+        if (result.missing.isNotEmpty()) {
+            appendLog(
+                "warning: missing ${result.missing.joinToString()}; " +
+                    "attach the platform image or fill the fields manually",
+            )
         }
     }
 
@@ -1691,15 +1740,9 @@ class GhostlockViewModel(
         val confirmation = pendingConfirmation ?: return
         pendingConfirmation = null
         when (confirmation) {
-            is PendingConfirmation.Parse -> viewModelScope.launch(Dispatchers.IO) {
-                runParse(
-                    confirmation.input,
-                    confirmation.xblPath,
-                    confirmation.uefiPath,
-                    confirmation.vendorBootPath,
-                    overwrite = true,
-                    route = confirmation.route,
-                )
+            is PendingConfirmation.Parse -> {
+                pendingParse = confirmation.request.copy(overwrite = true)
+                launchParse()
             }
         }
     }
@@ -1816,23 +1859,6 @@ class GhostlockViewModel(
     }
 
     private sealed interface PendingConfirmation {
-        data class Parse(
-            val input: String,
-            val xblPath: String?,
-            val uefiPath: String?,
-            val vendorBootPath: String? = null,
-            /** Kept across the overwrite confirmation, so the retry does not
-             * fall back into the ambiguity picker. */
-            val route: String? = null,
-        ) : PendingConfirmation
+        data class Parse(val request: ParseRequest) : PendingConfirmation
     }
-
-    /** Inputs of the pass that exited 7, replayed with the user's route. */
-    private data class PendingRouteParse(
-        val input: String,
-        val xblPath: String?,
-        val uefiPath: String?,
-        val vendorBootPath: String?,
-        val overwrite: Boolean,
-    )
 }

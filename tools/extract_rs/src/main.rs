@@ -521,6 +521,11 @@ fn run(cli: &Cli) -> Result<i32> {
             );
         }
     }
+    /* One canonical line for the app: which source supplied the physical pair.
+     * The parse flow uses it to decide whether to ask for the next recommended
+     * image (xbl_config -> uefi, vendor_boot -> dtbo). */
+    eprintln!("info: phys_source={phys_source}");
+
     if cli.anchor && cli.format != "conf" {
         eprintln!("warning: --anchor only affects --format conf; ignoring");
     }
