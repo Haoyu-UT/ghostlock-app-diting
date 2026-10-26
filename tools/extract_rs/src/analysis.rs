@@ -260,6 +260,135 @@ pub fn suggest_route(
     suggest(pselect_derived, &available, family, major, minor)
 }
 
+/// The select_stack verdict is the same for every family: it is the pselect
+/// derivation's own result.
+fn select_stack_verdict(pselect: &PselectOutcome) -> RouteVerdict {
+    match pselect {
+        PselectOutcome::Derived(layout) => {
+            let delta = layout.futex_waiter - layout.pselect_word0;
+            let numbers = BTreeMap::from([
+                ("pselect_word0".to_string(), layout.pselect_word0),
+                ("futex_waiter".to_string(), layout.futex_waiter),
+                ("buffer".to_string(), layout.pselect_buffer as i64),
+                ("waiter_local".to_string(), layout.waiter_local as i64),
+                ("delta".to_string(), delta),
+                ("waiter_shift".to_string(), layout.shift as i64 - 2),
+            ]);
+            RouteVerdict {
+                route: "select_stack",
+                verdict: Feasibility::Feasible,
+                reason: format!("pselect/futex geometry derived ({})", layout.chain),
+                numbers,
+            }
+        }
+        PselectOutcome::Infeasible { message, numbers } => RouteVerdict {
+            route: "select_stack",
+            verdict: Feasibility::Infeasible,
+            reason: message.clone(),
+            numbers: numbers.clone(),
+        },
+        PselectOutcome::Failed(message) => RouteVerdict {
+            route: "select_stack",
+            verdict: Feasibility::Unknown,
+            reason: message.clone(),
+            numbers: BTreeMap::new(),
+        },
+        PselectOutcome::NotAttempted(reason) => RouteVerdict {
+            route: "select_stack",
+            verdict: Feasibility::Unknown,
+            reason: (*reason).to_string(),
+            numbers: BTreeMap::new(),
+        },
+    }
+}
+
+/// The futex waiter depth, in the negative space the pselect layout uses. The
+/// tcp relation is measured against it.
+fn waiter_depth(pselect: &PselectOutcome) -> Option<i64> {
+    match pselect {
+        PselectOutcome::Derived(layout) => Some(layout.futex_waiter),
+        PselectOutcome::Infeasible { numbers, .. } => numbers.get("futex_waiter").copied(),
+        _ => None,
+    }
+}
+
+/// The tcp_zerocopy verdict from the image. The route stamps its fake waiter
+/// through the `getsockopt` zc local, which must sit exactly 8 bytes above the
+/// futex waiter, and the copy cap must reach the last fake word (0x38). On 5.x
+/// the cap is below that and the route cannot deliver; on the 6.1 train both
+/// conditions hold (device-proven).
+fn tcp_zerocopy_verdict(
+    kernel: &[u8],
+    rel_symbols: &RelSymbols,
+    sorted_offsets: &[u64],
+    pselect: &PselectOutcome,
+    allow_disasm: bool,
+) -> RouteVerdict {
+    let unknown = |reason: String| RouteVerdict {
+        route: "tcp_zerocopy",
+        verdict: Feasibility::Unknown,
+        reason,
+        numbers: BTreeMap::new(),
+    };
+    if !allow_disasm {
+        return unknown("--no-disasm".to_string());
+    }
+    let Some(waiter) = waiter_depth(pselect) else {
+        return unknown("pselect/futex waiter depth not derived".to_string());
+    };
+    match crate::derive::derive_tcp_zerocopy_layout(
+        kernel,
+        rel_symbols,
+        sorted_offsets,
+        waiter,
+    ) {
+        Ok(layout) => {
+            let numbers = BTreeMap::from([
+                ("copy_cap".to_string(), layout.copy_cap as i64),
+                ("zc_local".to_string(), layout.zc_local as i64),
+                ("chain_sum".to_string(), layout.chain_sum as i64),
+                ("zc_depth".to_string(), layout.zc_depth),
+                ("waiter_depth".to_string(), layout.waiter_depth),
+                ("delta".to_string(), layout.delta),
+            ]);
+            if layout.copy_cap < crate::derive::TCP_FAKE_WAITER_END {
+                RouteVerdict {
+                    route: "tcp_zerocopy",
+                    verdict: Feasibility::Infeasible,
+                    reason: format!(
+                        "getsockopt copy cap {:#x} ends before the fake waiter words (need {:#x})",
+                        layout.copy_cap,
+                        crate::derive::TCP_FAKE_WAITER_END
+                    ),
+                    numbers,
+                }
+            } else if layout.delta != 0 {
+                RouteVerdict {
+                    route: "tcp_zerocopy",
+                    verdict: Feasibility::Infeasible,
+                    reason: format!(
+                        "getsockopt zc local is {} bytes off the waiter relation (cap {:#x})",
+                        layout.delta, layout.copy_cap
+                    ),
+                    numbers,
+                }
+            } else {
+                RouteVerdict {
+                    route: "tcp_zerocopy",
+                    verdict: Feasibility::Feasible,
+                    reason: format!(
+                        "getsockopt zc local sits 8 bytes above the waiter (depth {:#x}), \
+                         copy cap {:#x}",
+                        -layout.zc_depth, layout.copy_cap
+                    ),
+                    numbers,
+                }
+            }
+        }
+        Err(err) => unknown(err.to_string()),
+    }
+}
+
 /// Every 5.10 route's verdict, computed before any selection. The `do_futex`
 /// frame rule is deliberately absent here: it is only the zero-feasible
 /// fallback, so it cannot pre-empt a route the derivation did not guess.
@@ -272,43 +401,7 @@ pub fn route_verdicts_5_10(
     allow_disasm: bool,
 ) -> Vec<RouteVerdict> {
     let mut verdicts = Vec::with_capacity(4);
-    match pselect {
-        PselectOutcome::Derived(layout) => {
-            let delta = layout.futex_waiter - layout.pselect_word0;
-            let numbers = BTreeMap::from([
-                ("pselect_word0".to_string(), layout.pselect_word0),
-                ("futex_waiter".to_string(), layout.futex_waiter),
-                ("buffer".to_string(), layout.pselect_buffer as i64),
-                ("waiter_local".to_string(), layout.waiter_local as i64),
-                ("delta".to_string(), delta),
-                ("waiter_shift".to_string(), layout.shift as i64 - 2),
-            ]);
-            verdicts.push(RouteVerdict {
-                route: "select_stack",
-                verdict: Feasibility::Feasible,
-                reason: format!("pselect/futex geometry derived ({})", layout.chain),
-                numbers,
-            });
-        }
-        PselectOutcome::Infeasible { message, numbers } => verdicts.push(RouteVerdict {
-            route: "select_stack",
-            verdict: Feasibility::Infeasible,
-            reason: message.clone(),
-            numbers: numbers.clone(),
-        }),
-        PselectOutcome::Failed(message) => verdicts.push(RouteVerdict {
-            route: "select_stack",
-            verdict: Feasibility::Unknown,
-            reason: message.clone(),
-            numbers: BTreeMap::new(),
-        }),
-        PselectOutcome::NotAttempted(reason) => verdicts.push(RouteVerdict {
-            route: "select_stack",
-            verdict: Feasibility::Unknown,
-            reason: (*reason).to_string(),
-            numbers: BTreeMap::new(),
-        }),
-    }
+    verdicts.push(select_stack_verdict(pselect));
     if allow_disasm {
         verdicts.push(multicast_verdict_5_10(
             kernel,
@@ -339,13 +432,65 @@ pub fn route_verdicts_5_10(
             numbers: BTreeMap::new(),
         });
     }
-    verdicts.push(RouteVerdict {
-        route: "tcp_zerocopy",
-        verdict: Feasibility::Unknown,
-        reason: "no 5.10 tcp geometry derivation".to_string(),
-        numbers: BTreeMap::new(),
-    });
+    verdicts.push(tcp_zerocopy_verdict(
+        kernel,
+        rel_symbols,
+        sorted_offsets,
+        pselect,
+        allow_disasm,
+    ));
     verdicts
+}
+
+/// Every route's verdict for families without the 5.10 model (the 6.x train):
+/// the pselect-derived select_stack, the derived tcp_zerocopy, and multicast /
+/// sigreturn unknown until they get their own derivation.
+pub fn route_verdicts_other(
+    kernel: &[u8],
+    rel_symbols: &RelSymbols,
+    sorted_offsets: &[u64],
+    pselect: &PselectOutcome,
+    allow_disasm: bool,
+) -> Vec<RouteVerdict> {
+    let unknown = |route: &'static str, reason: &str| RouteVerdict {
+        route,
+        verdict: Feasibility::Unknown,
+        reason: reason.to_string(),
+        numbers: BTreeMap::new(),
+    };
+    vec![
+        select_stack_verdict(pselect),
+        unknown(
+            "multicast_waiter",
+            "no non-5.10 multicast geometry derivation",
+        ),
+        unknown("sigreturn", "no non-5.10 sigreturn geometry derivation"),
+        tcp_zerocopy_verdict(
+            kernel,
+            rel_symbols,
+            sorted_offsets,
+            pselect,
+            allow_disasm,
+        ),
+    ]
+}
+
+/// Dispatch on the release major: the 5.x line keeps its own model, every
+/// other family uses the generic one.
+pub fn route_verdicts(
+    kernel: &[u8],
+    rel_symbols: &RelSymbols,
+    sorted_offsets: &[u64],
+    btf: Option<&Btf>,
+    pselect: &PselectOutcome,
+    allow_disasm: bool,
+    release_major: Option<u32>,
+) -> Vec<RouteVerdict> {
+    if release_major == Some(5) {
+        route_verdicts_5_10(kernel, rel_symbols, sorted_offsets, btf, pselect, allow_disasm)
+    } else {
+        route_verdicts_other(kernel, rel_symbols, sorted_offsets, pselect, allow_disasm)
+    }
 }
 
 fn sigreturn_verdict_5_10(
@@ -497,11 +642,11 @@ fn multicast_verdict_5_10(
 }
 
 /// Select a route from the verdict set. Exactly one Feasible route wins
-/// without a prompt; more than one is ambiguous; zero may use the frame rule,
-/// but only for an Unknown route — never one proven Infeasible.
-pub fn select_route_5_10(
+/// without a prompt; more than one is ambiguous; zero may use the fallback
+/// nomination, but only for a route that is not proven Infeasible.
+pub fn select_route(
     verdicts: &[RouteVerdict],
-    frame_hint: Option<(&'static str, String)>,
+    fallback: Option<(&'static str, String)>,
 ) -> RouteSelection {
     let feasible: Vec<&RouteVerdict> = verdicts
         .iter()
@@ -517,9 +662,9 @@ pub fn select_route_5_10(
             }
         }
         0 => {
-            let Some((route, hint_reason)) = frame_hint else {
+            let Some((route, hint_reason)) = fallback else {
                 return RouteSelection::None {
-                    reason: "no route is feasible and the frame rule nominated none".to_string(),
+                    reason: "no route is feasible and no fallback route was nominated".to_string(),
                 };
             };
             match verdicts.iter().find(|verdict| verdict.route == route) {
@@ -533,12 +678,10 @@ pub fn select_route_5_10(
                     }
                 }
                 Some(_) => RouteSelection::None {
-                    reason: format!(
-                        "the frame rule nominated {route}, but its layout is proven infeasible"
-                    ),
+                    reason: format!("the fallback route {route} is proven infeasible"),
                 },
                 None => RouteSelection::None {
-                    reason: format!("the frame rule nominated an unknown route {route}"),
+                    reason: format!("the fallback route {route} has no verdict"),
                 },
             }
         }
@@ -603,20 +746,17 @@ pub fn build(input: Input<'_>) -> Analysis {
         input.rel_symbols,
         input.sorted_offsets,
     );
-    let verdicts = if kernel_major == Some(5) {
-        route_verdicts_5_10(
-            input.kernel,
-            input.rel_symbols,
-            input.sorted_offsets,
-            input.btf,
-            &pselect,
-            input.allow_disasm,
-        )
-    } else {
-        Vec::new()
-    };
-    let (suggestion, suggestion_confidence, suggestion_reasons) = if kernel_major == Some(5) {
-        let hint = if input.allow_disasm {
+    let verdicts = route_verdicts(
+        input.kernel,
+        input.rel_symbols,
+        input.sorted_offsets,
+        input.btf,
+        &pselect,
+        input.allow_disasm,
+        kernel_major,
+    );
+    let hint = if kernel_major == Some(5) {
+        if input.allow_disasm {
             input.release.and_then(|release| {
                 crate::family::route_hint(
                     input.kernel,
@@ -627,8 +767,15 @@ pub fn build(input: Input<'_>) -> Analysis {
             })
         } else {
             None
-        };
-        match select_route_5_10(&verdicts, hint) {
+        }
+    } else {
+        let pselect_derived = matches!(pselect, PselectOutcome::Derived(_));
+        let (hint_route, _, hint_reasons) =
+            suggest_route(pselect_derived, &paths, input.release);
+        hint_route.map(|route| (route, hint_reasons.first().cloned().unwrap_or_default()))
+    };
+    let (suggestion, suggestion_confidence, suggestion_reasons) =
+        match select_route(&verdicts, hint) {
             RouteSelection::Chosen {
                 route,
                 basis,
@@ -651,11 +798,7 @@ pub fn build(input: Input<'_>) -> Analysis {
                 )],
             ),
             RouteSelection::None { reason } => (None, Confidence::Low, vec![reason]),
-        }
-    } else {
-        let pselect_derived = matches!(pselect, PselectOutcome::Derived(_));
-        suggest_route(pselect_derived, &paths, input.release)
-    };
+        };
 
     Analysis {
         release: input.release.map(str::to_string),
@@ -952,7 +1095,7 @@ mod tests {
             verdict("sigreturn", Feasibility::Unknown),
             verdict("tcp_zerocopy", Feasibility::Unknown),
         ];
-        match select_route_5_10(&verdicts, None) {
+        match select_route(&verdicts, None) {
             RouteSelection::Chosen { route, basis, .. } => {
                 assert_eq!(route, "select_stack");
                 assert_eq!(basis, SelectionBasis::Derived);
@@ -969,7 +1112,7 @@ mod tests {
             verdict("sigreturn", Feasibility::Unknown),
             verdict("tcp_zerocopy", Feasibility::Unknown),
         ];
-        match select_route_5_10(&verdicts, None) {
+        match select_route(&verdicts, None) {
             RouteSelection::Ambiguous { routes } => {
                 assert_eq!(routes, vec!["select_stack", "multicast_waiter"]);
             }
@@ -986,7 +1129,7 @@ mod tests {
             verdict("tcp_zerocopy", Feasibility::Unknown),
         ];
         let hint = Some(("sigreturn", "do_futex frame 0x20".to_string()));
-        match select_route_5_10(&verdicts, hint) {
+        match select_route(&verdicts, hint) {
             RouteSelection::Chosen { route, basis, .. } => {
                 assert_eq!(route, "sigreturn");
                 assert_eq!(basis, SelectionBasis::Fallback);
@@ -1005,7 +1148,7 @@ mod tests {
         ];
         let hint = Some(("select_stack", "do_futex frame 0xc0".to_string()));
         assert!(matches!(
-            select_route_5_10(&verdicts, hint),
+            select_route(&verdicts, hint),
             RouteSelection::None { .. }
         ));
     }
@@ -1014,8 +1157,27 @@ mod tests {
     fn no_feasible_route_and_no_hint_selects_nothing() {
         let verdicts = vec![verdict("select_stack", Feasibility::Unknown)];
         assert!(matches!(
-            select_route_5_10(&verdicts, None),
+            select_route(&verdicts, None),
             RouteSelection::None { .. }
         ));
+    }
+
+    #[test]
+    fn the_6x_shape_asks_between_select_stack_and_tcp() {
+        // The 6.1.138 image derives both the pselect layout and the tcp
+        // relation, so the parse must prompt instead of silently taking the
+        // suggestion.
+        let verdicts = vec![
+            verdict("select_stack", Feasibility::Feasible),
+            verdict("multicast_waiter", Feasibility::Unknown),
+            verdict("sigreturn", Feasibility::Unknown),
+            verdict("tcp_zerocopy", Feasibility::Feasible),
+        ];
+        match select_route(&verdicts, None) {
+            RouteSelection::Ambiguous { routes } => {
+                assert_eq!(routes, vec!["select_stack", "tcp_zerocopy"]);
+            }
+            other => panic!("unexpected selection: {other:?}"),
+        }
     }
 }

