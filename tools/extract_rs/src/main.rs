@@ -17,6 +17,7 @@ use ghostlock_extract::derive::{
 use ghostlock_extract::error::{ExtractError, Result};
 use ghostlock_extract::family;
 use ghostlock_extract::fdt::{recover_kernel_phys_load, recover_kernel_phys_load_from_uefi};
+use ghostlock_extract::dtbo;
 use ghostlock_extract::iomem;
 use ghostlock_extract::ikconfig;
 use ghostlock_extract::kallsyms;
@@ -29,7 +30,9 @@ use ghostlock_extract::symbols::{
     kernel_layout_verified, kernel_struct_macro, loggers_anchor_fallback, resolve_structs,
     resolve_symbols,
 };
-use ghostlock_extract::vendor_boot::recover_kernel_phys_from_vendor_boot;
+use ghostlock_extract::vendor_boot::{
+    recover_kernel_phys_from_vendor_boot, PhysOffsetSource,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -56,9 +59,14 @@ struct Cli {
     #[arg(long)]
     uefi: Option<PathBuf>,
     /// optional vendor_boot.img (MediaTek only); derive kernel physical load
-    /// AND offset from its header kernel_addr field.
+    /// from its header kernel_addr and the offset from its embedded DTB
     #[arg(long)]
     vendor_boot: Option<PathBuf>,
+    /// optional dtbo.img (MediaTek only); derive kernel_phys_offset from its
+    /// DTBs' /memory node when vendor_boot.img carries no embedded DTB (or is
+    /// not supplied)
+    #[arg(long)]
+    dtbo: Option<PathBuf>,
     /// kernel physical load address (hex or decimal); overrides defaults
     #[arg(long, value_parser = parse_int)]
     phys: Option<u64>,
@@ -285,37 +293,79 @@ fn run(cli: &Cli) -> Result<i32> {
         kernel_phys_load = cli.phys;
     }
 
-    // vendor_boot.img's kernel_addr field always supplies kernel_phys_load;
-    // kernel_phys_offset (the DRAM base) is only set when the alignment
-    // pattern proves it (see vendor_boot::classify) rather than merely
-    // being consistent with it, e.g. for MediaTek devices.
+    // vendor_boot.img (MediaTek): kernel_addr supplies kernel_phys_load, and
+    // the DTB in its dtb section supplies kernel_phys_offset from /memory.
+    // When the image carries no usable DTB, the header's text-align pattern
+    // is the fallback; dtbo.img names the same node when the bootloader takes
+    // the DTB from elsewhere (dtb_size == 0).
     let mut vendor_boot_phys_offset: Option<u64> = None;
-    if kernel_phys_load.is_none() {
-        if let Some(vb) = &cli.vendor_boot {
-            match recover_kernel_phys_from_vendor_boot(vb) {
-                Ok((load, Some(offset))) => {
-                    eprintln!(
-                        "info: vendor_boot; kernel_phys_load=0x{load:x} \
-                         kernel_phys_offset=0x{offset:x}"
-                    );
+    if let Some(vb) = &cli.vendor_boot {
+        match recover_kernel_phys_from_vendor_boot(vb) {
+            Ok(info) => {
+                if kernel_phys_load.is_none() {
+                    kernel_phys_load = Some(info.kernel_addr);
                     phys_source = "vendor_boot header (MediaTek)";
-                    kernel_phys_load = Some(load);
-                    vendor_boot_phys_offset = Some(offset);
-                }
-                Ok((load, None)) => {
                     eprintln!(
-                        "info: vendor_boot; kernel_phys_load=0x{load:x} \
-                         (MiB-aligned but not provably the DRAM base; \
-                         kernel_phys_offset left unset, pass --iomem or \
-                         --phys to supply it)"
+                        "info: vendor_boot; kernel_phys_load=0x{:x}",
+                        info.kernel_addr
                     );
-                    phys_source = "vendor_boot header (MediaTek)";
-                    kernel_phys_load = Some(load);
+                } else {
+                    eprintln!(
+                        "info: vendor_boot; kernel_addr=0x{:x} \
+                         (kernel_phys_load already resolved)",
+                        info.kernel_addr
+                    );
                 }
-                Err(err) => eprintln!(
-                    "warning: vendor_boot header parse failed: {err}; \
-                     trying other sources"
-                ),
+                if let Some(err) = &info.dtb_error {
+                    eprintln!("warning: vendor_boot embedded DTB unusable: {err}");
+                }
+                match info.source {
+                    PhysOffsetSource::EmbeddedDtb => {
+                        let offset = info.phys_offset.unwrap_or(0);
+                        eprintln!(
+                            "info: vendor_boot DTB /memory; \
+                             kernel_phys_offset=0x{offset:x}"
+                        );
+                        if let (Some(header), Some(dtb)) =
+                            (info.header_offset, info.phys_offset)
+                        {
+                            if header != dtb {
+                                eprintln!(
+                                    "warning: header alignment implies \
+                                     kernel_phys_offset=0x{header:x}; the DTB \
+                                     /memory node wins"
+                                );
+                            }
+                        }
+                    }
+                    PhysOffsetSource::HeaderAlignment => {
+                        let offset = info.phys_offset.unwrap_or(0);
+                        eprintln!(
+                            "info: vendor_boot header alignment; \
+                             kernel_phys_offset=0x{offset:x}"
+                        );
+                    }
+                    PhysOffsetSource::Unset => eprintln!(
+                        "info: vendor_boot; kernel_phys_offset not provable \
+                         (MiB-aligned kernel_addr and no usable embedded DTB); \
+                         pass --dtbo or --iomem to supply it"
+                    ),
+                }
+                vendor_boot_phys_offset = info.phys_offset;
+            }
+            Err(err) => eprintln!(
+                "warning: vendor_boot parse failed: {err}; trying other sources"
+            ),
+        }
+    }
+    if vendor_boot_phys_offset.is_none() {
+        if let Some(dtbo_path) = &cli.dtbo {
+            match dtbo::memory_base_from_path(dtbo_path) {
+                Ok(base) => {
+                    eprintln!("info: dtbo /memory; kernel_phys_offset=0x{base:x}");
+                    vendor_boot_phys_offset = Some(base);
+                }
+                Err(err) => eprintln!("warning: dtbo parse failed: {err}"),
             }
         }
     }
@@ -1242,8 +1292,8 @@ fn run(cli: &Cli) -> Result<i32> {
         report::render_conf(&report::ConfInputs {
             release: release_text,
             phys: kernel_phys_load,
-            /* DRAM base: from /proc/iomem when the extractor ran on a rooted
-             * device, otherwise left for the profile author to fill. */
+            /* DRAM base: from /proc/iomem, or from the vendor_boot/dtb DTB
+             * /memory node, or left null for the profile author to fill. */
             phys_offset: kernel_phys_offset,
             symbols: &symbol_offsets,
             structs: &struct_offsets,

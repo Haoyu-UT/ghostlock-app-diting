@@ -79,9 +79,11 @@ and doesn't repeat the field reference.
    the image's embedded table. `pselect_waiter_shift` and
    `off_slide_loggers_0_1` are derived by the built-in arm64 disassembler, and
    the route is suggested from kernel evidence (`--route` overrides it).
-   MediaTek images have no `xbl_config.img` and usually no embedded BTF: the
-   physical load address is derived from kallsyms `_text`, and you can override
-   it with `--phys`.
+   MediaTek images have no `xbl_config.img` and usually no embedded BTF: pass
+   the matching `vendor_boot.img` to read `kernel_phys_load` from its header and
+   `kernel_phys_offset` from the `/memory` node of its embedded DTB (add
+   `--dtbo` when that image carries no DTB). Without them the load falls back
+   to the kallsyms `_text` link base and `--phys`.
 
 5. **Transcribe field by field, then check your work.**
    Field meanings and requirements are in the
