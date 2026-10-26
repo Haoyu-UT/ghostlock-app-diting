@@ -7,8 +7,10 @@ Derive the two physical addresses a profile needs, on a rooted device:
 - `kernel_phys_load` — the `_text` physical load address.
 - `kernel_phys_offset` — the DRAM base (linear-map `PHYS_OFFSET`).
 
-The extractor cannot obtain these from the image (see
-[MEDIATEK.md](../../docs/kernel_profiles/MEDIATEK.md)); the script reads them
+The extractor reads both from `boot.img` + `vendor_boot.img`: the vendor_boot
+header's `kernel_addr` and the embedded DTB's `/memory` node. This script is
+the rooted fallback for devices whose images carry no DTB (see
+[MEDIATEK.md](../../docs/kernel_profiles/MEDIATEK.md)); it reads the values
 from `/proc/iomem` and `/proc/kallsyms`.
 
 ## Files

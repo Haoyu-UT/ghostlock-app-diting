@@ -67,7 +67,9 @@ GhostLock 用 `uname -r` 精确匹配内核版本：匹配不到时应用会直�
    `--kallsyms`，省略时会尝试恢复镜像内嵌表。`pselect_waiter_shift` 和
    `off_slide_loggers_0_1` 由内置的 arm64 反汇编器推导，route 由内核证据建议
    （`--route` 覆盖）。联发科（MediaTek）镜像没有 `xbl_config.img`，通常也没有内嵌 BTF：
-   物理加载地址由 kallsyms 的 `_text` 推导，必要时用 `--phys` 覆盖。
+   请一并传入对应的 `vendor_boot.img`——`kernel_phys_load` 取自其头部，`kernel_phys_offset`
+   取自其内嵌 DTB 的 `/memory` 节点（该镜像不带 DTB 时改用 `--dtbo`）。二者都缺失时，
+   加载地址回退到 kallsyms 的 `_text`，并可用 `--phys` 覆盖。
 
 5. **逐字段转录并自检。**
    字段含义与必填要求见 [Profile 结构文档](PROFILE_SCHEMA_ZH.md)。

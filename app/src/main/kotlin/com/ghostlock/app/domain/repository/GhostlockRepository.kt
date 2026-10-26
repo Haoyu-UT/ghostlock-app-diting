@@ -50,8 +50,8 @@ interface GhostlockRepository {
         input: String,
         xblPath: String? = null,
         uefiPath: String? = null,
-        /** vendor_boot.img (MediaTek only); derives kernel_phys_load AND
-         * kernel_phys_offset from its header. */
+        /** vendor_boot.img (MediaTek only); derives kernel_phys_load from
+         * its header and kernel_phys_offset from its embedded DTB /memory. */
         vendorBootPath: String? = null,
         overwrite: Boolean = false,
         /** Selects one route explicitly; null lets the extractor decide and

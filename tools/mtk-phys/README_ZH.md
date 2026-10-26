@@ -7,9 +7,10 @@
 - `kernel_phys_load` —— `_text` 的物理加载地址。
 - `kernel_phys_offset` —— DRAM 基址（linear-map `PHYS_OFFSET`）。
 
-提取器无法从镜像取得这两个值（见
-[MEDIATEK_ZH.md](../../docs/kernel_profiles/MEDIATEK_ZH.md)）；本脚本改从
-`/proc/iomem` 与 `/proc/kallsyms` 读取。
+提取器可从 `boot.img` + `vendor_boot.img` 同时得到两者：vendor_boot 头部的
+`kernel_addr` 与内嵌 DTB 的 `/memory` 节点。本脚本是镜像不带 DTB 时的 root
+回退方案（见 [MEDIATEK_ZH.md](../../docs/kernel_profiles/MEDIATEK_ZH.md)），
+从 `/proc/iomem` 与 `/proc/kallsyms` 读取。
 
 ## 文件
 
