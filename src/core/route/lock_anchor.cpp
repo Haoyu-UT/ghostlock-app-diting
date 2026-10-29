@@ -85,6 +85,18 @@ namespace ghostlock::route::anchor {
             const uintptr_t bytes = bytes_key
                                         ? static_cast<uintptr_t>(*bytes_key)
                                         : kLockAnchorBytesDefault;
+            /* Stage 3: a per-image sizeof(rt_mutex) is the real lower bound.
+             * The compiled 0x20 is the 5.10 shape; a profile that states a
+             * larger object must not be walked at the old pitch. */
+            if (const auto rt_mutex_size =
+                        session::g_exploit_session.profile.rt_mutex_size();
+                rt_mutex_size && stride < *rt_mutex_size) {
+                pr_error("[route] anchor stride 0x%llx is smaller than the profile's "
+                         "sizeof(rt_mutex) 0x%x; slots would overlap\n",
+                         static_cast<unsigned long long>(stride),
+                         static_cast<unsigned>(*rt_mutex_size));
+                return false;
+            }
             if (stride < kLockAnchorStrideMin || bytes == 0 || bytes % stride != 0) {
                 pr_error("[route] anchor geometry unusable (bytes=0x%llx stride=0x%llx): bytes must be a "
                          "non-zero multiple of the stride, and the stride at least 0x%llx -- the fake "

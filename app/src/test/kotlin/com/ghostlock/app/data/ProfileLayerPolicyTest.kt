@@ -126,7 +126,7 @@ class ProfileLayerPolicyTest {
     }
 
     @Test
-    fun `an external selection for another release does not apply`() = runBlocking {
+    fun `an external selection for another release refuses, not a silent bundle fallback`() = runBlocking {
         val uri = external.add(
             "content://profiles/foreign.conf",
             document(foreignRelease, routeWaitMs = 4242),
@@ -135,12 +135,13 @@ class ProfileLayerPolicyTest {
 
         val config = controller.load(bundledRelease, pair)
 
-        assertTrue(config.hasProfile)
-        assertEquals(bundledRouteWaitMs, generalValue(config, routeWaitPath))
+        assertFalse(config.hasProfile)
         val layers = checkNotNull(config.layers)
-        assertTrue(layers.bundledAuthoritative)
         assertFalse(layers.externalApplied)
-        assertNull(layers.external)
+        assertNotNull(layers.external)
+        assertNotNull(layers.externalError)
+        assertTrue(layers.externalError!!.contains("no entry for $bundledRelease"))
+        assertTrue(layers.hasInactiveLayer)
     }
 
     @Test

@@ -122,6 +122,28 @@ class ProfileResolverTest {
     }
 
     @Test
+    fun `validateMerged accepts the stage-3 layout keys`() {
+        val profile = validProfile()
+        profile["waiter_layout"] = valueMapOf(
+            "compact" to 0,
+            "pi_tree" to 40,
+            "task" to 80,
+            "lock" to 88,
+            "wake_state" to 96,
+        )
+        profile["cred"].asValueMap()!!.apply {
+            this["usage_size"] = 8
+            this["uid_offset"] = 8
+            this["security_offset"] = 128
+        }
+        profile["kernelsnitch"] = valueMapOf("rt_mutex_size" to 32)
+        assertEquals(
+            emptyList<ConfigError>(),
+            ProfileResolver.validateMerged(profile, "select_stack", "none"),
+        )
+    }
+
+    @Test
     fun `executionFromMerged flattens nested values`() {
         val profile = valueMapOf(
             "execution" to valueMapOf(
@@ -132,6 +154,117 @@ class ProfileResolverTest {
         val flat = ProfileResolver.executionFromMerged(profile)
         assertEquals(15uL, flat["stages.w1_attempts"])
         assertEquals(0uL, flat["recommended_cpus.main"])
+    }
+
+    @Test
+    fun `layout groups accept the 6,6 and 6,1 BTF shapes`() {
+        val sixSix = validProfile()
+        sixSix["cred"].asValueMap()!!.apply {
+            this["copy_size"] = 136L
+            this["caps_offset"] = 48L
+            this["usage_size"] = 8L
+            this["uid_offset"] = 8L
+            this["security_offset"] = 128L
+        }
+        sixSix["kernelsnitch"] = valueMapOf("rt_mutex_size" to 32L)
+        (sixSix["route"].asValueMap()!!["select_stack"].asValueMap()!!)["lock_anchor_stride"] = 32L
+        sixSix["waiter_layout"] = valueMapOf(
+            "compact" to 0L,
+            "pi_tree" to 40L,
+            "task" to 80L,
+            "lock" to 88L,
+            "wake_state" to 96L,
+        )
+        assertEquals(
+            emptyList<ConfigError>(),
+            ProfileResolver.validateMerged(sixSix, "select_stack", "none"),
+        )
+
+        assertEquals(
+            emptyList<ConfigError>(),
+            ProfileResolver.validateMerged(sixOneBtfProfile(), "select_stack", "none"),
+        )
+    }
+
+    @Test
+    fun `cred group rejects a copy that does not cover security`() {
+        val profile = validProfile()
+        profile["cred"].asValueMap()!!.apply {
+            this["copy_size"] = 124L
+            this["caps_offset"] = 40L
+            this["usage_size"] = 4L
+            this["uid_offset"] = 4L
+            this["security_offset"] = 120L
+        }
+        val errors = ProfileResolver.validateMerged(profile, "select_stack", "none")
+        assertTrue(errors.any { it.fieldPath == "cred.copy_size" })
+    }
+
+    @Test
+    fun `cred group accepts a 5,x copy that spans the fields after security`() {
+        val profile = validProfile()
+        profile["cred"].asValueMap()!!.apply {
+            this["copy_size"] = 176L
+            this["caps_offset"] = 48L
+            this["usage_size"] = 4L
+            this["uid_offset"] = 4L
+            this["security_offset"] = 120L
+        }
+        /* 5.x has user/user_ns/ucounts/group_info and the rcu head after
+         * `security`: sizeof(cred) is 176, not security + 8 = 128. */
+        assertEquals(
+            emptyList<ConfigError>(),
+            ProfileResolver.validateMerged(profile, "select_stack", "none"),
+        )
+    }
+
+    @Test
+    fun `waiter group rejects a compact flag that differs from the route`() {
+        val profile = sixOneBtfProfile()
+        profile["waiter_layout"].asValueMap()!!["compact"] = 0L
+        val errors = ProfileResolver.validateMerged(profile, "select_stack", "none")
+        assertTrue(errors.any { it.fieldPath == "waiter_layout.compact" })
+    }
+
+    @Test
+    fun `waiter group rejects out-of-order offsets`() {
+        val profile = sixOneBtfProfile()
+        profile["waiter_layout"].asValueMap()!!["task"] = 80L
+        val errors = ProfileResolver.validateMerged(profile, "select_stack", "none")
+        assertTrue(errors.any { it.fieldPath == "waiter_layout.task" })
+    }
+
+    @Test
+    fun `rt_mutex group rejects a stride below the object size`() {
+        val profile = sixOneBtfProfile()
+        val route = profile["route"].asValueMap()!!["select_stack"].asValueMap()!!
+        route["lock_anchor_stride"] = 16L
+        val errors = ProfileResolver.validateMerged(profile, "select_stack", "none")
+        assertTrue(errors.any { it.fieldPath == "route.select_stack.lock_anchor_stride" })
+    }
+
+    private fun sixOneBtfProfile(): MutableMap<String, Any?> {
+        val profile = validProfile()
+        profile["cred"].asValueMap()!!.apply {
+            this["copy_size"] = 128L
+            this["caps_offset"] = 40L
+            this["usage_size"] = 4L
+            this["uid_offset"] = 4L
+            this["security_offset"] = 120L
+        }
+        profile["kernelsnitch"] = valueMapOf("rt_mutex_size" to 32L)
+        (profile["route"].asValueMap()!!["select_stack"].asValueMap()!!).apply {
+            this["compact_waiter"] = 1L
+            this["lock_anchor_stride"] = 32L
+        }
+        profile["waiter_layout"] = valueMapOf(
+            "compact" to 1L,
+            "pi_tree" to 24L,
+            "task" to 48L,
+            "lock" to 56L,
+            "wake_state" to 64L,
+        )
+        return profile
     }
 
     private fun validProfile(): MutableMap<String, Any?> = valueMapOf(

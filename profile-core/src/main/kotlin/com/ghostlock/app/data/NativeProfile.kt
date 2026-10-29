@@ -30,6 +30,9 @@ data class NativeProfileDocument(
     val compactWaiter: UByte?,
     val kernelsnitchCollisions: UInt?,
     val mmStructSz: UInt?,
+    /** Stage-3 per-image layout facts; absent = the native release fallback. */
+    val rtMutexSize: UInt? = null,
+    val waiterLayout: WaiterLayoutOffsets = WaiterLayoutOffsets(),
     val execution: ExecutionTuning,
     val safeMode: UInt,
     /** Route-specific configuration; never part of the shared schema. */
@@ -100,6 +103,16 @@ data class NativeProfileDocument(
                 WireEntry("compact_waiter", compactWaiter?.toULong()),
                 WireEntry("kernelsnitch_collisions", kernelsnitchCollisions?.toULong()),
                 WireEntry("mm_struct_sz", mmStructSz?.toULong()),
+                WireEntry("rt_mutex_size", rtMutexSize?.toULong()),
+            ),
+        )
+        add(
+            "waiter_layout" to listOf(
+                WireEntry("compact", waiterLayout.compact?.toULong()),
+                WireEntry("pi_tree", waiterLayout.piTree?.toULong()),
+                WireEntry("task", waiterLayout.task?.toULong()),
+                WireEntry("lock", waiterLayout.lock?.toULong()),
+                WireEntry("wake_state", waiterLayout.wakeState?.toULong()),
             ),
         )
         add(
@@ -247,6 +260,9 @@ data class NativeProfileDocument(
         WireEntry("copy_size", cred.copySize.toULong()),
         WireEntry("usage_offset", cred.usageOffset.toULong()),
         WireEntry("usage_value", cred.usageValue.toULong()),
+        WireEntry("usage_size", cred.usageSize?.toULong()),
+        WireEntry("uid_offset", cred.uidOffset?.toULong()),
+        WireEntry("security_offset", cred.securityOffset?.toULong()),
         WireEntry("caps_offset", cred.capsOffset.toULong()),
         WireEntry("caps_count", cred.capsCount.toULong()),
         WireEntry("caps_value", cred.capsValue),
@@ -499,6 +515,9 @@ data class NativeProfileDocument(
                     copySize = vu("cred.copy_size"),
                     usageOffset = vu("cred.usage_offset"),
                     usageValue = vu("cred.usage_value"),
+                    usageSize = vbOrNull("cred.usage_size"),
+                    uidOffset = vuOrNull("cred.uid_offset"),
+                    securityOffset = vuOrNull("cred.security_offset"),
                     capsOffset = vu("cred.caps_offset"),
                     capsCount = vu("cred.caps_count"),
                     capsValue = vul("cred.caps_value"),
@@ -529,6 +548,14 @@ data class NativeProfileDocument(
                 compactWaiter = vbOrNull("compact_waiter"),
                 kernelsnitchCollisions = vuOrNull("kernelsnitch.collisions"),
                 mmStructSz = vuOrNull("kernelsnitch.mm_struct_sz"),
+                rtMutexSize = vuOrNull("kernelsnitch.rt_mutex_size"),
+                waiterLayout = WaiterLayoutOffsets(
+                    compact = vbOrNull("waiter_layout.compact"),
+                    piTree = vuOrNull("waiter_layout.pi_tree"),
+                    task = vuOrNull("waiter_layout.task"),
+                    lock = vuOrNull("waiter_layout.lock"),
+                    wakeState = vuOrNull("waiter_layout.wake_state"),
+                ),
                 execution = ExecutionTuning(
                     recommendedMainCpu = vu("execution.recommended_cpus.main"),
                     recommendedConsumerCpu = vu("execution.recommended_cpus.consumer"),
@@ -577,6 +604,8 @@ data class NativeProfileDocument(
             private var compactWaiter: UByte? = null
             private var kernelsnitchCollisions: UInt? = null
             private var mmStructSz: UInt? = null
+            private var rtMutexSize: UInt? = null
+            private var waiterLayout = WaiterLayoutOffsets()
             private var execution = ExecutionTuning()
             private var routeConfig: RouteConfig = routeKind.emptyConfig()
 
@@ -616,6 +645,9 @@ data class NativeProfileDocument(
                         "copy_size" -> credential.copy(copySize = raw.toUInt())
                         "usage_offset" -> credential.copy(usageOffset = raw.toUInt())
                         "usage_value" -> credential.copy(usageValue = raw.toUInt())
+                        "usage_size" -> credential.copy(usageSize = raw.toUByte())
+                        "uid_offset" -> credential.copy(uidOffset = raw.toUInt())
+                        "security_offset" -> credential.copy(securityOffset = raw.toUInt())
                         "caps_offset" -> credential.copy(capsOffset = raw.toUInt())
                         "caps_count" -> credential.copy(capsCount = raw.toUInt())
                         "caps_value" -> credential.copy(capsValue = raw)
@@ -651,6 +683,16 @@ data class NativeProfileDocument(
                         "compact_waiter" -> compactWaiter = raw.toUByte()
                         "kernelsnitch_collisions" -> kernelsnitchCollisions = raw.toUInt()
                         "mm_struct_sz" -> mmStructSz = raw.toUInt()
+                        "rt_mutex_size" -> rtMutexSize = raw.toUInt()
+                    }
+
+                    "waiter_layout" -> waiterLayout = when (key) {
+                        "compact" -> waiterLayout.copy(compact = raw.toUByte())
+                        "pi_tree" -> waiterLayout.copy(piTree = raw.toUInt())
+                        "task" -> waiterLayout.copy(task = raw.toUInt())
+                        "lock" -> waiterLayout.copy(lock = raw.toUInt())
+                        "wake_state" -> waiterLayout.copy(wakeState = raw.toUInt())
+                        else -> waiterLayout
                     }
 
                     "execution.recommended_cpus" -> execution = when (key) {
@@ -737,6 +779,8 @@ data class NativeProfileDocument(
                 compactWaiter = compactWaiter,
                 kernelsnitchCollisions = kernelsnitchCollisions,
                 mmStructSz = mmStructSz,
+                rtMutexSize = rtMutexSize,
+                waiterLayout = waiterLayout,
                 execution = execution,
                 safeMode = metaSafeMode,
                 routeConfig = routeConfig,
@@ -780,6 +824,10 @@ data class CredTemplate(
     val copySize: UInt = 0u,
     val usageOffset: UInt = 0u,
     val usageValue: UInt = 0u,
+    /** Stage-3 BTF facts. Absent = the native release/template fallback. */
+    val usageSize: UByte? = null,
+    val uidOffset: UInt? = null,
+    val securityOffset: UInt? = null,
     val capsOffset: UInt = 0u,
     val capsCount: UInt = 0u,
     val capsValue: ULong = 0uL,
@@ -792,6 +840,20 @@ data class CredTemplate(
     val ref1Image: ULong = 0uL,
     val ref2Image: ULong = 0uL,
     val ref3Image: ULong = 0uL,
+)
+
+/**
+ * Per-image `struct rt_mutex_waiter` shape. Emitted only when BTF supplied it;
+ * `compact = 0` with a `wakeState` offset is the 6.6/6.12 rb_node shape,
+ * `compact = 1` the 5.15/6.1 word shape. An absent field keeps the native
+ * release predicate.
+ */
+data class WaiterLayoutOffsets(
+    val compact: UByte? = null,
+    val piTree: UInt? = null,
+    val task: UInt? = null,
+    val lock: UInt? = null,
+    val wakeState: UInt? = null,
 )
 
 data class KernelOffsetTable(

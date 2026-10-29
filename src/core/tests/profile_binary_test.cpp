@@ -21,7 +21,7 @@ namespace {
      * block. Asserted with the same value in the Kotlin test
      * (profile-core `NativeProfileDigestTest`), which is what makes the two
      * implementations a checked contract rather than two hopeful copies. */
-    constexpr uint64_t kGoldenSchemaDigest = 0xcc8fc4e3d6a4eadfull;
+    constexpr uint64_t kGoldenSchemaDigest = 0x6a327466c48683dbull;
 
     void put_u16(std::string &out, uint16_t value) {
         out.push_back(static_cast<char>(value & 0xff));
@@ -135,6 +135,44 @@ int32_t main(void) {
     assert(parsed.execution.handoff_enforce_poll_interval_ms == 100);
     assert(parsed.geometry.mcast_waiter_off.value_or(-1) == 96);
     assert(parsed.geometry.mcast_buffer_size.value_or(0) == 512);
+
+    /* ---- Stage-3 layout keys: optional, additive, presence-sensitive. ---- */
+    {
+        profile::kernel_offsets v = {};
+        v.uname_r = "stage3-layout-test";
+        v.route = profile::kRouteSelectStack;
+        v.credential.usage_size = 8;
+        v.credential.uid_offset = 8;
+        v.credential.security_offset = 128;
+        v.misc.rt_mutex_size = 32;
+        v.waiter.compact = 0;
+        v.waiter.wake_state = 0x40;
+        assert(round_trip(v, &parsed, release, sizeof(release)) == 0);
+        assert(parsed.credential.usage_size.value_or(0) == 8);
+        assert(parsed.credential.uid_offset.value_or(0) == 8);
+        assert(parsed.credential.security_offset.value_or(0) == 128);
+        assert(parsed.misc.rt_mutex_size.value_or(0) == 32);
+        assert(parsed.waiter.compact.value_or(1) == 0);
+        assert(parsed.waiter.wake_state.value_or(0) == 0x40);
+        const profile::TargetProfile p = profile::TargetProfile::from(&parsed);
+        assert(p.cred_usage_size().value_or(0) == 8);
+        assert(p.cred_uid_offset().value_or(0) == 8);
+        assert(p.cred_security_offset().value_or(0) == 128);
+        assert(p.rt_mutex_size().value_or(0) == 32);
+        assert(!p.has_compact_waiter());
+        assert(!p.compact_waiter_has_wake_state());
+    }
+    {
+        profile::kernel_offsets v = {};
+        v.uname_r = "stage3-compact-test";
+        v.route = profile::kRouteSelectStack;
+        v.waiter.compact = 1;
+        v.waiter.wake_state = 0x40;
+        assert(round_trip(v, &parsed, release, sizeof(release)) == 0);
+        const profile::TargetProfile p = profile::TargetProfile::from(&parsed);
+        assert(p.has_compact_waiter());
+        assert(p.compact_waiter_has_wake_state());
+    }
 
     /* ---- Strict values and presence. ---- */
     {

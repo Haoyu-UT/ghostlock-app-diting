@@ -316,16 +316,32 @@ namespace ghostlock::support {
 
     static int32_t fill_profile_cred_copy(unsigned char *p, size_t off) {
         const profile::kernel_offsets *v = profile_values();
-        if (!v || !v->credential.copy_size || v->credential.copy_size > kernel::ORDER3_SIZE ||
-            v->credential.usage_offset + sizeof(uint32_t) > v->credential.copy_size ||
+        if (!v || !v->credential.copy_size || v->credential.copy_size > kernel::ORDER3_SIZE) {
+            pr_error("credential copy profile is incomplete\n");
+            return 0;
+        }
+        /* Stage 3: a per-image usage width / security offset is authoritative
+         * when present; otherwise the compiled 4-byte usage remains. */
+        const uint32_t usage_size = v->credential.usage_size.value_or(sizeof(uint32_t));
+        const bool security_out_of_range =
+                v->credential.security_offset &&
+                *v->credential.security_offset + sizeof(uint64_t) >
+                        v->credential.copy_size;
+        if ((usage_size != 4 && usage_size != 8) ||
+            v->credential.usage_offset + usage_size > v->credential.copy_size ||
+            security_out_of_range ||
             v->credential.caps_offset + v->credential.caps_count * sizeof(uint64_t) >
-            v->credential.copy_size) {
+                    v->credential.copy_size) {
             pr_error("credential copy profile is incomplete\n");
             return 0;
         }
         unsigned char *c = p + off;
         memset(c, 0, v->credential.copy_size);
-        put32(c, v->credential.usage_offset, v->credential.usage_value);
+        if (usage_size >= sizeof(uint64_t)) {
+            put64(c, v->credential.usage_offset, v->credential.usage_value);
+        } else {
+            put32(c, v->credential.usage_offset, v->credential.usage_value);
+        }
         for (uint32_t i = 0; i < v->credential.caps_count; i++) {
             put64(c, v->credential.caps_offset + i * sizeof(uint64_t), v->credential.caps_value);
         }

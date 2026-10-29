@@ -101,6 +101,10 @@ namespace ghostlock::profile {
 
     struct CredTemplate {
         uint32_t copy_size = 0, usage_offset = 0, usage_value = 0;
+        /* Stage-3 BTF facts; absent = the compiled/release fallback. */
+        std::optional<uint8_t> usage_size;
+        std::optional<uint32_t> uid_offset;
+        std::optional<uint32_t> security_offset;
         uint32_t caps_offset = 0, caps_count = 0;
         uint64_t caps_value = 0;
         uint32_t ref_count = 0;
@@ -128,6 +132,21 @@ namespace ghostlock::profile {
          * (the generation picker or the root slabinfo read). Absence means
          * the compiled default and the stride-agnostic scan. */
         std::optional<uint32_t> mm_struct_sz;
+        /* `sizeof(struct rt_mutex)` from BTF; the anchor's slot spacing must
+         * not be smaller. Absent = the route's compiled minimum. */
+        std::optional<uint32_t> rt_mutex_size;
+    };
+
+    /* Per-image `struct rt_mutex_waiter` shape. The field offsets are emitted
+     * for validation/future families; the behaviour gates are `compact` (the
+     * 5.15/6.1 word shape vs the 6.6/6.12 rb_node shape) and `wake_state`
+     * (whether the prio word is packed). Absent = the release fallback. */
+    struct WaiterLayoutOffsets {
+        std::optional<uint8_t> compact;
+        std::optional<uint32_t> pi_tree;
+        std::optional<uint32_t> task;
+        std::optional<uint32_t> lock;
+        std::optional<uint32_t> wake_state;
     };
 
     struct RouteGeometry {
@@ -167,6 +186,7 @@ namespace ghostlock::profile {
         ProfileMeta meta;
         TaskStructOffsets task;
         CredTemplate credential;
+        WaiterLayoutOffsets waiter;
         KernelOffsets offsets;
         KernelMisc misc;
         RouteGeometry geometry;
@@ -293,6 +313,14 @@ namespace ghostlock::profile {
          * See docs/analysis/waiter-layout-family-gating-plan.md. */
         [[nodiscard]] bool compact_waiter_has_wake_state() const noexcept {
             if (!loaded_) return false;
+            /* A per-image waiter layout is authoritative when present: the
+             * compact shape with a wake_state field is 5.15/6.1, the
+             * non-compact shape is 6.6/6.12. The release predicate below
+             * remains for profiles that predate the key. */
+            if (values_.waiter.compact.has_value()) {
+                return *values_.waiter.compact != 0 &&
+                       values_.waiter.wake_state.has_value();
+            }
             unsigned major = 0;
             unsigned minor = 0;
             const char *p = release();
@@ -357,7 +385,31 @@ namespace ghostlock::profile {
 #undef GHOSTLOCK_EXEC_U32
 
         [[nodiscard]] bool has_compact_waiter() const noexcept {
-            return loaded_ && values_.misc.compact_waiter.value_or(0) != 0;
+            if (!loaded_) return false;
+            if (values_.waiter.compact.has_value()) {
+                return *values_.waiter.compact != 0;
+            }
+            return values_.misc.compact_waiter.value_or(0) != 0;
+        }
+
+        [[nodiscard]] std::optional<uint8_t> cred_usage_size() const noexcept {
+            return loaded_ ? values_.credential.usage_size : std::nullopt;
+        }
+
+        [[nodiscard]] std::optional<uint32_t> cred_uid_offset() const noexcept {
+            return loaded_ ? values_.credential.uid_offset : std::nullopt;
+        }
+
+        [[nodiscard]] std::optional<uint32_t> cred_security_offset() const noexcept {
+            return loaded_ ? values_.credential.security_offset : std::nullopt;
+        }
+
+        [[nodiscard]] std::optional<uint32_t> rt_mutex_size() const noexcept {
+            return loaded_ ? values_.misc.rt_mutex_size : std::nullopt;
+        }
+
+        [[nodiscard]] const WaiterLayoutOffsets &waiter_layout() const noexcept {
+            return values_.waiter;
         }
 
         [[nodiscard]] bool safe_mode() const noexcept {

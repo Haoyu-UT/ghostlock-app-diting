@@ -29,6 +29,12 @@ object ProfileMerger {
         pair: CpuPairView,
         routePresets: Map<String, ValueMap>,
     ): ValueMap {
+        /* Identity before the merge. The merge stamps the device's release over
+         * the resolved map below; checking afterwards can only ever agree with
+         * itself. A profile whose own release names another image is the
+         * `wrong_image` case, not a value dispute: refuse and name both. */
+        requireIdentity("builtin", builtin, deviceRelease)
+        requireIdentity("imported", imported, deviceRelease)
         /* The caller's tuning map is shared by every profile it resolves (the
          * Gradle exporter resolves a whole index in one process), and the merge
          * below writes into the maps it is handed. Alias it and the *first*
@@ -118,6 +124,13 @@ object ProfileMerger {
             mergeRouteObjects(baseFallbackRoute, fallbackRoute)?.let { fallback["route"] = it }
         }
         return merged
+    }
+
+    private fun requireIdentity(layer: String, profile: ValueMap?, deviceRelease: String) {
+        val release = profile?.get("release") as? String ?: return
+        require(release == deviceRelease) {
+            "wrong_image: $layer profile release $release does not match device $deviceRelease"
+        }
     }
 
     private fun validateResolved(profile: ValueMap, release: String) {

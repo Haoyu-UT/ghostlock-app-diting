@@ -1,52 +1,59 @@
 package com.ghostlock.app.data.profile
 
-import com.ghostlock.app.data.asValueMap
 import com.ghostlock.app.data.valueMapOf
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
+/**
+ * Stage-5 foreign-image fixture: the merge may not stamp the device's uname
+ * over a document that names another image before comparing them. The identity
+ * is checked on the input layers, before the stamp.
+ */
 class ProfileMergerTest {
-    @Test
-    fun `sparse route group is filled field-wise from the preset`() {
-        val profile = valueMapOf(
-            "execution" to valueMapOf(
-                "routes" to valueMapOf(
-                    "select_stack" to valueMapOf("enter_delay_us" to 1L),
-                ),
-            ),
-        )
-        val preset = valueMapOf("enter_delay_us" to 50000L, "timeout_us" to 200000L)
-        ProfileMerger.fillRouteExecutionDefaults(profile, mapOf("select_stack" to preset))
+    private val device = "6.12.23-android16-5-g5a0e85dd9db0-ab14499855-4k"
+    private val foreign = "6.6.66-android15-8-g29d86c5fc9dd-abogki428889875-4k"
 
-        val group = profile["execution"].asValueMap()!!["routes"].asValueMap()!!
-            .get("select_stack").asValueMap()!!
-        assertEquals(1L, group["enter_delay_us"])   // explicit value preserved
-        assertEquals(200000L, group["timeout_us"])  // missing field filled from preset
+    @Test
+    fun `a foreign imported profile is wrong_image, not a value dispute`() {
+        val imported = valueMapOf(
+            "release" to foreign,
+            "kernel_major" to 6,
+            "execution" to valueMapOf(),
+        )
+        val error = assertThrows(IllegalArgumentException::class.java) {
+            ProfileMerger.resolveMerged(
+                deviceRelease = device,
+                builtin = null,
+                imported = imported,
+                overrides = null,
+                tuningExecution = null,
+                pair = CpuPairView(0, 1),
+                routePresets = emptyMap(),
+            )
+        }
+        assertTrue(error.message!!.contains("wrong_image"))
+        assertTrue(error.message!!.contains(foreign))
+        assertTrue(error.message!!.contains(device))
     }
 
     @Test
-    fun `cpu pair outranks an imported selected_cpus`() {
+    fun `a matching imported profile still merges`() {
         val imported = valueMapOf(
-            "execution" to valueMapOf(
-                "selected_cpus" to valueMapOf("main" to 7L, "consumer" to 8L),
-            ),
-        )
-        val builtin = valueMapOf(
-            "release" to "r",
-            "kernel_major" to 6L,
+            "release" to device,
+            "kernel_major" to 6,
             "execution" to valueMapOf(),
         )
         val resolved = ProfileMerger.resolveMerged(
-            deviceRelease = "r",
-            builtin = builtin,
+            deviceRelease = device,
+            builtin = null,
             imported = imported,
             overrides = null,
             tuningExecution = null,
-            pair = CpuPairView(3, 4),
+            pair = CpuPairView(0, 1),
             routePresets = emptyMap(),
         )
-        val selected = resolved["execution"].asValueMap()!!["selected_cpus"].asValueMap()!!
-        assertEquals(3L, selected["main"])
-        assertEquals(4L, selected["consumer"])
+        assertEquals(device, resolved["release"])
     }
 }

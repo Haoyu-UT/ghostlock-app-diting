@@ -13,6 +13,8 @@ object ProfileResolver {
         "release", "schema_version", "kernel_major", "recommend_shizuku",
         "route", "fallback", "kernelsnitch", "task_struct", "cred", "offset",
         "kernel_phys_load", "kernel_phys_offset", "execution",
+        /* Stage 3: optional per-image waiter layout, carried by the wire. */
+        "waiter_layout",
     )
     private val RequiredTopLevel = setOf(
         "release", "schema_version", "kernel_major", "route", "task_struct", "cred", "offset",
@@ -136,6 +138,119 @@ object ProfileResolver {
                         errors += ConfigError("offset.$field", "zero")
                     }
                 }
+            }
+        }
+        errors += validateLayoutGroups(profile, route, fallbackTo)
+        return errors
+    }
+
+    /**
+     * Stage-4 coupled groups. The stage-3 keys are optional, but when present
+     * they describe one physical layout: the copy must cover the `security`
+     * pointer, the uid must follow the usage word, the waiter's offsets must
+     * be ordered, and the anchor stride must not be smaller than
+     * `sizeof(rt_mutex)`. The copy bound is a minimum, not an equality: 5.x
+     * places user/user_ns/ucounts/group_info and the rcu head after
+     * `security`, so its copy is sizeof(cred) and is larger.
+     */
+    private fun validateLayoutGroups(
+        profile: Map<String, Any?>,
+        route: String?,
+        fallbackTo: String?,
+    ): List<ConfigError> {
+        val errors = mutableListOf<ConfigError>()
+        val anchorPrefix = route?.let { "route.$it" }
+            ?: fallbackTo?.takeIf { it != "none" }?.let { "fallback.route.$it" }
+            ?: "route"
+
+        val copy = profile.getLongAt("cred.copy_size")
+        val usageOffset = profile.getLongAt("cred.usage_offset") ?: 0L
+        val usageSize = profile.getLongAt("cred.usage_size")
+        val uid = profile.getLongAt("cred.uid_offset")
+        val security = profile.getLongAt("cred.security_offset")
+        val caps = profile.getLongAt("cred.caps_offset")
+        val capsCount = profile.getLongAt("cred.caps_count")
+        if (usageSize != null && usageSize != 4L && usageSize != 8L) {
+            errors += ConfigError("cred.usage_size", "must be 4 or 8")
+        }
+        if (usageSize != null && copy != null && usageOffset + usageSize > copy) {
+            errors += ConfigError("cred.usage_size", "does not fit cred.copy_size")
+        }
+        if (uid != null && copy != null && uid + 4L > copy) {
+            errors += ConfigError("cred.uid_offset", "does not fit cred.copy_size")
+        }
+        if (uid != null && usageSize != null && uid < usageOffset + usageSize) {
+            errors += ConfigError("cred.uid_offset", "overlaps cred.usage")
+        }
+        if (security != null && copy != null && copy < security + 8L) {
+            errors += ConfigError(
+                "cred.copy_size",
+                "must cover cred.security_offset + 8 (cred layout group)",
+            )
+        }
+        if (security != null && caps != null && security < caps) {
+            errors += ConfigError("cred.security_offset", "precedes cred.caps_offset")
+        }
+        if (caps != null && capsCount != null && copy != null &&
+            caps + capsCount * 8L > copy
+        ) {
+            errors += ConfigError("cred.caps_offset", "does not fit cred.copy_size")
+        }
+
+        val waiterCompact = profile.getLongAt("waiter_layout.compact")
+        if (waiterCompact != null && waiterCompact != 0L && waiterCompact != 1L) {
+            errors += ConfigError("waiter_layout.compact", "must be 0 or 1")
+        }
+        if (waiterCompact != null) {
+            val routeCompact = profile.getLongAt("$anchorPrefix.compact_waiter")
+            if (routeCompact != null && routeCompact != 0L && waiterCompact != routeCompact) {
+                errors += ConfigError(
+                    "waiter_layout.compact",
+                    "differs from $anchorPrefix.compact_waiter (waiter layout group)",
+                )
+            }
+        }
+        val pi = profile.getLongAt("waiter_layout.pi_tree")
+        val task = profile.getLongAt("waiter_layout.task")
+        val lock = profile.getLongAt("waiter_layout.lock")
+        val wake = profile.getLongAt("waiter_layout.wake_state")
+        for ((path, value) in listOf(
+            "waiter_layout.pi_tree" to pi,
+            "waiter_layout.task" to task,
+            "waiter_layout.lock" to lock,
+            "waiter_layout.wake_state" to wake,
+        )) {
+            if (value != null && (value < 0L || value > 0x200L)) {
+                errors += ConfigError(path, "outside the waiter's plausible field range")
+            }
+        }
+        if (pi != null && task != null && pi >= task) {
+            errors += ConfigError("waiter_layout.pi_tree", "must precede waiter_layout.task")
+        }
+        if (task != null && lock != null && task >= lock) {
+            errors += ConfigError("waiter_layout.task", "must precede waiter_layout.lock")
+        }
+        if (lock != null && wake != null && lock >= wake) {
+            errors += ConfigError("waiter_layout.lock", "must precede waiter_layout.wake_state")
+        }
+
+        val rtMutex = profile.getLongAt("kernelsnitch.rt_mutex_size")
+        if (rtMutex != null && (rtMutex < 8L || rtMutex > 256L)) {
+            errors += ConfigError("kernelsnitch.rt_mutex_size", "outside 8..256")
+        }
+        if (rtMutex != null) {
+            val stride = profile.getLongAt("$anchorPrefix.lock_anchor_stride")
+            if (stride != null && stride < rtMutex) {
+                errors += ConfigError(
+                    "$anchorPrefix.lock_anchor_stride",
+                    "smaller than kernelsnitch.rt_mutex_size (rt_mutex layout group)",
+                )
+            }
+            if (stride != null && stride % rtMutex != 0L) {
+                errors += ConfigError(
+                    "$anchorPrefix.lock_anchor_stride",
+                    "not a multiple of kernelsnitch.rt_mutex_size",
+                )
             }
         }
         return errors

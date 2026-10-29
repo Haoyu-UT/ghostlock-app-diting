@@ -39,12 +39,35 @@ class NativeDocumentEquivalenceTest {
                 preferences = context.getSharedPreferences("native-doc-equivalence", 0)
                     .also { it.edit().clear().commit() },
             )
-            for ((release, expected) in golden) {
+            val computed = LinkedHashMap<String, String>()
+            for ((release, _) in golden) {
                 val config = controller.load(release, pair)
                 assertTrue("$release did not resolve", config.hasProfile)
                 val bytes = controller.nativeDocument(config)
                 assertNotNull("$release has no native document", bytes)
-                assertEquals("$release wire bytes drifted", expected, sha256(bytes!!))
+                computed[release] = sha256(bytes!!)
+            }
+            /* Deliberate re-freeze for a schema change: the digest covers every
+             * declared key, so adding an absent key moves every document's
+             * bytes while changing no value. Set the env var to the resource
+             * path to regenerate; a normal run compares. */
+            val updatePath = System.getenv("UPDATE_NATIVE_DOC_GOLDEN")
+            if (updatePath != null) {
+                val header = goldenHeader() +
+                    "\n# Re-frozen 2026-10-29: stage-3 layout facts (cred usage/uid/security,\n" +
+                    "# rt_mutex_size, waiter_layout) entered the wire schema. They are absent\n" +
+                    "# on the bundled profiles, so no value changed, but the digest covers\n" +
+                    "# every declared key and every document's bytes changed."
+                val rows = computed.entries.joinToString("\n") { "${it.key} ${it.value}" }
+                Files.writeString(java.nio.file.Path.of(updatePath), "$header\n$rows\n")
+                return@runBlocking
+            }
+            for ((release, expected) in golden) {
+                assertEquals(
+                    "$release wire bytes drifted",
+                    expected,
+                    computed.getValue(release),
+                )
             }
         } finally {
             root.deleteRecursively()
@@ -62,6 +85,16 @@ class NativeDocumentEquivalenceTest {
                 parts[0] to parts[1]
             }
     }
+
+    /** The comment block currently in the resource, preserved across a re-freeze. */
+    private fun goldenHeader(): String =
+        checkNotNull(
+            javaClass.classLoader?.getResourceAsStream("native-doc-golden.sha256"),
+        ).bufferedReader().use { reader ->
+            reader.readText().lineSequence()
+                .filter { it.trimStart().startsWith("#") }
+                .joinToString("\n")
+        }
 
     private fun sha256(bytes: ByteArray): String =
         MessageDigest.getInstance("SHA-256").digest(bytes)

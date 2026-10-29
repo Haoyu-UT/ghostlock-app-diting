@@ -84,6 +84,9 @@ namespace ghostlock::binary_profile {
             PLAIN("copy_size", credential.copy_size),
             PLAIN("usage_offset", credential.usage_offset),
             PLAIN("usage_value", credential.usage_value),
+            OPT("usage_size", credential.usage_size),
+            OPT("uid_offset", credential.uid_offset),
+            OPT("security_offset", credential.security_offset),
             PLAIN("caps_offset", credential.caps_offset),
             PLAIN("caps_count", credential.caps_count),
             PLAIN("caps_value", credential.caps_value),
@@ -117,6 +120,15 @@ namespace ghostlock::binary_profile {
             OPT("compact_waiter", misc.compact_waiter),
             OPT("kernelsnitch_collisions", misc.kernelsnitch_collisions),
             OPT("mm_struct_sz", misc.mm_struct_sz),
+            OPT("rt_mutex_size", misc.rt_mutex_size),
+        };
+
+        constexpr Field kWaiter[] = {
+            OPT("compact", waiter.compact),
+            OPT("pi_tree", waiter.pi_tree),
+            OPT("task", waiter.task),
+            OPT("lock", waiter.lock),
+            OPT("wake_state", waiter.wake_state),
         };
 
         constexpr Field kExecCpus[] = {
@@ -233,6 +245,7 @@ namespace ghostlock::binary_profile {
             {"cred", kCred, std::size(kCred)},
             {"offset", kOffset, std::size(kOffset)},
             {"kernel", kKernel, std::size(kKernel)},
+            {"waiter_layout", kWaiter, std::size(kWaiter)},
             {"execution.recommended_cpus", kExecCpus, std::size(kExecCpus)},
             {"execution.heap", kExecHeap, std::size(kExecHeap)},
             {"execution.race", kExecRace, std::size(kExecRace)},

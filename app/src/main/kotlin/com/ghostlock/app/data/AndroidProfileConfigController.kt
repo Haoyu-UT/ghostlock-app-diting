@@ -627,10 +627,12 @@ internal class AndroidProfileConfigController(
     private fun activeOverrides(release: String): ValueMap? =
         overrideStore.read(release).takeIf { it.isNotEmpty() }
 
-    /** External > builtin > bundled, for the device's own release. */
+    /** External > builtin > bundled. A stored external selection is the user's
+     * statement: it stays the source even when its release names another image,
+     * and the identity check then refuses instead of silently using the bundle. */
     private fun liveSelection(release: String): ProfileSelection? {
         val external = storedExternalSelection()
-        if (external != null && external.release == release) return external
+        if (external != null) return external
         val builtin = preferences.getString(PrefBuiltinRelease, null)?.takeIf { it.isNotEmpty() }
         if (builtin != null) return ProfileSelection.Builtin(builtin)
         return if (bundledDocument(release) != null) ProfileSelection.Bundled(release) else null
@@ -666,10 +668,11 @@ internal class AndroidProfileConfigController(
         selection: ProfileSelection?,
     ): Resolution {
         val source = loadSource(release, selection)
-        val layers = layersFor(selection, source.error)
-        val document = source.document ?: return Resolution(null, layers, selection)
-        val merged = runCatching { merge(release, pair, document, overrides) }.getOrNull()
-        return Resolution(merged, layers, selection)
+        val document = source.document
+            ?: return Resolution(null, layersFor(selection, source.error), selection)
+        val merged = runCatching { merge(release, pair, document, overrides) }
+        val layers = layersFor(selection, source.error ?: merged.exceptionOrNull()?.message)
+        return Resolution(merged.getOrNull(), layers, selection)
     }
 
     private fun merge(

@@ -17,7 +17,7 @@ class NativeProfileDigestTest {
      * two implementations are a checked contract rather than two hopeful
      * copies — change one and its own test fails.
      */
-    private val goldenDigest = 0xcc8fc4e3d6a4eadfuL
+    private val goldenDigest = 0x6a327466c48683dbuL
 
     private fun document(
         values: Map<String, Long> = emptyMap(),
@@ -94,6 +94,28 @@ class NativeProfileDigestTest {
     fun `safe_mode is outside the digest and kernel_major is inside it`() {
         assertEquals(digestOf(goldenDocument()), digestOf(goldenDocument().copy(safeMode = 1u)))
         assertNotEquals(digestOf(goldenDocument()), digestOf(goldenDocument().copy(kernelMajor = 6u)))
+    }
+
+    @Test
+    fun `stage-3 layout keys survive a wire round trip`() {
+        val document = document(
+            mapOf(
+                "cred.usage_size" to 8L,
+                "cred.uid_offset" to 8L,
+                "cred.security_offset" to 128L,
+                "kernelsnitch.rt_mutex_size" to 32L,
+                "waiter_layout.compact" to 0L,
+                "waiter_layout.wake_state" to 64L,
+            ),
+        )
+        val decoded = checkNotNull(NativeProfileDocument.fromBinary(document.toBinary()))
+        assertEquals(8u.toUByte(), decoded.cred.usageSize)
+        assertEquals(8u, decoded.cred.uidOffset)
+        assertEquals(128u, decoded.cred.securityOffset)
+        assertEquals(32u, decoded.rtMutexSize)
+        assertEquals(0u.toUByte(), decoded.waiterLayout.compact)
+        assertEquals(64u, decoded.waiterLayout.wakeState)
+        assertNull(decoded.waiterLayout.task)
     }
 
     @Test
