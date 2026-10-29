@@ -44,6 +44,12 @@ pub struct Bounds {
 pub enum Kind {
     Read,
     Write,
+    /// The address is materialised (`adrp` + `add`) but no constant-offset
+    /// access follows. It may be compared, or passed to a function, or used as
+    /// the base of an indexed access -- the last two touch memory the scanner
+    /// cannot see. This is not an access, so it does not bound a prefix, but it
+    /// does keep a candidate out of `Safe`.
+    Materialize,
 }
 
 #[derive(Debug, Clone)]
@@ -73,10 +79,27 @@ impl Reference {
 /// three-valued rather than a boolean.
 pub fn scan_references(kernel: &[u8], bounds: &Bounds) -> Vec<Reference> {
     let mut refs = Vec::new();
-    let start = bounds.text_start as usize;
-    let end = bounds.text_end as usize;
+    scan_range(kernel, bounds.text_start, bounds.text_end, bounds, &mut refs);
+    /* Init text is freed after boot, but a store there still runs during
+     * bring-up; leaving it unscanned made every boot-time registration
+     * invisible (the 6.1 anchor scan's 0/0 defect). */
+    if bounds.init_end > bounds.init_start {
+        scan_range(kernel, bounds.init_start, bounds.init_end, bounds, &mut refs);
+    }
+    refs
+}
+
+fn scan_range(
+    kernel: &[u8],
+    start: u64,
+    end: u64,
+    bounds: &Bounds,
+    refs: &mut Vec<Reference>,
+) {
+    let start = start as usize;
+    let end = end as usize;
     if end <= start || end > kernel.len() {
-        return refs;
+        return;
     }
 
     let decoder = InstDecoder::default();
@@ -98,30 +121,39 @@ pub fn scan_references(kernel: &[u8], bounds: &Bounds) -> Vec<Reference> {
         let ops = insn.operands;
         match insn.opcode {
             Opcode::ADRP => {
-                if let (Operand::Register(_, rd), Operand::PCOffset(imm)) = (&ops[0], &ops[1]) {
+                if let (Some(rd), Operand::PCOffset(imm)) = (reg_of(&ops[0]), &ops[1]) {
                     // adrp target: (pc & !0xfff) + (imm << 12); yaxpeax renders
                     // PCOffset already page-shifted for adrp.
                     let base = (addr & !0xfff) as i64 + *imm;
-                    page_of[*rd as usize % 32] = Some(base as u64);
+                    page_of[rd as usize % 32] = Some(base as u64);
                 }
                 continue;
             }
             Opcode::ADD => {
-                // add Rd, Rn, #imm  ->  address of Rn's target + imm
-                if let (Operand::Register(_, rd), Operand::Register(_, rn), Operand::Immediate(imm)) =
-                    (&ops[0], &ops[1], &ops[2])
+                // add Rd, Rn, #imm  ->  address of Rn's target + imm.
+                // yaxpeax renders both GPR operands as RegisterOrSP for the
+                // immediate form, so matching only `Register` meant this arm
+                // never ran and every `adrp; add; ldr` access was invisible.
+                if let (Some(rd), Some(rn), Operand::Immediate(imm)) =
+                    (reg_of(&ops[0]), reg_of(&ops[1]), &ops[2])
                 {
-                    if let Some(page) = page_of[*rn as usize % 32] {
+                    if let Some(page) = page_of[rn as usize % 32] {
                         let resolved = page.wrapping_add(*imm as u64);
-                        page_of[*rd as usize % 32] = Some(resolved);
-                        /* Not a reference on its own: it materialises an
-                         * address, and whatever consumes it will be recorded
-                         * when it does. */
-                        let _ = resolved;
+                        page_of[rd as usize % 32] = Some(resolved);
+                        /* Record the materialisation even though it is not an
+                         * access: it may feed an indexed access or a call,
+                         * neither of which this scanner can follow. */
+                        refs.push(Reference {
+                            site: addr,
+                            target: resolved,
+                            width: 8,
+                            kind: Kind::Materialize,
+                            init: in_init(addr, bounds),
+                        });
                         continue;
                     }
                 }
-                clear_dest(&ops, &mut page_of, false);
+                clear_dest(&ops, &mut page_of);
                 continue;
             }
             Opcode::LDR | Opcode::LDRB | Opcode::LDRH | Opcode::LDRSW => {
@@ -140,8 +172,8 @@ pub fn scan_references(kernel: &[u8], bounds: &Bounds) -> Vec<Reference> {
                         init: in_init(addr, bounds),
                     });
                 }
-                if let Operand::Register(_, rd) = &ops[0] {
-                    page_of[*rd as usize % 32] = None;
+                if let Some(rd) = reg_of(&ops[0]) {
+                    page_of[rd as usize % 32] = None;
                 }
                 continue;
             }
@@ -164,19 +196,44 @@ pub fn scan_references(kernel: &[u8], bounds: &Bounds) -> Vec<Reference> {
                 // A store's first operand is a source, not a destination.
                 continue;
             }
+            Opcode::BL | Opcode::BLR => {
+                /* A call clobbers the caller-saved registers; a page base left
+                 * in x0..x18 must not be attributed to an access after the
+                 * call. Without this, a linear scan reports reads of whatever
+                 * the callee's x0 points at as references to the last
+                 * materialised .bss page (the 5.10.198 +0x8c false read). */
+                for reg in page_of.iter_mut().take(19) {
+                    *reg = None;
+                }
+                continue;
+            }
+            Opcode::RET | Opcode::BR | Opcode::B => {
+                /* Function boundary or unknown target: no register state
+                 * survives into the next decoded instruction. */
+                page_of = [None; 32];
+                continue;
+            }
             _ => {
-                clear_dest(&ops, &mut page_of, false);
+                clear_dest(&ops, &mut page_of);
                 continue;
             }
         }
     }
-    refs
+}
+
+/// Register number of a GPR operand. yaxpeax uses `RegisterOrSP` for the
+/// immediate forms (`add x9, x9, #0x858`), so both variants have to count.
+fn reg_of(op: &Operand) -> Option<u16> {
+    match op {
+        Operand::Register(_, reg) | Operand::RegisterOrSP(_, reg) => Some(*reg),
+        _ => None,
+    }
 }
 
 /// Access width implied by a register operand.
 fn reg_width(op: &Operand) -> Option<u8> {
     match op {
-        Operand::Register(code, _) => Some(size_of(*code)),
+        Operand::Register(code, _) | Operand::RegisterOrSP(code, _) => Some(size_of(*code)),
         _ => None,
     }
 }
@@ -185,9 +242,9 @@ fn in_init(addr: u64, b: &Bounds) -> bool {
     b.init_end > b.init_start && addr >= b.init_start && addr < b.init_end
 }
 
-fn clear_dest(ops: &[Operand; 4], page_of: &mut [Option<u64>; 32], _keep: bool) {
-    if let Operand::Register(_, rd) = &ops[0] {
-        page_of[*rd as usize % 32] = None;
+fn clear_dest(ops: &[Operand; 4], page_of: &mut [Option<u64>; 32]) {
+    if let Some(rd) = reg_of(&ops[0]) {
+        page_of[rd as usize % 32] = None;
     }
 }
 
@@ -277,10 +334,19 @@ pub struct Assessment {
     /// Longest prefix of the candidate that no live write touches and that does
     /// not run into another symbol carrying live references.
     pub safe_len: u64,
+    /// Offset, from the candidate's start, of the first live or init read/write
+    /// inside its extent. `None` when nothing in the scanned text or init text
+    /// touches the candidate. The truly untouched prefix is
+    /// `min(safe_len, first_access)`: a read inside a slot makes that slot
+    /// unusable just as a write does.
+    pub first_access: Option<u64>,
     /// What stopped the extension, in words, for the report.
     pub stopped_by: String,
     pub live_reads: Vec<Reference>,
     pub live_writes: Vec<Reference>,
+    /// Address materialisations with no constant-offset access: the candidate
+    /// may still be touched through an indexed access or a called function.
+    pub materializations: Vec<Reference>,
     pub init_refs: Vec<Reference>,
     pub verdict: Verdict,
 }
@@ -294,6 +360,7 @@ pub fn assess(
 ) -> Assessment {
     let mut live_reads = Vec::new();
     let mut live_writes = Vec::new();
+    let mut materializations = Vec::new();
     let mut init_refs = Vec::new();
     for r in refs {
         if r.target < cand.offset || r.target >= cand.offset + cand.extent {
@@ -303,6 +370,8 @@ pub fn assess(
             init_refs.push(r.clone());
         } else if r.kind == Kind::Write {
             live_writes.push(r.clone());
+        } else if r.kind == Kind::Materialize {
+            materializations.push(r.clone());
         } else {
             live_reads.push(r.clone());
         }
@@ -358,18 +427,28 @@ pub fn assess(
 
     let verdict = if !live_writes.is_empty() {
         Verdict::Unsafe
-    } else if live_reads.is_empty() {
+    } else if live_reads.is_empty() && materializations.is_empty() {
         Verdict::Safe
     } else {
         Verdict::NeedsReview
     };
 
+    let first_access = live_reads
+        .iter()
+        .chain(live_writes.iter())
+        .chain(init_refs.iter())
+        .filter(|r| r.target >= cand.offset && r.target < cand.offset + cand.extent)
+        .map(|r| r.target - cand.offset)
+        .min();
+
     Assessment {
         candidate: cand.clone(),
         safe_len,
+        first_access,
         stopped_by,
         live_reads,
         live_writes,
+        materializations,
         init_refs,
         verdict,
     }
@@ -443,19 +522,56 @@ pub fn assess_named(
 }
 
 /// The result of choosing an anchor. `refused` is a named preference that
-/// exists but is unsafe; the caller must say why it was omitted rather than
-/// silently falling back to another region.
+/// exists but whose safe prefix cannot hold even one lock slot; the caller
+/// must say why it was omitted rather than silently falling back to another
+/// region.
 #[derive(Debug, Clone)]
 pub struct AnchorPick {
     pub selected: Option<Assessment>,
     pub refused: Option<Assessment>,
 }
 
+/// Round a safe length down to a whole number of lock slots.
+pub fn aligned_bytes(safe_len: u64, stride: u64) -> u64 {
+    if stride == 0 {
+        0
+    } else {
+        safe_len - (safe_len % stride)
+    }
+}
+
+/// The untouched prefix: the smaller of the write-bounded safe length and the
+/// first access of any kind (read, write or init), rounded down to whole slots.
+/// A read inside a slot makes that slot unusable just as a write does, which is
+/// why a candidate is not judged by `safe_len` alone.
+pub fn clean_prefix(a: &Assessment, stride: u64) -> u64 {
+    let bound = a
+        .first_access
+        .unwrap_or(a.candidate.extent)
+        .min(a.safe_len);
+    aligned_bytes(bound, stride)
+}
+
+/// The profile triple an assessment can support: `(image offset, bytes, stride)`.
+/// `bytes` is the safe prefix rounded down to whole slots; `None` when the
+/// prefix cannot hold one.
+pub fn profile_triple(a: &Assessment) -> Option<(u64, u64, u64)> {
+    let stride = crate::family::ANCHOR_STRIDE;
+    let bytes = aligned_bytes(a.safe_len, stride);
+    (bytes >= stride).then_some((a.candidate.offset, bytes, stride))
+}
+
 /// Pick the region a generated profile should carry: the named preference when
-/// it exists and is not unsafe, else the largest non-unsafe ranked candidate
-/// that fits at least one lock slot. The named path is how the diting line is
-/// validated (`dump_skip.zeroes`); the ranked path is the fallback for a build
-/// whose symbol set moved. An unsafe named region is refused, never emitted.
+/// it exists and its safe prefix holds at least one slot, else the largest
+/// non-unsafe ranked candidate that fits at least one lock slot. The named path
+/// is how the diting line is validated (`dump_skip.zeroes`); the ranked path is
+/// the fallback for a build whose symbol set moved.
+///
+/// The named path judges the **prefix**, not the whole symbol: a live store
+/// past the prefix never reaches the slots the anchor writes (5.10.198's
+/// `dump_skip.zeroes` has a store at +0x810 and a 0x800 usable prefix). The
+/// whole-symbol verdict is still reported, and a prefix shorter than one slot
+/// is refused.
 pub fn select_candidate(
     kernel: &[u8],
     rel: &BTreeMap<String, BTreeSet<u64>>,
@@ -466,15 +582,16 @@ pub fn select_candidate(
     if let Some(name) = prefer {
         if let Some(candidate) = named_candidate(rel, &bounds, name) {
             let assessment = assess(&candidate, &refs, rel, &bounds);
-            if assessment.verdict == Verdict::Unsafe {
-                return AnchorPick {
+            return if profile_triple(&assessment).is_some() {
+                AnchorPick {
+                    selected: Some(assessment),
+                    refused: None,
+                }
+            } else {
+                AnchorPick {
                     selected: None,
                     refused: Some(assessment),
-                };
-            }
-            return AnchorPick {
-                selected: Some(assessment),
-                refused: None,
+                }
             };
         }
     }
@@ -496,4 +613,100 @@ pub fn best_candidate(
     prefer: Option<&str>,
 ) -> Option<Assessment> {
     select_candidate(kernel, rel, prefer).selected
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assessment(safe_len: u64, verdict: Verdict) -> Assessment {
+        Assessment {
+            candidate: Candidate {
+                name: "dump_skip.zeroes".to_string(),
+                offset: 0x2eac808,
+                extent: 0x1000,
+            },
+            safe_len,
+            first_access: None,
+            stopped_by: "live store at +0x810".to_string(),
+            live_reads: Vec::new(),
+            live_writes: Vec::new(),
+            materializations: Vec::new(),
+            init_refs: Vec::new(),
+            verdict,
+        }
+    }
+
+    /// adrp x9, page; add x9, x9, #imm; ldr x0, [x9] -- the sequence whose `add`
+    /// yaxpeax renders with `RegisterOrSP` operands.
+    fn adrp_add_ldr(page: u32, low: u32) -> Vec<u8> {
+        let immlo = (page >> 12) & 3;
+        let immhi = (page >> 14) & 0x7ffff;
+        let adrp = 0x9000_0000 | (immlo << 29) | (immhi << 5) | 9;
+        let add = 0x9100_0000 | (low << 10) | (9 << 5) | 9;
+        let ldr = 0xf940_0000 | (9 << 5);
+        [adrp, add, ldr]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect()
+    }
+
+    fn bounds(text_start: u64, text_end: u64, init_start: u64, init_end: u64) -> Bounds {
+        Bounds {
+            text_start,
+            text_end,
+            init_start,
+            init_end,
+            bss_start: 0,
+            bss_end: 0,
+            ro_after_init_end: 0,
+        }
+    }
+
+    #[test]
+    fn scanner_follows_add_through_register_or_sp() {
+        let kernel = adrp_add_ldr(0x1000, 0x10);
+        let refs = scan_references(&kernel, &bounds(0, 12, 0, 0));
+        assert!(
+            refs.iter()
+                .any(|r| r.target == 0x1010 && r.kind == Kind::Read),
+            "adrp+add+ldr produced no read at 0x1010: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn scanner_reaches_init_text_and_marks_it() {
+        let kernel = adrp_add_ldr(0x1000, 0x20);
+        let refs = scan_references(&kernel, &bounds(0, 0, 0, 12));
+        assert!(
+            refs.iter().any(|r| r.target == 0x1020 && r.init),
+            "init-text access missing or not marked: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn clean_prefix_stops_at_the_first_read() {
+        let mut a = assessment(0x1000, Verdict::NeedsReview);
+        a.first_access = Some(0xa70);
+        assert_eq!(clean_prefix(&a, 0x20), 0xa60);
+    }
+
+    #[test]
+    fn aligned_bytes_rounds_down_to_whole_slots() {
+        assert_eq!(aligned_bytes(0x810, 0x20), 0x800);
+        assert_eq!(aligned_bytes(0x1000, 0x20), 0x1000);
+        assert_eq!(aligned_bytes(0x1f, 0x20), 0);
+    }
+
+    #[test]
+    fn profile_triple_uses_the_safe_prefix_of_an_unsafe_symbol() {
+        let a = assessment(0x810, Verdict::Unsafe);
+        assert_eq!(profile_triple(&a), Some((0x2eac808, 0x800, 0x20)));
+    }
+
+    #[test]
+    fn profile_triple_refuses_a_prefix_shorter_than_one_slot() {
+        let a = assessment(0x1f, Verdict::Unsafe);
+        assert_eq!(profile_triple(&a), None);
+    }
 }

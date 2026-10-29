@@ -151,12 +151,17 @@ notes for the full rule.
 
 To port a *different* build, extract your own profile and then bundle or import it:
 
-1. Extract on a host (`--iomem /dev/null` — the tool otherwise reads the *build host's*
-   `/proc/iomem` and silently produces a plausible wrong `kernel_phys_load`):
+1. Extract on a host. The physical load comes from the bootloader's own image — `--xbl-config`
+   (or `--uefi`) for Qualcomm, `--vendor-boot`/`--dtbo` for MediaTek — or from `--phys`; with
+   neither, the profile leaves it `null` and the native's compiled default applies. The tool does
+   **not** read `/proc/iomem`:
 
    ```sh
-   ghostlock-extract boot.img --iomem /dev/null --phys 0xa8000000 --format conf --out profile.conf
+   ghostlock-extract boot.img --phys 0xa8000000 --format conf --out profile.conf
    ```
+
+   Add `--explain` to print the per-key fact table (value, domain, source, confidence) to
+   stderr; the profile output is unchanged.
 
 2. Either add it under `app/src/main/assets/kernel_profiles/` and register it in `index.conf` (then
    it is the authoritative layer for that kernel), or import it as a user document on a kernel that

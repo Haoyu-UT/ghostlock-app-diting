@@ -102,7 +102,6 @@ fn local_images_reproduce_the_bundled_profiles() {
         return;
     };
     let image_dir = PathBuf::from(image_dir);
-    let iomap = std::env::var_os("GHOSTLOCK_IOMAP").unwrap_or_else(|| "/dev/null".into());
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let assets = manifest.join("../../app/src/main/assets/kernel_profiles");
     let binary = env!("CARGO_BIN_EXE_ghostlock-extract");
@@ -132,8 +131,6 @@ fn local_images_reproduce_the_bundled_profiles() {
             let mut command = Command::new(binary);
             command
                 .arg(image)
-                .arg("--iomem")
-                .arg(&iomap)
                 .arg("--phys")
                 .arg("0xa8000000")
                 .arg("--format")
@@ -259,8 +256,13 @@ fn local_images_reproduce_the_bundled_profiles() {
                 "kernelsnitch",
                 "offset",
             ] {
-                let want = want.get(name).cloned().unwrap_or_default();
-                let got = got.get(name).cloned().unwrap_or_default();
+                let mut want = want.get(name).cloned().unwrap_or_default();
+                let mut got = got.get(name).cloned().unwrap_or_default();
+                if name == "kernelsnitch" {
+                    // The SLUB stride is app-measured; see the families test.
+                    want.retain(|line| !line.contains("mm_struct_sz"));
+                    got.retain(|line| !line.contains("mm_struct_sz"));
+                }
                 assert_eq!(
                     want,
                     got,

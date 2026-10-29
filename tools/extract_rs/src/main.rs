@@ -15,14 +15,15 @@ use ghostlock_extract::derive::{
     multicast_waiter_off, relative_symbols,
 };
 use ghostlock_extract::error::{ExtractError, Result};
+use ghostlock_extract::fact;
 use ghostlock_extract::family;
 use ghostlock_extract::fdt::{recover_kernel_phys_load, recover_kernel_phys_load_from_uefi};
 use ghostlock_extract::dtbo;
-use ghostlock_extract::iomem;
 use ghostlock_extract::ikconfig;
 use ghostlock_extract::kallsyms;
 use ghostlock_extract::kallsyms::Kallsyms;
 use ghostlock_extract::kallsyms_finder;
+use ghostlock_extract::layout;
 use ghostlock_extract::payload;
 use ghostlock_extract::report;
 use ghostlock_extract::structs;
@@ -47,10 +48,6 @@ struct Cli {
     /// embedded kallsyms table is recovered from the kernel image
     #[arg(long)]
     kallsyms: Option<PathBuf>,
-    /// /proc/iomem text file (rooted device dump); when omitted a readable
-    /// /proc/iomem is used to derive kernel_phys_offset and kernel_phys_load
-    #[arg(long)]
-    iomem: Option<PathBuf>,
     /// optional XBL xbl_config.img; derive kernel physical load from its FDT
     #[arg(long)]
     xbl_config: Option<PathBuf>,
@@ -96,6 +93,10 @@ struct Cli {
     /// and print a report instead of offsets
     #[arg(long)]
     analysis: bool,
+    /// with --format conf, print the per-key fact table (value/domain/source/
+    /// confidence) to stderr; the profile output is unchanged
+    #[arg(long)]
+    explain: bool,
     /// scan .bss for a usable lock-anchor region and report the
     /// route.select_stack.lock_anchor_* triple instead of offsets
     #[arg(long)]
@@ -107,6 +108,17 @@ struct Cli {
     /// acceptance test checks a known-good region
     #[arg(long)]
     anchor_symbol: Option<String>,
+    /// operator-supplied lock-anchor image offset, for a family whose anchor
+    /// gate is not open. Requires --anchor-bytes and --anchor-stride. Logged as
+    /// not derived; never emitted without the bytes/stride pair.
+    #[arg(long, value_parser = parse_int)]
+    anchor_image: Option<u64>,
+    /// operator-supplied lock-anchor usable length in bytes (must be >= stride)
+    #[arg(long, value_parser = parse_int)]
+    anchor_bytes: Option<u64>,
+    /// operator-supplied lock-anchor slot pitch in bytes
+    #[arg(long, value_parser = parse_int)]
+    anchor_stride: Option<u64>,
     /// working directory for payload extraction and temp files; defaults to
     /// the system temp dir (pass an app-writable dir when running on Android)
     #[arg(long)]
@@ -348,7 +360,7 @@ fn run(cli: &Cli) -> Result<i32> {
                     PhysOffsetSource::Unset => eprintln!(
                         "info: vendor_boot; kernel_phys_offset not provable \
                          (MiB-aligned kernel_addr and no usable embedded DTB); \
-                         pass --dtbo or --iomem to supply it"
+                         pass --dtbo to supply it"
                     ),
                 }
                 vendor_boot_phys_offset = info.phys_offset;
@@ -385,37 +397,13 @@ fn run(cli: &Cli) -> Result<i32> {
 
     /* The image's release scopes the series template/IKCONFIG predicate below. */
     let release = boot.release();
-    // DRAM base / linear-map offset, and (with the kallsyms delta) the kernel
-    // physical load, from /proc/iomem when it is actually readable (rooted
-    // analysis or --iomem). A fresh unprivileged device gets nothing here; both
-    // stay unset and the native's compiled P0 defaults apply.
-    let mut kernel_phys_offset: Option<u64> = vendor_boot_phys_offset;
-    let iomem_info = match iomem::load(cli.iomem.as_deref()) {
-        Ok(info) => info,
-        Err(err) => {
-            eprintln!("warning: {err}");
-            None
-        }
-    };
-    if let Some(info) = iomem_info {
-        if let Some(dram_base) = info.dram_base {
-            kernel_phys_offset = Some(dram_base);
-        }
-        if kernel_phys_load.is_none() {
-            /* arch/arm64/kernel/setup.c: kernel_code.start = __pa_symbol(_text),
-             * so the "Kernel code" range already starts at the image's physical
-             * base. Subtracting (_stext - _text) here made every 5.10 value
-             * 0x10000 low (the reason `--phys` was needed as a workaround). */
-            if let Some(kc) = info.kernel_code_start {
-                eprintln!(
-                    "info: iomem; kernel_phys_load=0x{kc:x} kernel_phys_offset=0x{:x}",
-                    kernel_phys_offset.unwrap_or(0)
-                );
-                kernel_phys_load = Some(kc);
-                phys_source = "iomem";
-            }
-        }
-    }
+    /* /proc/iomem is deliberately not a source for the physical pair. Its
+     * "Kernel code" start is seeded from _text on some images and _stext on
+     * others (a per-image fact, not a release rule), and its System-RAM base
+     * is not memstart_addr (arm64 rounds that down to ARM64_MEMSTART_ALIGN).
+     * The load comes from xbl_config/uefi/vendor_boot or --phys; the offset
+     * from vendor_boot/dtbo, or stays null for the native's compiled default. */
+    let kernel_phys_offset: Option<u64> = vendor_boot_phys_offset;
 
     let (rel_symbols, sorted_offsets) = relative_symbols(&symbols, base);
     // stop early when remove_waiter() is fixed; --analysis reports it instead.
@@ -877,6 +865,9 @@ fn run(cli: &Cli) -> Result<i32> {
     }
 
     let btf_size = btf_raw.as_ref().map(|b| b.len()).unwrap_or(0);
+    if cli.explain && cli.format != "conf" {
+        eprintln!("warning: --explain is only meaningful with --format conf; ignoring");
+    }
     let output = if cli.format == "conf" {
         let release_text = release
             .as_deref()
@@ -1095,46 +1086,103 @@ fn run(cli: &Cli) -> Result<i32> {
         // region; the anchor triple is per image (offset, safe length, slot
         // pitch). The pitch is the family's sizeof(rt_mutex): the anchor scan
         // does not derive it (docs/analysis/anchor-derivation-plan.md).
-        if cli.anchor && series_matched {
-            match route.as_deref() {
-                Some(route) if route == "select_stack" || route == "sigreturn" => {
-                    let pick = anchor::select_candidate(
-                        &boot.kernel,
-                        &rel_symbols,
-                        Some("dump_skip.zeroes"),
-                    );
-                    match (pick.selected, pick.refused) {
-                        (Some(a), _) => {
-                            eprintln!(
-                                "info: lock anchor {} +0x{:x}, 0x{:x} bytes, stride {}, verdict {}",
-                                a.candidate.name,
-                                a.candidate.offset,
-                                a.safe_len,
-                                family::ANCHOR_STRIDE,
-                                a.verdict.label(),
-                            );
-                            geometry.push(("lock_anchor_image", a.candidate.offset as i64));
-                            geometry.push(("lock_anchor_bytes", a.safe_len as i64));
-                            geometry.push(("lock_anchor_stride", family::ANCHOR_STRIDE as i64));
-                        }
-                        (None, Some(a)) => eprintln!(
-                            "warning: lock anchor {} +0x{:x} refused: verdict {} ({}); \
-                             the anchor triple is omitted",
-                            a.candidate.name,
-                            a.candidate.offset,
-                            a.verdict.label(),
-                            a.stopped_by,
-                        ),
-                        (None, None) => eprintln!(
-                            "warning: --anchor found no usable .bss region; the profile falls \
-                             back to the reclaimed page"
-                        ),
+        if cli.anchor {
+            match (cli.anchor_image, cli.anchor_bytes, cli.anchor_stride) {
+                (Some(image), Some(bytes), Some(stride)) => {
+                    if stride == 0 || bytes < stride {
+                        eprintln!(
+                            "warning: lock anchor +0x{image:x}: 0x{bytes:x} bytes cannot \
+                             hold one {stride}-byte slot; the triple is omitted"
+                        );
+                    } else {
+                        eprintln!(
+                            "warning: operator-supplied lock anchor +0x{image:x}, \
+                             0x{bytes:x} bytes, stride {stride} -- NOT derived; the \
+                             anchor gate for {release_text} stays closed until a device \
+                             gate records a pass"
+                        );
+                        geometry.push(("lock_anchor_image", image as i64));
+                        geometry.push(("lock_anchor_bytes", bytes as i64));
+                        geometry.push(("lock_anchor_stride", stride as i64));
                     }
                 }
-                Some(route) => eprintln!(
-                    "warning: --anchor: route {route} does not use a lock anchor; nothing emitted"
+                (None, None, None)
+                    if series_matched && family::anchor_stride(release_text).is_some() =>
+                {
+                    match route.as_deref() {
+                        Some(route)
+                            if route == "select_stack"
+                                || route == "sigreturn"
+                                || route == "multicast_waiter" =>
+                        {
+                            let pick = anchor::select_candidate(
+                                &boot.kernel,
+                                &rel_symbols,
+                                Some("dump_skip.zeroes"),
+                            );
+                            match (pick.selected, pick.refused) {
+                                (Some(a), _) => match anchor::profile_triple(&a) {
+                                    Some((image, bytes, stride)) => {
+                                        eprintln!(
+                                            "info: lock anchor {} +0x{:x}, 0x{:x} bytes \
+                                             (safe prefix 0x{:x}, stopped by: {}), stride {}, \
+                                             verdict {}",
+                                            a.candidate.name,
+                                            image,
+                                            bytes,
+                                            a.safe_len,
+                                            a.stopped_by,
+                                            stride,
+                                            a.verdict.label(),
+                                        );
+                                        geometry.push(("lock_anchor_image", image as i64));
+                                        geometry.push(("lock_anchor_bytes", bytes as i64));
+                                        geometry.push(("lock_anchor_stride", stride as i64));
+                                    }
+                                    None => eprintln!(
+                                        "warning: lock anchor {} +0x{:x} has no usable \
+                                         prefix (safe length 0x{:x}); the anchor triple is \
+                                         omitted",
+                                        a.candidate.name,
+                                        a.candidate.offset,
+                                        a.safe_len,
+                                    ),
+                                },
+                                (None, Some(a)) => eprintln!(
+                                    "warning: lock anchor {} +0x{:x} refused: safe prefix \
+                                     0x{:x} cannot hold one 0x{:x}-byte slot (verdict {}, \
+                                     {}); the anchor triple is omitted",
+                                    a.candidate.name,
+                                    a.candidate.offset,
+                                    a.safe_len,
+                                    family::ANCHOR_STRIDE,
+                                    a.verdict.label(),
+                                    a.stopped_by,
+                                ),
+                                (None, None) => eprintln!(
+                                    "warning: --anchor found no usable .bss region; the \
+                                     profile falls back to the reclaimed page"
+                                ),
+                            }
+                        }
+                        Some(route) => eprintln!(
+                            "warning: --anchor: route {route} does not use a lock anchor; \
+                             nothing emitted"
+                        ),
+                        None => {
+                            eprintln!("warning: --anchor: no route selected; nothing emitted")
+                        }
+                    }
+                }
+                (None, None, None) => eprintln!(
+                    "warning: --anchor: the anchor gate is closed for {release_text} (only \
+                     the device-validated 5.10 android12-9 series emits one); supply \
+                     --anchor-image/--anchor-bytes/--anchor-stride for a device-gate run"
                 ),
-                None => eprintln!("warning: --anchor: no route selected; nothing emitted"),
+                _ => eprintln!(
+                    "warning: --anchor-image/--anchor-bytes/--anchor-stride must be given \
+                     together; the anchor triple is omitted"
+                ),
             }
         }
         match route.as_deref() {
@@ -1278,19 +1326,34 @@ fn run(cli: &Cli) -> Result<i32> {
             empty_zero_page: kallsyms::unique(&symbols, "empty_zero_page")
                 .and_then(|value| value.checked_sub(base)),
         };
-        report::render_conf(&report::ConfInputs {
+        let layouts = layout::derive(btf.as_ref(), release_text);
+        let inputs = report::ConfInputs {
             release: release_text,
             phys: kernel_phys_load,
-            /* DRAM base: from /proc/iomem, or from the vendor_boot/dtb DTB
-             * /memory node, or left null for the profile author to fill. */
+            /* DRAM base: from the vendor_boot/dtbo DTB /memory node, or left
+             * null so the native's compiled default applies. */
             phys_offset: kernel_phys_offset,
+            phys_source,
             symbols: &symbol_offsets,
             structs: &struct_offsets,
             route: route.as_deref(),
             route_geometry: &geometry,
             cred: &cred,
             extra_offsets: &extra_offsets,
-        })
+            layouts: Some(&layouts),
+        };
+        if cli.explain {
+            let provenance = fact::Provenance {
+                btf_present: btf.is_some(),
+                phys_source,
+                route_forced: cli.route.is_some(),
+                field_sources: &field_sources,
+                release: release_text,
+                layouts: &layouts,
+            };
+            eprint!("{}", fact::explain_conf(&inputs, &provenance).render());
+        }
+        report::render_conf(&inputs)
     } else {
         let report_value = report::build_report(
             release.as_deref(),
@@ -1455,11 +1518,18 @@ text [+0x{:x}, +0x{:x}), init [+0x{:x}, +0x{:x})\n",
             a.candidate.name, a.candidate.offset, a.candidate.extent
         ));
         out.push_str(&format!(
-            "  references : {} live read, {} live write, {} init\n",
+            "  references : {} live read, {} live write, {} init, {} materialized\n",
             a.live_reads.len(),
             a.live_writes.len(),
-            a.init_refs.len()
+            a.init_refs.len(),
+            a.materializations.len()
         ));
+        for r in a.materializations.iter().take(3) {
+            out.push_str(&format!(
+                "     addr  +0x{:x} at +0x{:x} (materialized; indexed/call uses are invisible)\n",
+                r.target, r.site
+            ));
+        }
         for r in a.live_reads.iter().take(3) {
             out.push_str(&format!(
                 "     read  +0x{:x} width {} at +0x{:x}\n",
@@ -1476,19 +1546,38 @@ text [+0x{:x}, +0x{:x}), init [+0x{:x}, +0x{:x})\n",
             "  safe length: 0x{:x}   (stopped by: {})\n",
             a.safe_len, a.stopped_by
         ));
+        out.push_str(&format!(
+            "  first access: {}\n",
+            a.first_access
+                .map(|o| format!("+0x{o:x}"))
+                .unwrap_or_else(|| "none".to_string())
+        ));
+        out.push_str(&format!(
+            "  clean prefix: 0x{:x}   (first read/write/init access, at stride {})\n",
+            anchor::clean_prefix(&a, family::ANCHOR_STRIDE),
+            family::ANCHOR_STRIDE,
+        ));
         out.push_str(&format!("  verdict    : {}\n", a.verdict.label()));
         out.push_str(&format!(
             "  stride     : not derived -- the PI walk's lock-relative accesses need \
 register provenance across branches; supply it in the profile (see the design doc)\n"
         ));
-        out.push_str(&format!(
-            "  => route.select_stack.lock_anchor_image  = {}\n",
-            a.candidate.offset
-        ));
-        out.push_str(&format!(
-            "     route.select_stack.lock_anchor_bytes  = {}\n\n",
-            a.safe_len
-        ));
+        match anchor::profile_triple(&a) {
+            Some((image, bytes, stride)) => {
+                out.push_str(&format!(
+                    "  => lock_anchor_image = {}   (place under the selected route)\n",
+                    image
+                ));
+                out.push_str(&format!(
+                    "     lock_anchor_bytes = {}   (safe prefix 0x{:x} rounded down)\n",
+                    bytes, a.safe_len
+                ));
+                out.push_str(&format!("     lock_anchor_stride = {}\n\n", stride));
+            }
+            None => out.push_str(
+                "  => no triple: the safe prefix is shorter than one lock slot\n\n",
+            ),
+        }
     }
     out
 }

@@ -50,7 +50,11 @@ class ParsePhysTest {
         )
         assertNull(nextPhysImage(state(qualcomm = true, physSource = "xbl_config FDT")))
         assertNull(nextPhysImage(state(qualcomm = true, physSource = "uefi memory map")))
-        assertNull(nextPhysImage(state(qualcomm = true, physSource = "iomem")))
+        // iomem is no longer a load source: a stale source string must still prompt.
+        assertEquals(
+            PhysImage.XBL,
+            nextPhysImage(state(qualcomm = true, physSource = "iomem")),
+        )
     }
 
     @Test

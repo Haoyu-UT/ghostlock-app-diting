@@ -393,7 +393,7 @@ sealed interface ParseResult {
         /** The extractor's lock-anchor line (verdict and reason), if any. */
         val anchor: String? = null,
         /** Extractor's canonical phys source (`xbl_config FDT`, `uefi memory
-         * map`, `vendor_boot …`, `iomem`, `MediaTek DRAM base`, `unset`). */
+         * map`, `vendor_boot …`, `MediaTek DRAM base`, `--phys`, `unset`). */
         val physSource: String? = null,
         /** The parsed document carries `kernel_phys_load`. */
         val physLoadPresent: Boolean = false,

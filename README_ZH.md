@@ -126,12 +126,16 @@ waiter —— 10 字布局
 
 配置文件**不是**内置资源，而是以用户文档方式导入。
 
-1. 在主机上提取（务必加 `--iomem /dev/null`——否则工具会去读**构建主机**的 `/proc/iomem`，
-   并静默给出一个看似合理的错误 `kernel_phys_load`）：
+1. 在主机上提取。物理加载地址来自引导程序自身的镜像——高通用 `--xbl-config`（或 `--uefi`），
+   联发科用 `--vendor-boot`/`--dtbo`——或用 `--phys` 显式给出；两者都没有时，profile 留空，
+   由 native 的编译默认值生效。工具**不再读取** `/proc/iomem`：
 
    ```sh
-   ghostlock-extract boot.img --iomem /dev/null --phys 0xa8000000 --format conf --out profile.conf
+   ghostlock-extract boot.img --phys 0xa8000000 --format conf --out profile.conf
    ```
+
+   加 `--explain` 会把每个键的事实表（值、domain、source、confidence）打到 stderr；
+   profile 输出保持不变。
 
 2. 在 App 中导入：**配置参数 → 导入 offsets.conf（v2）**。导入的用户文档优先于内置配置。
 3. 用 root shell 设置 `settings_enable_monitor_phantom_procs = false`。否则 Android 的

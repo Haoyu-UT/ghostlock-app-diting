@@ -129,12 +129,14 @@ text [+0x{:x}, +0x{:x}), init [+0x{:x}, +0x{:x})",
     for a in &assessed {
         println!(
             "{:<10} {:<48} image +0x{:<9x} extent 0x{:<7x} safe_len 0x{:<7x} \
-reads {:<3} writes {:<3} init {:<3} stopped_by {}",
+first {:<8} mats {:<3} reads {:<3} writes {:<3} init {:<3} stopped_by {}",
             a.verdict.label(),
             a.candidate.name,
             a.candidate.offset,
             a.candidate.extent,
             a.safe_len,
+            a.first_access.map(|v| format!("0x{v:x}")).unwrap_or_else(|| "none".into()),
+            a.materializations.len(),
             a.live_reads.len(),
             a.live_writes.len(),
             a.init_refs.len(),
@@ -181,13 +183,15 @@ safe_len 0x{:x}  stopped_by {}",
     for (i, a) in by_len.iter().take(20).enumerate() {
         println!(
             "{:>2}. {:<10} {:<48} image +0x{:<9x} extent 0x{:<7x} safe_len 0x{:<7x} \
-reads {:<3} writes {:<3} stopped_by {}",
+first {:<8} mats {:<3} reads {:<3} writes {:<3} stopped_by {}",
             i + 1,
             a.verdict.label(),
             a.candidate.name,
             a.candidate.offset,
             a.candidate.extent,
             a.safe_len,
+            a.first_access.map(|v| format!("0x{v:x}")).unwrap_or_else(|| "none".into()),
+            a.materializations.len(),
             a.live_reads.len(),
             a.live_writes.len(),
             a.stopped_by,

@@ -108,7 +108,12 @@ The gate is met, and the device run exposed one bug the host path had hidden.
   `(_stext - _text)` from the `Kernel code` start; `arch/arm64/kernel/setup.c` already stores
   `__pa_symbol(_text)` there, so the subtraction is wrong on every 5.10 image. Every host run had
   passed `--iomem /dev/null` and carried `null`, which is why this stayed invisible until the
-  extractor ran on the phone. `main.rs` now uses the `Kernel code` start directly.
+  extractor ran on the phone. `main.rs` now uses the `Kernel code` start directly. *(2026-10-28:
+  that is exact on 5.10; most 5.15+/6.x images put `__pa_symbol(_stext)` there (0x10000 high),
+  but 6.12.69 does not (one build after a `_stext` build on the same device), so the
+  version-independent load is the `Kernel data` range against `_sdata`/`_end` — see
+  `fact-sources-and-precedence-plan.md`. 2026-10-29: the iomem source was removed entirely;
+  the load now comes from the bootloader sidecar or `--phys`, otherwise null.)*
 - **A profile derived on the phone runs.** The derived 5.10.236 document was loaded as the imported
   layer. Because a bundled profile is authoritative for the device's own release, the run needed a
   builtin selected by hand — the layer policy's escape hatch; the app's log then records

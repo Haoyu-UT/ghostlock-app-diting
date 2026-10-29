@@ -48,8 +48,6 @@ fn analysis(binary: &str, image: &Path) -> String {
     let output = Command::new(binary)
         .arg(image)
         .arg("--analysis")
-        .arg("--iomem")
-        .arg("/dev/null")
         .output()
         .expect("run extractor");
     assert!(
@@ -137,8 +135,6 @@ fn the_6_1_image_asks_for_a_route_choice() {
 
     let first = Command::new(binary)
         .arg(image)
-        .arg("--iomem")
-        .arg("/dev/null")
         .arg("--format")
         .arg("conf")
         .arg("--out")
@@ -162,8 +158,6 @@ fn the_6_1_image_asks_for_a_route_choice() {
 
     let forced = Command::new(binary)
         .arg(image)
-        .arg("--iomem")
-        .arg("/dev/null")
         .arg("--format")
         .arg("conf")
         .arg("--route")

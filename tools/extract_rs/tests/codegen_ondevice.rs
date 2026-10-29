@@ -72,8 +72,6 @@ fn run(binary: &str, image: &Path, route: &str, no_disasm: bool) -> (i32, String
     let mut command = Command::new(binary);
     command
         .arg(image)
-        .arg("--iomem")
-        .arg("/dev/null")
         .arg("--format")
         .arg("conf")
         .arg("--route")

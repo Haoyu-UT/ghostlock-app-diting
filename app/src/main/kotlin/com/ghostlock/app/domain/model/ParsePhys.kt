@@ -16,13 +16,12 @@ internal data class PhysPromptState(
 
 /**
  * True when the reported source can be trusted for the kernel physical load:
- * `xbl_config` and `uefi` are the Qualcomm image sources, `iomem` is the rooted
- * device's own map and `--phys` is the user's explicit value.
+ * `xbl_config` and `uefi` are the Qualcomm image sources, `--phys` is the
+ * user's explicit value. `/proc/iomem` is deliberately not a source.
  */
 internal fun sourceSuppliesLoad(source: String?): Boolean {
     val text = source?.lowercase().orEmpty()
-    return text.contains("xbl_config") || text.contains("uefi") ||
-        text.contains("iomem") || text.contains("--phys")
+    return text.contains("xbl_config") || text.contains("uefi") || text.contains("--phys")
 }
 
 /**
