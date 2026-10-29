@@ -110,23 +110,6 @@ pub fn matches(release: &str) -> bool {
     release.starts_with("5.10.") && release.contains("-android12-9-")
 }
 
-/// The lock-anchor pitch for a release, when that family's anchor gate is open.
-///
-/// Only the 5.10 `android12-9` series has a device-validated anchor. The pitch
-/// itself is not 5.10-specific -- `sizeof(struct rt_mutex)` is 32 bytes on every
-/// family sampled (5.15, 6.1, 6.6, 6.12, 2026-10-27) -- but emitting a triple
-/// also asserts that *a region* on that family is unused, and static scanning
-/// cannot prove that (indirect and indexed accesses are invisible). A family
-/// opens only after its own device gate, with its own acceptance control.
-/// Do not loosen this to "any family with a 32-byte rt_mutex".
-pub fn anchor_stride(release: &str) -> Option<u64> {
-    if matches(release) {
-        Some(ANCHOR_STRIDE)
-    } else {
-        None
-    }
-}
-
 /// Any 5.10 build, regardless of the release suffix. The series predicate
 /// (IKCONFIG fingerprint) decides which template fields may be carried; this
 /// only identifies the codegen family whose waiter layout is a 5.10 constant.

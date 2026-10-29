@@ -77,7 +77,9 @@ struct Cli {
     /// numbers, chosen route); exit 7 signals ambiguity
     #[arg(long)]
     feasible_out: Option<PathBuf>,
-    /// derive the route's lock-anchor region and emit it in --format conf
+    /// derive the route's lock-anchor region and emit it in --format conf.
+    /// Any family; the profile carries it only when the route uses an anchor,
+    /// and the app asks page-vs-anchor before export.
     #[arg(long)]
     anchor: bool,
     /// treat every unresolved symbol as optional (emit 0)
@@ -108,9 +110,9 @@ struct Cli {
     /// acceptance test checks a known-good region
     #[arg(long)]
     anchor_symbol: Option<String>,
-    /// operator-supplied lock-anchor image offset, for a family whose anchor
-    /// gate is not open. Requires --anchor-bytes and --anchor-stride. Logged as
-    /// not derived; never emitted without the bytes/stride pair.
+    /// operator-supplied lock-anchor image offset; overrides the derived
+    /// candidate. Requires --anchor-bytes and --anchor-stride. Logged as not
+    /// derived; never emitted without the bytes/stride pair.
     #[arg(long, value_parser = parse_int)]
     anchor_image: Option<u64>,
     /// operator-supplied lock-anchor usable length in bytes (must be >= stride)
@@ -1106,19 +1108,37 @@ fn run(cli: &Cli) -> Result<i32> {
                         geometry.push(("lock_anchor_stride", stride as i64));
                     }
                 }
-                (None, None, None)
-                    if series_matched && family::anchor_stride(release_text).is_some() =>
-                {
+                (None, None, None) => {
                     match route.as_deref() {
                         Some(route)
                             if route == "select_stack"
                                 || route == "sigreturn"
                                 || route == "multicast_waiter" =>
                         {
+                            /* The named, device-proven classes only: the
+                             * coredump zero page (6.x calls it
+                             * `__dump_skip.zeroes`, 5.10 `dump_skip.zeroes`)
+                             * and the 6.1 dead-code serial-port array. No
+                             * ranked fallback -- the scan's `safe` verdict is
+                             * not proof (`__log_buf` scores safe and is
+                             * written by printk through invisible indexes). */
+                            let prefer: &[&str] = if release_text.starts_with("6.1.") {
+                                &[
+                                    "s3c24xx_serial_ports",
+                                    "__dump_skip.zeroes",
+                                    "dump_skip.zeroes",
+                                ]
+                            } else {
+                                &[
+                                    "__dump_skip.zeroes",
+                                    "dump_skip.zeroes",
+                                    "s3c24xx_serial_ports",
+                                ]
+                            };
                             let pick = anchor::select_candidate(
                                 &boot.kernel,
                                 &rel_symbols,
-                                Some("dump_skip.zeroes"),
+                                prefer,
                             );
                             match (pick.selected, pick.refused) {
                                 (Some(a), _) => match anchor::profile_triple(&a) {
@@ -1160,8 +1180,11 @@ fn run(cli: &Cli) -> Result<i32> {
                                     a.stopped_by,
                                 ),
                                 (None, None) => eprintln!(
-                                    "warning: --anchor found no usable .bss region; the \
-                                     profile falls back to the reclaimed page"
+                                    "warning: --anchor found no usable named region \
+                                     (zero page / serial ports); the profile falls back \
+                                     to the reclaimed page -- supply \
+                                     --anchor-image/--anchor-bytes/--anchor-stride for a \
+                                     known region"
                                 ),
                             }
                         }
@@ -1174,11 +1197,6 @@ fn run(cli: &Cli) -> Result<i32> {
                         }
                     }
                 }
-                (None, None, None) => eprintln!(
-                    "warning: --anchor: the anchor gate is closed for {release_text} (only \
-                     the device-validated 5.10 android12-9 series emits one); supply \
-                     --anchor-image/--anchor-bytes/--anchor-stride for a device-gate run"
-                ),
                 _ => eprintln!(
                     "warning: --anchor-image/--anchor-bytes/--anchor-stride must be given \
                      together; the anchor triple is omitted"

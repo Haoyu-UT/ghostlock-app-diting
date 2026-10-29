@@ -561,58 +561,46 @@ pub fn profile_triple(a: &Assessment) -> Option<(u64, u64, u64)> {
     (bytes >= stride).then_some((a.candidate.offset, bytes, stride))
 }
 
-/// Pick the region a generated profile should carry: the named preference when
-/// it exists and its safe prefix holds at least one slot, else the largest
-/// non-unsafe ranked candidate that fits at least one lock slot. The named path
-/// is how the diting line is validated (`dump_skip.zeroes`); the ranked path is
-/// the fallback for a build whose symbol set moved.
+/// Pick the region a generated profile should carry: the first named
+/// preference that exists and whose safe prefix holds at least one slot.
+///
+/// There is deliberately **no ranked fallback**: the scanner's `safe` verdict
+/// is not proof — `__log_buf` scores as `safe` (0 direct references) yet
+/// printk writes it through indexes the scan cannot see, and it would win a
+/// `max_by_key(safe_len)` race. An anchor the operator did not accept may
+/// corrupt live kernel data; a build whose symbol set moved gets the warning
+/// and the page path, or an operator-supplied triple.
 ///
 /// The named path judges the **prefix**, not the whole symbol: a live store
 /// past the prefix never reaches the slots the anchor writes (5.10.198's
 /// `dump_skip.zeroes` has a store at +0x810 and a 0x800 usable prefix). The
 /// whole-symbol verdict is still reported, and a prefix shorter than one slot
-/// is refused.
+/// is refused (the next name in the list is still tried).
 pub fn select_candidate(
     kernel: &[u8],
     rel: &BTreeMap<String, BTreeSet<u64>>,
-    prefer: Option<&str>,
+    prefer: &[&str],
 ) -> AnchorPick {
     let bounds = bounds_from(rel);
     let refs = scan_references(kernel, &bounds);
-    if let Some(name) = prefer {
-        if let Some(candidate) = named_candidate(rel, &bounds, name) {
-            let assessment = assess(&candidate, &refs, rel, &bounds);
-            return if profile_triple(&assessment).is_some() {
-                AnchorPick {
-                    selected: Some(assessment),
-                    refused: None,
-                }
-            } else {
-                AnchorPick {
-                    selected: None,
-                    refused: Some(assessment),
-                }
+    let mut refused = None;
+    for name in prefer {
+        let Some(candidate) = named_candidate(rel, &bounds, name) else {
+            continue;
+        };
+        let assessment = assess(&candidate, &refs, rel, &bounds);
+        if profile_triple(&assessment).is_some() {
+            return AnchorPick {
+                selected: Some(assessment),
+                refused: None,
             };
         }
+        refused.get_or_insert(assessment);
     }
-    let selected = candidates(rel, &bounds, 256)
-        .into_iter()
-        .map(|candidate| assess(&candidate, &refs, rel, &bounds))
-        .filter(|a| a.verdict != Verdict::Unsafe && a.safe_len >= 32)
-        .max_by_key(|a| a.safe_len);
     AnchorPick {
-        selected,
-        refused: None,
+        selected: None,
+        refused,
     }
-}
-
-/// Compatibility wrapper: the selected assessment, if any.
-pub fn best_candidate(
-    kernel: &[u8],
-    rel: &BTreeMap<String, BTreeSet<u64>>,
-    prefer: Option<&str>,
-) -> Option<Assessment> {
-    select_candidate(kernel, rel, prefer).selected
 }
 
 #[cfg(test)]
