@@ -455,6 +455,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 documentName = name,
                 route = report?.chosen ?: route,
                 anchor = anchorLine(captured),
+                hasAnchor = document.contains("lock_anchor_image"),
                 physSource = physSourceFromLines(captured),
                 physLoadPresent = filtered.any { it.getLongAt("kernel_phys_load") != null },
                 physOffsetPresent = filtered.any { it.getLongAt("kernel_phys_offset") != null },
@@ -523,6 +524,11 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         if (probe == null) onLog("stride: no candidate table")
         return probe
     }
+
+    override fun applyLockSourceToDocument(
+        documentText: String,
+        keepAnchor: Boolean,
+    ): String? = if (keepAnchor) documentText else stripLockAnchor(documentText)
 
     override fun applyStrideToDocument(
         documentText: String,

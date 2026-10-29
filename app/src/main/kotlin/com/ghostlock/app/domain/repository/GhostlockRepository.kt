@@ -85,6 +85,16 @@ interface GhostlockRepository {
         stride: Int?,
     ): String?
 
+    /**
+     * Applies the user's lock-source choice to an in-memory generated document:
+     * `keepAnchor = false` removes the `lock_anchor_*` triple (page mode) and
+     * returns the rendered text; `true` returns the text unchanged.
+     */
+    fun applyLockSourceToDocument(
+        documentText: String,
+        keepAnchor: Boolean,
+    ): String?
+
     /* ---- profile sources (measured-db storage model) ---- */
 
     /** External document selected for the device release, or null. */

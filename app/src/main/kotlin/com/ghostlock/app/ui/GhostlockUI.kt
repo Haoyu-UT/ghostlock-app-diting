@@ -252,6 +252,7 @@ interface GhostlockActions {
     fun onClearExternalProfile()
     fun onParseOta()
     fun onParseImage()
+    fun onGenerateProfile()
     fun onCpuPairSelected(index: Int)
     fun onSafeModeChanged(enabled: Boolean)
     fun onForceAttackTestChanged(enabled: Boolean)
@@ -1096,6 +1097,15 @@ private fun ControlPanel(
                 .fillMaxWidth()
                 .padding(top = 12.dp),
         )
+        /* The profile-generation entry sits on the home: one sheet, OTA link
+         * or an on-device image, instead of the deep advanced page. */
+        Card(modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) {
+            ArrowPreference(
+                title = stringResource(R.string.home_generate_profile),
+                summary = stringResource(R.string.home_generate_profile_summary),
+                onClick = actions::onGenerateProfile,
+            )
+        }
         Card(modifier = modifier.padding(top = 12.dp)) {
             if (state.cpuPairLabels.isNotEmpty()) {
                 val customPair = state.customCpuPair

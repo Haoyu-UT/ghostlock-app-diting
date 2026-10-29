@@ -16,6 +16,9 @@
     <string name="action_import_offsets_json">导入 offsets.json（v1）</string>
     <string name="action_parse_ota">解析完整包链接</string>
     <string name="action_parse">解析本地镜像</string>
+    <string name="home_generate_profile">生成配置</string>
+    <string name="home_generate_profile_summary">从 OTA 链接或本机镜像解析内核</string>
+    <string name="parse_source_title">生成配置 — 选择来源</string>
     <string name="import_success">偏移已导入</string>
     <string name="import_no_match">已导入，但 release 与本机内核不匹配，不会生效</string>
     <string name="import_failed">导入失败</string>
@@ -60,6 +63,9 @@
     <string name="parse_missing_phys_mediatek">缺少 kernel_phys_load / kernel_phys_offset。联发科镜像没有 xbl_config 或 BTF，提取器无法仅从 boot.img 推导，运行时回退会在 W1 失败。最简单的办法：重新解析并附加 vendor_boot.img。如果被拒绝（对齐模式无法识别），请改为在已 root 的设备上运行单独的 tools/mtk-phys 提取器，再把两个值填入高级参数覆盖。</string>
     <string name="parse_result_title">解析结果</string>
     <string name="parse_route_title">两条路线均可用，请选择一条</string>
+    <string name="parse_lock_title">锁来源 — 请选择</string>
+    <string name="parse_lock_page">页面 — 锁在回收页中；不会选错内核对象，成功率较低</string>
+    <string name="parse_lock_anchor">锚点 — 使用镜像中的零 .bss 区域；区域正确时成功率更高，选错会破坏内核数据</string>
     <string name="stride_title">Slab 跨度</string>
     <string name="stride_subtitle">已在本机取得 %1$d 次泄漏测量</string>
     <string name="stride_level_confirmed">已确认</string>

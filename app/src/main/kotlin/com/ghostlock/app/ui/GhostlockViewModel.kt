@@ -75,7 +75,7 @@ private data class ParseRequest(
     val route: String? = null,
 )
 
-private enum class ParseDialogStage { Mode, PhysImage, Route }
+private enum class ParseDialogStage { Mode, PhysImage, Route, Lock, Source }
 
 class GhostlockViewModel(
     private val repository: GhostlockRepository,
@@ -110,6 +110,7 @@ class GhostlockViewModel(
     /** The pass that reported Ambiguous, re-run with the picked route. */
     private var pendingRouteParse: ParseRequest? = null
     private var pendingRouteChoices: List<RouteVerdict> = emptyList()
+    private var pendingLockParse: ParseResult.Parsed? = null
 
     /** The generated document and its stride evidence, held while the picker is up. */
     private var pendingStrideParse: ParseResult.Parsed? = null
@@ -1103,8 +1104,34 @@ class GhostlockViewModel(
         }
     }
 
+    /**
+     * The home entry: one sheet with the two profile sources. The OTA path
+     * keeps its URL input; the on-device path accepts boot.img, a raw Image,
+     * payload.bin or an OTA zip in one picker (the extractor detects the
+     * format from the bytes).
+     */
+    fun promptParseSource() {
+        resetParseSession()
+        parseDialogStage = ParseDialogStage.Source
+        mutableState.update {
+            it.copy(
+                dialogVisible = true,
+                dialogType = DialogType.LIST,
+                dialogTitleRes = R.string.parse_source_title,
+                dialogItems = emptyList(),
+                dialogItemResIds = listOf(
+                    R.string.action_parse_ota,
+                    R.string.action_parse,
+                ),
+                dialogCurrentItemIndex = -1,
+                executionSheetVisible = false,
+            )
+        }
+    }
+
     private fun resetParseSession() {
         pendingParse = null
+        pendingLockParse = null
         physVendorBootOffered = false
         physXblOffered = false
         physUefiOffered = false
@@ -1146,6 +1173,14 @@ class GhostlockViewModel(
                 1 -> pickBoot()
             }
 
+            ParseDialogStage.Source -> {
+                parseDialogStage = ParseDialogStage.Mode
+                when (index) {
+                    0 -> promptParseUrl()
+                    1 -> parseOffsets()
+                }
+            }
+
             ParseDialogStage.PhysImage -> {
                 val image = pendingPhysImage
                 if (image == null || index > 1) {
@@ -1178,6 +1213,30 @@ class GhostlockViewModel(
                     appendLog("route chosen: $route")
                     pendingParse = parse.copy(route = route)
                     launchParse()
+                }
+            }
+
+            ParseDialogStage.Lock -> {
+                val parse = pendingLockParse
+                pendingLockParse = null
+                parseDialogStage = ParseDialogStage.Mode
+                val document = parse?.documentText
+                if (parse != null && document != null) {
+                    if (index == 1) {
+                        appendLog("lock source: anchor")
+                        viewModelScope.launch { continueParsed(parse, document) }
+                    } else {
+                        val page = repository.applyLockSourceToDocument(
+                            document,
+                            keepAnchor = false,
+                        )
+                        if (page == null) {
+                            appendLog("result: could not remove the lock anchor; export cancelled")
+                        } else {
+                            appendLog("lock source: page (lock anchor removed)")
+                            viewModelScope.launch { continueParsed(parse, page) }
+                        }
+                    }
                 }
             }
         }
@@ -1234,6 +1293,15 @@ class GhostlockViewModel(
             pendingRouteChoices = emptyList()
             parseDialogStage = ParseDialogStage.Mode
             appendLog("result: route choice cancelled")
+        }
+        if (parseDialogStage == ParseDialogStage.Lock) {
+            pendingLockParse = null
+            parseDialogStage = ParseDialogStage.Mode
+            appendLog("result: lock source choice cancelled")
+        }
+        if (parseDialogStage == ParseDialogStage.Source) {
+            parseDialogStage = ParseDialogStage.Mode
+            appendLog("result: profile source choice cancelled")
         }
         pendingSelectUri = null
         dismissDialog()
@@ -1660,6 +1728,37 @@ class GhostlockViewModel(
         }
         appendLog("profile generated: ${result.releases.joinToString()}")
         appendLog("result: profile generated; export it to use it")
+        /* The lock source is the user's choice: page (safe, lower rate) or the
+         * generated anchor (higher rate if the zero-page region is correct).
+         * The extractor only emits a triple for routes that use one. */
+        if (result.hasAnchor) {
+            pendingLockParse = result
+            parseDialogStage = ParseDialogStage.Lock
+            mutableState.update {
+                it.copy(
+                    dialogVisible = true,
+                    dialogType = DialogType.LIST,
+                    dialogTitleRes = R.string.parse_lock_title,
+                    dialogItems = emptyList(),
+                    dialogItemResIds = listOf(
+                        R.string.parse_lock_page,
+                        R.string.parse_lock_anchor,
+                    ),
+                    dialogCurrentItemIndex = -1,
+                    executionSheetVisible = false,
+                )
+            }
+            return
+        }
+        continueParsed(result, document)
+    }
+
+    /**
+     * The stride probe and the export are shared by the no-anchor path and the
+     * post-choice path: [document] is what will be exported (page mode has had
+     * the `lock_anchor_*` triple removed in memory).
+     */
+    private suspend fun continueParsed(result: ParseResult.Parsed, document: String) {
         /* The live stride probe only makes sense for the running kernel; a
          * profile generated for another image skips it. */
         val runningRelease = kernelSnapshot?.kernelRelease

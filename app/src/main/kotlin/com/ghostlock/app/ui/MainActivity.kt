@@ -153,6 +153,7 @@ private fun GhostlockRoute(
             override fun onCopyLogs() = viewModel.copyLogs()
             override fun onParseOta() = viewModel.promptParseUrl()
             override fun onParseImage() = viewModel.parseOffsets()
+            override fun onGenerateProfile() = viewModel.promptParseSource()
             override fun onCpuPairSelected(index: Int) = viewModel.selectCpuPair(index)
             override fun onSafeModeChanged(enabled: Boolean) = viewModel.toggleSafeMode(enabled)
             override fun onForceAttackTestChanged(enabled: Boolean) =

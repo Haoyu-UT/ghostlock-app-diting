@@ -392,6 +392,8 @@ sealed interface ParseResult {
         val route: String? = null,
         /** The extractor's lock-anchor line (verdict and reason), if any. */
         val anchor: String? = null,
+        /** The generated document carries a `lock_anchor_*` triple. */
+        val hasAnchor: Boolean = false,
         /** Extractor's canonical phys source (`xbl_config FDT`, `uefi memory
          * map`, `vendor_boot …`, `MediaTek DRAM base`, `--phys`, `unset`). */
         val physSource: String? = null,
