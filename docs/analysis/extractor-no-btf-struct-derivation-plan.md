@@ -3,6 +3,16 @@
 > 级别：L（提取器核心推导路径 + profile 字段契约）。按 `docs/development/documentation-standards.md` 模板。
 > 关联 issue：YuKongA/ghostlock-app#213（OPPO A3x 5G / PKD130，`5.15.180-android13-8-o-g88bbcb96ee5e`，内核无 BTF）。
 
+**Status.** This is the field-derivation half of
+[`extractor-5x-route-geometry-plan.md`](extractor-5x-route-geometry-plan.md) and is implemented in
+the same batch. That plan owns the route geometry and the Feasible/Infeasible/Unknown verdicts;
+this one owns the shared `task_struct`/`cred`/`mm_struct`/`slab` derivations (phases 2–3 below,
+plus the phase-1 `nf_logger` path; the phase-1 pselect work is that plan's).
+The source priority is per-image derivation → measured-series constant → version/suffix heuristic;
+the measured series is defined by the layout-determining config, not the release suffix. The line
+references in the body predate the current extractor (`family.rs`, the verdict model) — re-check
+them against `feat/extractor-ondevice` @ `32b9ca8` when implementing.
+
 ## 现状与基线
 
 - 分支 `vr-ko-bypass-dev`，基线 commit `deff0b1`（Merge branch 'ancillary-architecture'）。
