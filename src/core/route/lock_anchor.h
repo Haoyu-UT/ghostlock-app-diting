@@ -28,6 +28,13 @@ namespace ghostlock::route::anchor {
         std::uintptr_t stride = 0;
         std::uintptr_t bytes = 0;
         std::uintptr_t slots = 0;
+        /* Page-free Stage 1: when W1's scratch lies inside this region, the
+         * slot(s) covering its collateral window are reserved -- the allocator
+         * never hands them out as a lock. Slot k is reserved when
+         * reserved_first <= k <= reserved_last. */
+        std::uintptr_t reserved_first = 0;
+        std::uintptr_t reserved_last = 0;
+        bool has_reserved = false;
     };
 
     /* Resolve the grid from the profile keys, take this boot's next pristine

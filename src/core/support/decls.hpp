@@ -77,6 +77,20 @@ namespace ghostlock::support {
 
     uintptr_t prepare_good_kernel_page(const ghostlock::memory::WriteRequest &request);
 
+    /* Page-free Stage 3: the run's effective mode (route policy ∧ profile W1
+     * scratch ∧ profile route lock anchor). `page_free_reason` is the first
+     * missing conjunct, for the run's one-line evidence. */
+    bool page_free_run(void);
+
+    const char *page_free_reason(void);
+
+    /* Page-free Stage 3: derive the write layout for `request` without a
+     * payload page, install it in heap.current and zero every page verdict
+     * field, so a route can stamp against the anchors only. Returns 0 when
+     * the profile's stated scratch cannot resolve or a value-carrying write
+     * has no value source. */
+    int32_t prepare_page_free_context(const ghostlock::memory::WriteRequest &request);
+
     /* Run up to max_rounds unprivileged leak rounds for the slab-stride
      * verifier and print its evidence table ([stride] lines). Returns whether
      * one candidate held every nonzero vote. The caller must have installed the
