@@ -24,6 +24,7 @@ use ghostlock_extract::kallsyms;
 use ghostlock_extract::kallsyms::Kallsyms;
 use ghostlock_extract::kallsyms_finder;
 use ghostlock_extract::layout;
+use ghostlock_extract::options;
 use ghostlock_extract::payload;
 use ghostlock_extract::report;
 use ghostlock_extract::structs;
@@ -77,6 +78,11 @@ struct Cli {
     /// numbers, chosen route); exit 7 signals ambiguity
     #[arg(long)]
     feasible_out: Option<PathBuf>,
+    /// write the option superset -- every feasible route with its geometry,
+    /// every named anchor candidate with its page-free placement, and the
+    /// page/auto/attested plans -- as JSON
+    #[arg(long)]
+    options_out: Option<PathBuf>,
     /// derive the route's lock-anchor region and emit it in --format conf.
     /// Any family; the profile carries it only when the route uses an anchor,
     /// and the app asks page-vs-anchor before export.
@@ -121,6 +127,14 @@ struct Cli {
     /// operator-supplied lock-anchor slot pitch in bytes
     #[arg(long, value_parser = parse_int)]
     anchor_stride: Option<u64>,
+    /// operator-supplied W1 scratch image offset (page-free); requires
+    /// --anchor and is emitted only when the value predicate holds
+    #[arg(long, value_parser = parse_int)]
+    w1_scratch_image: Option<u64>,
+    /// named W1 second region resolved from kallsyms (e.g. bm_pmd,
+    /// serial8250_ports, s3c24xx_serial_ports); requires --anchor
+    #[arg(long)]
+    w1_scratch_symbol: Option<String>,
     /// working directory for payload extraction and temp files; defaults to
     /// the system temp dir (pass an app-writable dir when running on Android)
     #[arg(long)]
@@ -234,6 +248,40 @@ fn resolve_kallsyms(
     }
     kallsyms_finder::recover(&boot.kernel, btf_at)
         .map_err(|err| ExtractError::kallsyms(err.to_string()))
+}
+
+/// `selinux_state`'s field offsets: from the image's BTF when present (and
+/// consistent), else the 5.10 release template. `None` = fail closed, the
+/// profile omits the block and the native keeps its release-derived layout.
+fn selinux_layout(btf: Option<&Btf>, release: &str) -> Option<(u32, u32, &'static str)> {
+    if let Some(btf) = btf {
+        let enforcing = btf.field("selinux_state", "enforcing")?;
+        let initialized = btf.field("selinux_state", "initialized")?;
+        if btf.field("selinux_state", "disabled").is_some() {
+            eprintln!(
+                "warning: selinux_state.disabled is present; the selinux block is omitted"
+            );
+            return None;
+        }
+        if enforcing != 0 || initialized >= 8 {
+            eprintln!(
+                "warning: unexpected selinux_state layout (enforcing {enforcing}, \
+                 initialized {initialized}); the selinux block is omitted"
+            );
+            return None;
+        }
+        return Some((enforcing, initialized, "btf"));
+    }
+    /* No BTF: only the 5.10 series has a template; 5.15/6.1 and 6.6/6.12 are
+     * BTF-carrying images, so a no-BTF member of those families fails closed. */
+    let mut parts = release.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next()?.parse().ok()?;
+    if major == 5 && minor == 10 {
+        Some((0, 2, "release-template"))
+    } else {
+        None
+    }
 }
 
 fn run(cli: &Cli) -> Result<i32> {
@@ -870,6 +918,9 @@ fn run(cli: &Cli) -> Result<i32> {
     if cli.explain && cli.format != "conf" {
         eprintln!("warning: --explain is only meaningful with --format conf; ignoring");
     }
+    if cli.options_out.is_some() && cli.format != "conf" {
+        eprintln!("warning: --options-out is only meaningful with --format conf; ignoring");
+    }
     let output = if cli.format == "conf" {
         let release_text = release
             .as_deref()
@@ -891,6 +942,10 @@ fn run(cli: &Cli) -> Result<i32> {
                 "--no-disasm with --format conf requires --route",
             ));
         }
+        /* With `--options-out` an ambiguous pass still has to reach the common
+         * facts so the superset can carry a cuttable profile; it exits 7 after
+         * writing the document instead of returning here. */
+        let mut ambiguous = false;
         let route = if let Some(forced) = cli.route.as_deref() {
             match route_verdicts
                 .iter()
@@ -963,7 +1018,12 @@ fn run(cli: &Cli) -> Result<i32> {
                         "error: more than one feasible route ({}); pass --route",
                         routes.join(", ")
                     );
-                    return Ok(7);
+                    if cli.options_out.is_some() {
+                        ambiguous = true;
+                        None
+                    } else {
+                        return Ok(7);
+                    }
                 }
                 analysis::RouteSelection::None { reason } => {
                     eprintln!("warning: {reason}");
@@ -1088,6 +1148,7 @@ fn run(cli: &Cli) -> Result<i32> {
         // region; the anchor triple is per image (offset, safe length, slot
         // pitch). The pitch is the family's sizeof(rt_mutex): the anchor scan
         // does not derive it (docs/analysis/anchor-derivation-plan.md).
+        let mut policy_scratch: Option<anchor::W1Scratch> = None;
         if cli.anchor {
             match (cli.anchor_image, cli.anchor_bytes, cli.anchor_stride) {
                 (Some(image), Some(bytes), Some(stride)) => {
@@ -1115,76 +1176,87 @@ fn run(cli: &Cli) -> Result<i32> {
                                 || route == "sigreturn"
                                 || route == "multicast_waiter" =>
                         {
-                            /* The named, device-proven classes only: the
-                             * coredump zero page (6.x calls it
-                             * `__dump_skip.zeroes`, 5.10 `dump_skip.zeroes`)
-                             * and the 6.1 dead-code serial-port array. No
-                             * ranked fallback -- the scan's `safe` verdict is
-                             * not proof (`__log_buf` scores safe and is
-                             * written by printk through invisible indexes). */
-                            let prefer: &[&str] = if release_text.starts_with("6.1.") {
-                                &[
-                                    "s3c24xx_serial_ports",
-                                    "__dump_skip.zeroes",
-                                    "dump_skip.zeroes",
-                                ]
-                            } else {
-                                &[
-                                    "__dump_skip.zeroes",
-                                    "dump_skip.zeroes",
-                                    "s3c24xx_serial_ports",
-                                ]
-                            };
-                            let pick = anchor::select_candidate(
-                                &boot.kernel,
-                                &rel_symbols,
-                                prefer,
-                            );
-                            match (pick.selected, pick.refused) {
-                                (Some(a), _) => match anchor::profile_triple(&a) {
-                                    Some((image, bytes, stride)) => {
+                            /* The policy chain (options::auto_plan): the
+                             * first unconditioned region with a slot, then an
+                             * unconditioned second region. The superset and
+                             * the CLI must not disagree. */
+                            let initialized = selinux_layout(btf.as_ref(), release_text)
+                                .map(|(_, initialized, _)| initialized);
+                            let candidates = options::scan_candidates(&options::CandidateInput {
+                                kernel: &boot.kernel,
+                                rel_symbols: &rel_symbols,
+                                phys_load: kernel_phys_load,
+                                phys_offset: kernel_phys_offset,
+                                initialized,
+                            });
+                            let plan = options::auto_plan(route, &candidates);
+                            match plan.anchor {
+                                Some(anchor) => {
+                                    let name = candidates
+                                        .iter()
+                                        .find(|candidate| {
+                                            candidate.anchor.as_ref().map(|a| a.image)
+                                                == Some(anchor.image)
+                                        })
+                                        .map(|candidate| {
+                                            format!(
+                                                "{} ({}{})",
+                                                candidate.name,
+                                                candidate.verdict,
+                                                if candidate.conditioned {
+                                                    ", conditioned"
+                                                } else {
+                                                    ""
+                                                }
+                                            )
+                                        })
+                                        .unwrap_or_else(|| "region".to_string());
+                                    eprintln!(
+                                        "info: auto plan anchor {name} +0x{:x}, 0x{:x} bytes, \
+                                         stride {}, page_free={} ({})",
+                                        anchor.image,
+                                        anchor.bytes,
+                                        anchor.stride,
+                                        plan.page_free,
+                                        plan.reason
+                                    );
+                                    geometry.push(("lock_anchor_image", anchor.image as i64));
+                                    geometry.push(("lock_anchor_bytes", anchor.bytes as i64));
+                                    geometry.push(("lock_anchor_stride", anchor.stride as i64));
+                                    policy_scratch =
+                                        plan.scratch.as_ref().map(|placement| anchor::W1Scratch {
+                                            image: placement.image,
+                                            window: placement.window,
+                                            reserved_first: placement.reserved_first.unwrap_or(0),
+                                            reserved_last: placement.reserved_last.unwrap_or(0),
+                                            inside_anchor: placement.reserved_first.is_some(),
+                                            source: anchor::ScratchSource::Policy,
+                                        });
+                                    if let Some(scratch) = policy_scratch {
                                         eprintln!(
-                                            "info: lock anchor {} +0x{:x}, 0x{:x} bytes \
-                                             (safe prefix 0x{:x}, stopped by: {}), stride {}, \
-                                             verdict {}",
-                                            a.candidate.name,
-                                            image,
-                                            bytes,
-                                            a.safe_len,
-                                            a.stopped_by,
-                                            stride,
-                                            a.verdict.label(),
+                                            "info: auto plan scratch +0x{:x} ({}; {})",
+                                            scratch.image,
+                                            if scratch.inside_anchor {
+                                                "in-anchor"
+                                            } else {
+                                                "second region"
+                                            },
+                                            if scratch.inside_anchor {
+                                                format!(
+                                                    "reserves anchor slots {}..{}",
+                                                    scratch.reserved_first, scratch.reserved_last
+                                                )
+                                            } else {
+                                                "no slot reservation".to_string()
+                                            }
                                         );
-                                        geometry.push(("lock_anchor_image", image as i64));
-                                        geometry.push(("lock_anchor_bytes", bytes as i64));
-                                        geometry.push(("lock_anchor_stride", stride as i64));
                                     }
-                                    None => eprintln!(
-                                        "warning: lock anchor {} +0x{:x} has no usable \
-                                         prefix (safe length 0x{:x}); the anchor triple is \
-                                         omitted",
-                                        a.candidate.name,
-                                        a.candidate.offset,
-                                        a.safe_len,
-                                    ),
-                                },
-                                (None, Some(a)) => eprintln!(
-                                    "warning: lock anchor {} +0x{:x} refused: safe prefix \
-                                     0x{:x} cannot hold one 0x{:x}-byte slot (verdict {}, \
-                                     {}); the anchor triple is omitted",
-                                    a.candidate.name,
-                                    a.candidate.offset,
-                                    a.safe_len,
-                                    family::ANCHOR_STRIDE,
-                                    a.verdict.label(),
-                                    a.stopped_by,
-                                ),
-                                (None, None) => eprintln!(
-                                    "warning: --anchor found no usable named region \
-                                     (zero page / serial ports); the profile falls back \
-                                     to the reclaimed page -- supply \
-                                     --anchor-image/--anchor-bytes/--anchor-stride for a \
-                                     known region"
+                                }
+                                None => eprintln!(
+                                    "warning: --anchor found no unconditional anchor region; \
+                                     the profile falls back to the reclaimed page -- pass \
+                                     --anchor-image/--anchor-bytes/--anchor-stride for a known \
+                                     region"
                                 ),
                             }
                         }
@@ -1345,6 +1417,111 @@ fn run(cli: &Cli) -> Result<i32> {
                 .and_then(|value| value.checked_sub(base)),
         };
         let layouts = layout::derive(btf.as_ref(), release_text);
+        /* Page-free Stage 1: the selinux field offsets and, when the route's
+         * anchor triple was derived, the W1 scratch slot inside that region.
+         * The scratch arithmetic needs the physical pair the native will use
+         * (the profile's values, else the compiled defaults) and a 64 KiB
+         * delta, so an unknown load or a misaligned delta fails closed. */
+        let selinux_fields = selinux_layout(btf.as_ref(), release_text);
+        let w1_scratch = (|| {
+            if !cli.anchor {
+                if cli.w1_scratch_image.is_some() || cli.w1_scratch_symbol.is_some() {
+                    eprintln!(
+                        "warning: --w1-scratch-image/--w1-scratch-symbol require \
+                         --anchor (the effective page-free flag needs the route's \
+                         anchor); the W1 scratch block is omitted"
+                    );
+                }
+                return None;
+            }
+            let field = |name: &str| {
+                geometry
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| *value as u64)
+            };
+            let anchor_image = field("lock_anchor_image")?;
+            let anchor_bytes = field("lock_anchor_bytes")?;
+            let stride = field("lock_anchor_stride")?;
+            let initialized = selinux_fields?.1;
+            let load = kernel_phys_load?;
+            let offset = kernel_phys_offset.unwrap_or(0x8000_0000);
+            let delta = load.checked_sub(offset)?;
+            if delta & 0xffff != 0 {
+                eprintln!(
+                    "warning: physical delta 0x{delta:x} is not 64 KiB-aligned; the \
+                     W1 scratch block is omitted"
+                );
+                return None;
+            }
+            match (cli.w1_scratch_image, cli.w1_scratch_symbol.as_deref()) {
+                (Some(_), Some(_)) => {
+                    eprintln!(
+                        "warning: --w1-scratch-image and --w1-scratch-symbol are \
+                         mutually exclusive; the W1 scratch block is omitted"
+                    );
+                    None
+                }
+                (Some(image), None) => anchor::pick_w1_scratch_at(
+                    image,
+                    anchor_image,
+                    anchor_bytes,
+                    stride,
+                    delta,
+                    initialized,
+                ),
+                (None, Some(symbol)) => {
+                    let Some(offset) = rel_symbols
+                        .get(symbol)
+                        .and_then(|offsets| offsets.iter().next().copied())
+                    else {
+                        eprintln!(
+                            "warning: --w1-scratch-symbol {symbol}: not in kallsyms; \
+                             the W1 scratch block is omitted"
+                        );
+                        return None;
+                    };
+                    let Some(next) = sorted_offsets.iter().copied().find(|off| *off > offset)
+                    else {
+                        eprintln!(
+                            "warning: --w1-scratch-symbol {symbol}: no following symbol \
+                             bounds the region; the W1 scratch block is omitted"
+                        );
+                        return None;
+                    };
+                    let scratch = anchor::pick_w1_scratch_in_symbol(
+                        offset,
+                        next - offset,
+                        &boot.kernel,
+                        delta,
+                        initialized,
+                    );
+                    if scratch.is_none() {
+                        eprintln!(
+                            "warning: --w1-scratch-symbol {symbol}: no admissible window \
+                             in 0x{:x} bytes; the W1 scratch block is omitted",
+                            next - offset
+                        );
+                    }
+                    scratch
+                }
+                (None, None) => policy_scratch.or_else(|| {
+                    anchor::pick_w1_scratch(
+                        anchor_image,
+                        anchor_bytes,
+                        stride,
+                        delta,
+                        initialized,
+                    )
+                }),
+            }
+        })();
+        let stage1 = selinux_fields.map(|(enforcing, initialized, source)| report::Stage1Conf {
+            selinux_enforcing: enforcing,
+            selinux_initialized: initialized,
+            selinux_source: source,
+            w1_scratch,
+        });
         let inputs = report::ConfInputs {
             release: release_text,
             phys: kernel_phys_load,
@@ -1359,7 +1536,102 @@ fn run(cli: &Cli) -> Result<i32> {
             cred: &cred,
             extra_offsets: &extra_offsets,
             layouts: Some(&layouts),
+            stage1,
         };
+        /* The option superset, written once the common profile facts exist so
+         * it can be cut into any plan. An ambiguous route set reaches this
+         * point and exits 7 below, after the document is on disk. */
+        if let Some(path) = &cli.options_out {
+            let mut all_geometry: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
+            for verdict in &route_verdicts {
+                if verdict.verdict != analysis::Feasibility::Feasible {
+                    continue;
+                }
+                let shift = if verdict.route == "select_stack" {
+                    pselect_shift.or_else(|| {
+                        (release_major == Some(5)).then_some(family::SELECT_WAITER_SHIFT)
+                    })
+                } else {
+                    pselect_shift
+                };
+                let mut geometry: BTreeMap<String, i64> =
+                    report::conf_route_geometry_with_sigreturn(
+                        verdict.route,
+                        release_text,
+                        shift,
+                        sigreturn_offsets,
+                        &struct_offsets,
+                    )
+                    .into_iter()
+                    .map(|(key, value)| (key.to_string(), value))
+                    .collect();
+                if verdict.route == "multicast_waiter" && !cli.no_disasm {
+                    let layout = if release_major == Some(5) {
+                        match btf.as_ref() {
+                            Some(btf) => WaiterLayout::from_btf(btf).ok(),
+                            None => Some(family::waiter_layout_5_10()),
+                        }
+                    } else {
+                        btf.as_ref().and_then(|btf| WaiterLayout::from_btf(btf).ok())
+                    };
+                    if let Some((layout, lock)) =
+                        layout.and_then(|layout| layout.lock.map(|lock| (layout, lock)))
+                    {
+                        if let Ok(geom) = multicast_waiter_off(
+                            &boot.kernel,
+                            &rel_symbols,
+                            &sorted_offsets,
+                            MULTICAST_5X_BUFFER_SIZE as u64,
+                            layout.pi_tree_entry,
+                            lock,
+                        ) {
+                            geometry.insert("waiter_off".to_string(), geom.waiter_off as i64);
+                        }
+                    }
+                }
+                all_geometry.insert(verdict.route.to_string(), geometry);
+            }
+            let common_text = report::render_conf(&report::ConfInputs {
+                release: release_text,
+                phys: kernel_phys_load,
+                phys_offset: kernel_phys_offset,
+                phys_source,
+                symbols: &symbol_offsets,
+                structs: &struct_offsets,
+                route: None,
+                route_geometry: &[],
+                cred: &cred,
+                extra_offsets: &extra_offsets,
+                layouts: Some(&layouts),
+                stage1: stage1.map(|stage| report::Stage1Conf {
+                    w1_scratch: None,
+                    ..stage
+                }),
+            });
+            let initialized = selinux_fields.map(|(_, initialized, _)| initialized);
+            let input = options::Input {
+                release: release_text,
+                kernel_major: major,
+                phys_load: kernel_phys_load,
+                phys_offset: kernel_phys_offset,
+                phys_source,
+                verdicts: &route_verdicts,
+                geometry: &all_geometry,
+                initialized,
+                kernel: &boot.kernel,
+                rel_symbols: &rel_symbols,
+                common_profile: &common_text,
+            };
+            let superset = options::build(&input);
+            let text = serde_json::to_string_pretty(&superset)
+                .map_err(|err| ExtractError::new(format!("cannot serialize options: {err}")))?;
+            std::fs::write(path, text + "\n")
+                .map_err(|err| ExtractError::new(format!("{err}")))?;
+            eprintln!("info: options superset written to {}", path.display());
+        }
+        if ambiguous {
+            return Ok(7);
+        }
         if cli.explain {
             let provenance = fact::Provenance {
                 btf_present: btf.is_some(),

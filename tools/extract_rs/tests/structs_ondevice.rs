@@ -30,6 +30,20 @@ fn profile_offset(text: &str, key: &str) -> Option<u64> {
     })
 }
 
+/// The expected `offset` value: the superset's common profile when present,
+/// else the legacy `profile.conf` (excluded/codegen directories keep theirs).
+fn expected_offset(dir: &Path, release: &str, key: &str) -> Option<u64> {
+    let superset = dir.join(format!("options-{release}.json"));
+    if let Ok(text) = std::fs::read_to_string(&superset) {
+        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+        return value["profile"]["offset"][key]
+            .as_str()
+            .and_then(|value| value.parse().ok());
+    }
+    let text = std::fs::read_to_string(dir.join("profile.conf")).ok()?;
+    profile_offset(&text, key)
+}
+
 fn collect_images(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -135,13 +149,11 @@ fn task_struct_and_cred_anchors_match_the_series() {
         let logger = derive_nf_logger_registration(&boot.kernel, &relative, &sorted, None)
             .unwrap_or_else(|err| panic!("{release}: nf_logger derivation failed: {err}"));
         assert_eq!(logger.nf_log_type_ulog, 1, "{release}: ULOG value");
-        let profile =
-            std::fs::read_to_string(image.parent().expect("image parent").join("profile.conf"))
-                .expect("read profile.conf");
-        let want_loggers = profile_offset(&profile, "slide_loggers_0_1")
-            .unwrap_or_else(|| panic!("{release}: profile has no slide_loggers_0_1"));
-        let want_logger = profile_offset(&profile, "slide_nfulnl_logger")
-            .unwrap_or_else(|| panic!("{release}: profile has no slide_nfulnl_logger"));
+        let release_dir = image.parent().expect("image parent");
+        let want_loggers = expected_offset(release_dir, &release, "slide_loggers_0_1")
+            .unwrap_or_else(|| panic!("{release}: no slide_loggers_0_1 in the superset/profile"));
+        let want_logger = expected_offset(release_dir, &release, "slide_nfulnl_logger")
+            .unwrap_or_else(|| panic!("{release}: no slide_nfulnl_logger in the superset/profile"));
         assert_eq!(
             logger.loggers_0_1, want_loggers,
             "{release}: derived loggers anchor disagrees with the profile"

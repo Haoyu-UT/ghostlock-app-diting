@@ -43,7 +43,11 @@ fn load() -> Option<(Vec<u8>, BTreeMap<String, BTreeSet<u64>>)> {
 }
 
 fn bounds(rel: &BTreeMap<String, BTreeSet<u64>>) -> anchor::Bounds {
-    let g = |n: &str| rel.get(n).and_then(|s| s.iter().next().copied()).unwrap_or(0);
+    let g = |n: &str| {
+        rel.get(n)
+            .and_then(|s| s.iter().next().copied())
+            .unwrap_or(0)
+    };
     anchor::Bounds {
         text_start: g("_text"),
         text_end: g("_etext"),
@@ -83,15 +87,29 @@ fn reproduces_the_device_measurement() {
     assert_eq!(cand.offset, ANCHOR_OFFSET, "anchor offset");
 
     let a = anchor::assess(cand, &refs, &rel, &b);
-    assert_eq!(a.safe_len, ANCHOR_BYTES, "safe length (the array, one page)");
+    assert_eq!(
+        a.safe_len, ANCHOR_BYTES,
+        "safe length (the array, one page)"
+    );
 
     /* `dump_skip()` reads the region as the source of a bulk copy, so it is not
-     * reference-free -- and the tool must say so rather than call it safe. If
-     * this ever becomes `Safe`, the tool has lost a distinction, not gained
-     * one. */
+     * reference-free -- and the tool must say so rather than call it safe. The
+     * copy's read is not a constant-offset load: the address is materialised
+     * into the kvec and consumed by a generic copy, so the 2026-10-27 scanner
+     * fixes correctly stopped reporting the old `live_read` hits for this
+     * symbol as false positives (ABI-blind register tracking). The distinction
+     * is therefore carried by the materialisations and the NeedsReview
+     * verdict; `Safe` here would still mean the tool lost it. */
     assert_eq!(a.verdict, Verdict::NeedsReview, "verdict");
     assert!(a.live_writes.is_empty(), "no live writes into the anchor");
-    assert!(!a.live_reads.is_empty(), "the copy source is found");
+    assert!(
+        !a.materializations.is_empty(),
+        "the copy source is materialised"
+    );
+    assert!(
+        a.live_reads.is_empty(),
+        "the old false-positive reads stay retired"
+    );
 }
 
 #[test]
@@ -104,8 +122,12 @@ fn rejects_the_kernel_log_buffer() {
     let refs = anchor::scan_references(&kernel, &b);
 
     /* `__log_buf` is the printk ring buffer: one of the most written-to objects
-     * in the kernel. A scan that calls it usable is worse than no scan, and an
-     * earlier version of this one did exactly that. */
+     * in the kernel, but printk writes it through indexes the static scan
+     * cannot see. The scan therefore reports no live writes and a `Safe`
+     * verdict -- which is exactly why the *selector* must not use the verdict
+     * (dd10f34a): a ranked "largest safe candidate" rule picked this 128 KiB
+     * buffer over the 4 KiB coredump zero page on 6.12.23. Selection is
+     * restricted to the named, device-proven regions instead. */
     let cand = anchor::Candidate {
         name: "__log_buf".to_string(),
         offset: rel
@@ -115,6 +137,32 @@ fn rejects_the_kernel_log_buffer() {
         extent: 0x20000,
     };
     let a = anchor::assess(&cand, &refs, &rel, &b);
-    assert_eq!(a.verdict, Verdict::Unsafe, "__log_buf must be unsafe");
-    assert!(!a.live_writes.is_empty(), "its live writes are found");
+    assert!(
+        a.live_writes.is_empty(),
+        "the scan cannot see printk's indexed writes"
+    );
+    assert_eq!(
+        a.verdict,
+        Verdict::Safe,
+        "the scan alone cannot refuse it; the selector must"
+    );
+
+    /* The production 5.10 preference list never offers __log_buf, and the
+     * named pick is the coredump zero page -- smaller than the buffer a ranked
+     * rule would have chosen. */
+    let pick = anchor::select_candidate(
+        &kernel,
+        &rel,
+        &[
+            "__dump_skip.zeroes",
+            "dump_skip.zeroes",
+            "s3c24xx_serial_ports",
+        ],
+    );
+    let selected = pick.selected.expect("the named zero page is selected");
+    assert_eq!(selected.candidate.name, "dump_skip.zeroes");
+    assert!(
+        selected.safe_len < a.safe_len,
+        "the refused buffer is the larger one the ranked rule would have taken"
+    );
 }

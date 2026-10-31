@@ -13,6 +13,7 @@ pub mod ikconfig;
 pub mod kallsyms;
 pub mod kallsyms_finder;
 pub mod layout;
+pub mod options;
 pub mod payload;
 pub mod report;
 pub mod structs;
