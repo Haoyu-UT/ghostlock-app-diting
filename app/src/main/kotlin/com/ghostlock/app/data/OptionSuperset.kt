@@ -26,6 +26,9 @@ data class OptionScratch(
     val inAnchor: Boolean get() = reservedFirst != null
 }
 
+/** The `scratchSource` spelling for a scratch inside the anchor's own region. */
+const val ScratchInAnchor = "in-anchor"
+
 data class OptionPlan(
     val route: String,
     val anchor: OptionAnchor?,
@@ -36,12 +39,12 @@ data class OptionPlan(
     val scratchSource: String?,
     val reason: String,
 ) {
-    /** A short UI label: the anchor region and, when it is not in-anchor, the
-     * scratch region. */
+    /** A short technical label (logs and tests): the anchor region and, when it
+     * is not in-anchor, the scratch region. */
     val label: String
         get() {
             val anchor = anchorName ?: "page"
-            val scratch = scratchSource?.takeIf { it != "in-anchor" }
+            val scratch = scratchSource?.takeIf { it != ScratchInAnchor }
             return if (scratch == null) anchor else "$anchor + $scratch"
         }
 }

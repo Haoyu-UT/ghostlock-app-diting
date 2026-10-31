@@ -1,6 +1,8 @@
 package com.ghostlock.app.ui
 
+import android.app.Application
 import android.net.Uri
+import android.os.Build
 import androidx.core.net.toUri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -10,6 +12,7 @@ import com.ghostlock.app.data.OptionDecision
 import com.ghostlock.app.data.OptionPlan
 import com.ghostlock.app.data.OptionSuperset
 import com.ghostlock.app.data.RoutePlans
+import com.ghostlock.app.data.ScratchInAnchor
 import com.ghostlock.app.data.decision
 import com.ghostlock.app.domain.model.CpuPair
 import com.ghostlock.app.domain.model.ExternalProfileInfo
@@ -84,6 +87,7 @@ private enum class ParseDialogStage { Mode, PhysImage, Route, Plan, Lock, Source
 
 class GhostlockViewModel(
     private val repository: GhostlockRepository,
+    private val application: Application,
 ) : ViewModel() {
     private val effectChannel = Channel<GhostlockEffect>(Channel.BUFFERED)
     private val mutableState = MutableStateFlow(GhostlockUiState())
@@ -1655,23 +1659,30 @@ class GhostlockViewModel(
                         appendLog("result: route ambiguity without a usable route")
                         showNotice(R.string.parse_result_title, R.string.parse_failed)
                     } else {
-                        /* The choice is the user's: both routes are derived from
-                         * the image, and which one runs is a device fact. The
-                         * second pass forces the pick with --route. */
+                        /* The choice is the user's: every feasible route is
+                         * derived from the image, and which one runs is a
+                         * device fact. The second pass forces the pick with
+                         * --route. The picker labels the waiter shape and the
+                         * ABI inline and shows the measured grade. */
                         pendingRouteParse = request
                         pendingRouteChoices = feasible
                         pendingRouteOptions = result.options
                         parseDialogStage = ParseDialogStage.Route
+                        val routeOptions = result.options
                         mutableState.update {
                             it.copy(
                                 dialogVisible = true,
                                 dialogType = DialogType.LIST,
                                 dialogTitleRes = R.string.parse_route_title,
                                 dialogItems = feasible.map { choice ->
-                                    "${choice.route} — ${choice.reason}"
+                                    val geometry = routeOptions?.route(choice.route)?.geometry.orEmpty()
+                                    "${RouteDisplay.label(choice.route, geometry, routeOptions?.release)} — ${choice.reason}"
                                 },
                                 dialogItemResIds = emptyList(),
-                                dialogItemGrades = feasible.map { RouteGrade.of(it.route) },
+                                dialogItemGrades = feasible.map { choice ->
+                                    val geometry = routeOptions?.route(choice.route)?.geometry.orEmpty()
+                                    RouteDisplay.grade(choice.route, geometry, routeOptions?.release)
+                                },
                                 dialogLeadingResId = null,
                                 dialogCurrentItemIndex = -1,
                                 /* The picker must be the only overlay on
@@ -1767,6 +1778,11 @@ class GhostlockViewModel(
                 dialogTitleRes = title,
                 dialogItems = emptyList(),
                 dialogItemResIds = listOf(attach, R.string.parse_phys_skip),
+                /* The phys prompt is not a route choice: do not inherit the
+                 * route picker's success-rate chips (they would render above
+                 * "attach uefi / skip"). */
+                dialogItemGrades = emptyList(),
+                dialogLeadingResId = null,
                 dialogCurrentItemIndex = -1,
                 executionSheetVisible = false,
             )
@@ -1827,6 +1843,13 @@ class GhostlockViewModel(
         if (!result.hasAnchor) return false
         pendingLockParse = result
         parseDialogStage = ParseDialogStage.Lock
+        val options = result.options
+        val route = result.route
+            ?: options?.routes?.firstOrNull { it.verdict == OptionSuperset.Feasible }?.route
+        val anchorOnly = route?.let { options?.plansFor(it)?.anchorOnly }
+        val anchorSafety = anchorOnly?.let {
+            RegionSafety.classify(it.anchorName, it.scratchSource, Build.MANUFACTURER)
+        }
         mutableState.update {
             it.copy(
                 dialogVisible = true,
@@ -1837,13 +1860,28 @@ class GhostlockViewModel(
                     R.string.parse_lock_page,
                     R.string.parse_lock_anchor,
                 ),
-                dialogItemGrades = emptyList(),
+                dialogItemGrades = listOf(null, anchorSafety),
                 dialogLeadingResId = null,
                 dialogCurrentItemIndex = -1,
                 executionSheetVisible = false,
             )
         }
         return true
+    }
+
+    /**
+     * The plan row's user-facing text: both roles are named, because the same
+     * region can supply the lock and W1's value, or only one of them. The
+     * technical [OptionPlan.label] stays in the logs.
+     */
+    private fun planDisplayLabel(plan: OptionPlan): String {
+        val anchor = plan.anchorName ?: return plan.label
+        val scratch = plan.scratchSource?.takeIf { it != ScratchInAnchor }
+        return if (scratch == null) {
+            application.getString(R.string.parse_plan_label_same, anchor)
+        } else {
+            application.getString(R.string.parse_plan_label_pair, anchor, scratch)
+        }
     }
 
     /** The page-free option list; the UI adds a page row only when offered. */
@@ -1866,9 +1904,14 @@ class GhostlockViewModel(
                 } else {
                     R.string.parse_plan_title
                 },
-                dialogItems = decision.options.map { plan -> plan.label },
+                dialogItems = decision.options.map(::planDisplayLabel),
                 dialogItemResIds = emptyList(),
-                dialogItemGrades = emptyList(),
+                /* A kernel region's safety is a property of the region, not of
+                 * the plan: the Samsung serial array is the one conditional
+                 * region (see RegionSafety). */
+                dialogItemGrades = decision.options.map { plan ->
+                    RegionSafety.classify(plan.anchorName, plan.scratchSource, Build.MANUFACTURER)
+                },
                 dialogLeadingResId = if (decision.pageOffered) {
                     R.string.parse_plan_page
                 } else {
