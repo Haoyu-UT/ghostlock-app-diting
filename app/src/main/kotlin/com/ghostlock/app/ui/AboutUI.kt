@@ -149,12 +149,19 @@ internal fun AboutScreen(onBack: () -> Unit) {
             item(key = "source") {
                 AboutLink(
                     title = stringResource(R.string.about_source_code),
-                    summary = "github.com/YuKongA/ghostlock-app",
-                    onClick = { uriHandler.openUri("https://github.com/YuKongA/ghostlock-app") },
+                    summary = "github.com/Haoyu-UT/robust-ghostlock-app",
+                    onClick = { uriHandler.openUri("https://github.com/Haoyu-UT/robust-ghostlock-app") },
                 )
             }
             item(key = "origins-title") {
                 SmallTitle(text = stringResource(R.string.about_origins))
+            }
+            item(key = "upstream") {
+                AboutLink(
+                    title = "YuKongA/ghostlock-app",
+                    summary = "github.com/YuKongA/ghostlock-app",
+                    onClick = { uriHandler.openUri("https://github.com/YuKongA/ghostlock-app") },
+                )
             }
             item(key = "cybermeowfia") {
                 AboutLink("CyberMeowfia", "github.com/NebuSec/CyberMeowfia") {
