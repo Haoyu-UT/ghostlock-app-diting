@@ -8,6 +8,7 @@
 
 #include <cassert>
 #include <cstdio>
+#include <string_view>
 #include <variant>
 
 using namespace ghostlock;
@@ -30,11 +31,14 @@ namespace {
         state = StubState{};
     }
 
-    profile::TargetProfile profile_with(uint8_t route, uint8_t fallback) {
+    profile::TargetProfile profile_with(uint8_t route, uint8_t fallback,
+                                        bool scratch = false, bool anchor = false) {
         static profile::kernel_offsets values;
         values = {};
         values.route = route;
         values.meta.fallback_route = fallback;
+        if (scratch) values.w1_scratch.image = 44279296;          /* the diting's */
+        if (anchor) values.geometry.select_lock_anchor_image = 44279184;
         return profile::TargetProfile::from(&values);
     }
 } // namespace
@@ -90,6 +94,13 @@ int32_t main(void) {
                   !SigreturnPolicy::w3_exact_target && !SigreturnPolicy::tcp_payload_layout &&
                   !SigreturnPolicy::allows_fallback);
 
+    /* Page-free is the design whenever the profile chooses the anchor (operator
+     * decision, 2026-10-30): every anchored route that can support it inherits
+     * the capability; tcp is excluded by design (its fake lock is content). */
+    static_assert(!RoutePolicyDefaults::page_free_capable);
+    static_assert(SelectPolicy::page_free_capable && SigreturnPolicy::page_free_capable &&
+                  MulticastPolicy::page_free_capable && !TcpPolicy::page_free_capable);
+
     /* Every policy satisfies the registry concept. */
     static_assert(RoutePolicy<SelectPolicy> && RoutePolicy<TcpPolicy> &&
                   RoutePolicy<MulticastPolicy> && RoutePolicy<SigreturnPolicy>);
@@ -127,6 +138,28 @@ int32_t main(void) {
     assert(!route_capability(mcast_profile, [](auto policy) {
         return std::decay_t<decltype(policy)>::tcp_payload_layout;
     }));
+
+    /* Page-free Stage 3: policy ∧ scratch ∧ anchor, and the reason names the
+     * first missing conjunct. */
+    const profile::TargetProfile pf_select =
+        profile_with(profile::kRouteSelectStack, 0, /*scratch=*/true, /*anchor=*/true);
+    assert(page_free(pf_select));
+    assert(std::string_view(page_free_reason(pf_select)) == "policy+scratch+anchor");
+    const profile::TargetProfile pf_no_anchor =
+        profile_with(profile::kRouteSelectStack, 0, /*scratch=*/true, /*anchor=*/false);
+    assert(!page_free(pf_no_anchor));
+    assert(std::string_view(page_free_reason(pf_no_anchor)) == "no-anchor");
+    const profile::TargetProfile pf_no_scratch =
+        profile_with(profile::kRouteSelectStack, 0, /*scratch=*/false, /*anchor=*/true);
+    assert(!page_free(pf_no_scratch));
+    assert(std::string_view(page_free_reason(pf_no_scratch)) == "no-scratch");
+    const profile::TargetProfile pf_tcp =
+        profile_with(profile::kRouteTcpZerocopy, 0, /*scratch=*/true, /*anchor=*/true);
+    assert(!page_free(pf_tcp));
+    assert(std::string_view(page_free_reason(pf_tcp)) == "route-not-capable");
+    assert(page_free(profile_with(profile::kRouteMulticastWaiter, 0, true, true)));
+    assert(page_free(profile_with(profile::kRouteSigreturn, 0, true, true)));
+    assert(!page_free(profile_with(profile::kRouteAuto, 0, true, true)));
 
     memory::WriteRequest request = {.mode = memory::WriteMode::Zero};
 

@@ -57,6 +57,13 @@ namespace ghostlock::route {
         static constexpr bool w3_exact_target = false;
         static constexpr bool tcp_payload_layout = false;
         static constexpr bool allows_fallback = false;
+        /* Page-free Stage 3: the route can run without the reclaimed payload
+         * page once the profile states W1's scratch region and the route's own
+         * lock anchor. The tcp route stays false by design: its fake lock is a
+         * crafted object (`owner`, `waiters.rb_leftmost`) that a zero anchor
+         * cannot drive (anchor-family-and-tcp-anchor-plan.md, closed
+         * 2026-10-28), so the page is content, not just an address. */
+        static constexpr bool page_free_capable = false;
 
         /* Middleware route hooks (Batch 4, D1=B). Only the route steps with side
          * effects are hooks; pure capability queries stay on the
@@ -78,6 +85,7 @@ namespace ghostlock::route {
 
     struct SelectPolicy : RoutePolicyDefaults {
         static constexpr RouteKind kind = RouteKind::SelectStack;
+        static constexpr bool page_free_capable = true;
 
         static bool supported(const profile::TargetProfile &profile) noexcept {
             return profile.supports(kind);
@@ -107,6 +115,11 @@ namespace ghostlock::route {
         static constexpr RouteKind kind = RouteKind::MulticastWaiter;
         static constexpr bool multicast = true;
         static constexpr bool w2_fast_repair = true;
+        /* Page-free is the design whenever the profile chooses the anchor
+         * (operator decision, 2026-10-30): for every anchored route that can
+         * support it, the mode follows from the profile's anchor + scratch, with
+         * no separate switch. The anchor is the choice. */
+        static constexpr bool page_free_capable = true;
 
         static bool supported(const profile::TargetProfile &profile) noexcept {
             return profile.supports(kind);
@@ -138,6 +151,12 @@ namespace ghostlock::route {
      * fallback. Selected only by a profile that says so. */
     struct SigreturnPolicy : RoutePolicyDefaults {
         static constexpr RouteKind kind = RouteKind::Sigreturn;
+        /* Page-free is the design whenever the profile chooses the anchor
+         * (operator decision, 2026-10-30). The route's +0x188 rate is a property
+         * of its stack strip, untouched by the mode; the Stage 3 series read
+         * 6/10 page-free against 9/10 page-based, not separable at n=10 (p≈0.30),
+         * and the mode is kept rather than re-adding the page dependency. */
+        static constexpr bool page_free_capable = true;
 
         static bool supported(const profile::TargetProfile &profile) noexcept {
             return profile.supports(kind);
@@ -225,6 +244,38 @@ namespace ghostlock::route {
             if (!result && P::supported(profile)) result = projection(P{});
         });
         return result;
+    }
+
+    /* Page-free Stage 3: this run skips the reclaimed payload page.
+     *
+     * The effective flag is the conjunction the plan fixes: the resolved
+     * route policy permits page-free, the profile states W1's scratch region,
+     * and the profile states the route's own lock anchor. All three are
+     * per-run constants (a profile never changes mid-run), so a run is either
+     * wholly page-free or wholly page-based. A profile without either anchor
+     * keeps the page path byte-identically, which is the regression arm's
+     * contract. Every anchored route stores its anchor in the same geometry
+     * fields, so one layout check covers all three routes. */
+    [[nodiscard]] inline bool page_free(const profile::TargetProfile &profile) noexcept {
+        if (!profile.w1_scratch_image().has_value()) return false;
+        if (!profile.select_stack_layout().lock_anchor_image.has_value()) return false;
+        return route_capability(profile, [](auto policy) {
+            return std::decay_t<decltype(policy)>::page_free_capable;
+        });
+    }
+
+    /* The first missing conjunct, for the run's one-line evidence: what the
+     * effective flag is and why. */
+    [[nodiscard]] inline const char *page_free_reason(
+        const profile::TargetProfile &profile) noexcept {
+        if (!route_capability(profile, [](auto policy) {
+                return std::decay_t<decltype(policy)>::page_free_capable;
+            })) {
+            return "route-not-capable";
+        }
+        if (!profile.w1_scratch_image().has_value()) return "no-scratch";
+        if (!profile.select_stack_layout().lock_anchor_image.has_value()) return "no-anchor";
+        return "policy+scratch+anchor";
     }
 
     template<class P>

@@ -64,6 +64,8 @@ set(SOURCES
         core/route/multicast_waiter_route.cpp
         core/route/lock_anchor.cpp
         core/route/sigreturn_route.cpp
+        core/route/compat_bitmap.cpp
+        core/route/compat_carrier.cpp
         core/memory/payload_builder.cpp
         core/session/runtime_config.cpp
         core/support/util.cpp

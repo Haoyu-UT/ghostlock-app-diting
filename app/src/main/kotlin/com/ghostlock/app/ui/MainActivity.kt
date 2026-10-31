@@ -27,7 +27,12 @@ import com.ghostlock.app.domain.model.VrKoMode
 class MainActivity : ComponentActivity() {
     private val viewModel by viewModels<GhostlockViewModel> {
         viewModelFactory {
-            initializer { GhostlockViewModel((application as GhostlockApplication).createRepository()) }
+            initializer {
+                GhostlockViewModel(
+                    (application as GhostlockApplication).createRepository(),
+                    application,
+                )
+            }
         }
     }
 

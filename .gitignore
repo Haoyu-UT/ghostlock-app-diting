@@ -7,6 +7,7 @@ cmake-build-*/
 *.iml
 app/build/
 libghostlock.so
+libghostlock32.so
 libextract.so
 build/
 /.build/

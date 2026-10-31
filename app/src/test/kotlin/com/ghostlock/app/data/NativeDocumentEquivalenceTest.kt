@@ -53,11 +53,14 @@ class NativeDocumentEquivalenceTest {
              * path to regenerate; a normal run compares. */
             val updatePath = System.getenv("UPDATE_NATIVE_DOC_GOLDEN")
             if (updatePath != null) {
-                val header = goldenHeader() +
-                    "\n# Re-frozen 2026-10-29: stage-3 layout facts (cred usage/uid/security,\n" +
-                    "# rt_mutex_size, waiter_layout) entered the wire schema. They are absent\n" +
-                    "# on the bundled profiles, so no value changed, but the digest covers\n" +
-                    "# every declared key and every document's bytes changed."
+                val stage4Note =
+                    "\n# Re-frozen 2026-10-30 (Stage 4): the eight bundled 5.10 profiles carry the\n" +
+                    "# page-free blocks -- `selinux` (enforcing 0, initialized 2) and `w1_scratch`\n" +
+                    "# (the in-anchor slot on 136/209/226/236; bm_pmd on 81/177/198; the Samsung\n" +
+                    "# array's zero gap on 101). Only those eight documents changed."
+                val header = goldenHeader().let {
+                    if (it.contains("Re-frozen 2026-10-30 (Stage 4)")) it else it + stage4Note
+                }
                 val rows = computed.entries.joinToString("\n") { "${it.key} ${it.value}" }
                 Files.writeString(java.nio.file.Path.of(updatePath), "$header\n$rows\n")
                 return@runBlocking

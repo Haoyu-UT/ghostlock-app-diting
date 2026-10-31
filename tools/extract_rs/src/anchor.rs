@@ -561,6 +561,199 @@ pub fn profile_triple(a: &Assessment) -> Option<(u64, u64, u64)> {
     (bytes >= stride).then_some((a.candidate.offset, bytes, stride))
 }
 
+/// Where a W1 scratch placement came from, for the fact row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScratchSource {
+    /// The picker found it inside the profile's lock-anchor region.
+    Derived,
+    /// `--w1-scratch-image`: an operator-supplied image offset.
+    OperatorImage,
+    /// `--w1-scratch-symbol`: a named second region resolved from kallsyms.
+    OperatorSymbol,
+    /// The superset's auto policy chain (`options::auto_plan`).
+    Policy,
+}
+
+impl ScratchSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            ScratchSource::Derived => "disassembly/derived",
+            ScratchSource::OperatorImage => "operator-supplied image offset",
+            ScratchSource::OperatorSymbol => "operator-supplied symbol",
+            ScratchSource::Policy => "policy chain",
+        }
+    }
+}
+
+/// One valid W1 scratch placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct W1Scratch {
+    /// The scratch's image offset (what the profile's `w1_scratch.image` states).
+    pub image: u64,
+    /// The region-relative offset of the value the erase writes:
+    /// `alias(image) + 0x100 - alias(anchor)`. Zero when the scratch lies
+    /// outside the anchor region (there is no region-relative window then).
+    pub window: u64,
+    /// The allocator slots the collateral window touches (inclusive). Only
+    /// meaningful when `inside_anchor`.
+    pub reserved_first: u64,
+    pub reserved_last: u64,
+    pub inside_anchor: bool,
+    pub source: ScratchSource,
+}
+
+/// Pick where W1's scratch lives inside the named anchor region.
+///
+/// The value W1 stores is `alias(image) + 0x100`, the same construction as the
+/// page value, and three properties must hold:
+///
+///  * the value's byte 0 is 0 (`selinux_state.enforcing`),
+///  * the byte at `initialized_offset` is **odd** -- the kernel compiles the
+///    `_Bool` load as `ldarb; tbnz #0` (measured on the diting,
+///    2026-10-29 run), so only bit 0 counts,
+///  * the 0x18-byte collateral window stays inside the region.
+///
+/// `phys_delta` is `kernel_phys_load - kernel_phys_offset`; only its low bits
+/// matter, and the caller has already checked it is 64 KiB-aligned, which makes
+/// the arithmetic a function of the image offset alone. The scan yields exactly
+/// 2 reserved slots on the diting: `+0x100` cannot be both aligned to the
+/// region grid (0x20) and to the byte-0 requirement, so the window straddles
+/// two slots.
+pub fn pick_w1_scratch(
+    anchor_image: u64,
+    anchor_bytes: u64,
+    stride: u64,
+    phys_delta: u64,
+    initialized_offset: u32,
+) -> Option<W1Scratch> {
+    if stride == 0 || initialized_offset >= 8 {
+        return None;
+    }
+    let base = phys_delta.wrapping_add(anchor_image);
+    /* (base + s + 0x100) & 0xff == 0  =>  s == (-base) mod 0x100. */
+    let mut s = (0u64.wrapping_sub(base)) & 0xff;
+    loop {
+        if s + 0x100 + 0x18 > anchor_bytes {
+            return None;
+        }
+        let value = base.wrapping_add(s).wrapping_add(0x100);
+        let byte = (value >> (8 * initialized_offset)) & 0xff;
+        if byte & 1 == 1 {
+            let window = s + 0x100;
+            return Some(W1Scratch {
+                image: anchor_image + s,
+                window,
+                reserved_first: window / stride,
+                reserved_last: (window + 0x17) / stride,
+                inside_anchor: true,
+                source: ScratchSource::Derived,
+            });
+        }
+        s += 0x100;
+    }
+}
+
+/// Validate an operator-supplied scratch image offset (`--w1-scratch-image`).
+///
+/// The same predicate as the derived picker -- byte 0 of the value is 0 and
+/// the `initialized` byte is odd -- plus the reservation rule: a scratch inside
+/// the anchor region must keep its 0x18-byte window inside the region, and a
+/// scratch outside it reserves nothing (the named region is the operator's
+/// safety claim, and the window is not part of the lock grid).
+pub fn pick_w1_scratch_at(
+    image: u64,
+    anchor_image: u64,
+    anchor_bytes: u64,
+    stride: u64,
+    phys_delta: u64,
+    initialized_offset: u32,
+) -> Option<W1Scratch> {
+    if stride == 0 || initialized_offset >= 8 {
+        return None;
+    }
+    let value = phys_delta.wrapping_add(image).wrapping_add(0x100);
+    if value & 0xff != 0 {
+        return None;
+    }
+    if ((value >> (8 * initialized_offset)) & 0xff) & 1 == 0 {
+        return None;
+    }
+    let inside = image >= anchor_image && image < anchor_image.checked_add(anchor_bytes)?;
+    if inside {
+        let window = image - anchor_image + 0x100;
+        if window + 0x18 > anchor_bytes {
+            return None;
+        }
+        Some(W1Scratch {
+            image,
+            window,
+            reserved_first: window / stride,
+            reserved_last: (window + 0x17) / stride,
+            inside_anchor: true,
+            source: ScratchSource::OperatorImage,
+        })
+    } else {
+        Some(W1Scratch {
+            image,
+            window: 0,
+            reserved_first: 0,
+            reserved_last: 0,
+            inside_anchor: false,
+            source: ScratchSource::OperatorImage,
+        })
+    }
+}
+
+/// Pick a window inside a named second region (`--w1-scratch-symbol`).
+///
+/// `offset` is the symbol's image offset and `extent` its span to the next
+/// symbol. Windows are tried on the byte-0 residue, 0x100 apart. A window
+/// inside the image file must be all zero; a window past the file is BSS
+/// (zero at boot by definition, and the runtime zero is the device/QEMU
+/// witness, not the tool's claim) and is accepted.
+pub fn pick_w1_scratch_in_symbol(
+    offset: u64,
+    extent: u64,
+    kernel: &[u8],
+    phys_delta: u64,
+    initialized_offset: u32,
+) -> Option<W1Scratch> {
+    if initialized_offset >= 8 || extent < 0x118 {
+        return None;
+    }
+    let base = phys_delta.wrapping_add(offset);
+    let mut s = (0u64.wrapping_sub(base)) & 0xff;
+    loop {
+        if s + 0x100 + 0x18 > extent {
+            return None;
+        }
+        let value = base.wrapping_add(s).wrapping_add(0x100);
+        if value & 0xff == 0 && ((value >> (8 * initialized_offset)) & 0xff) & 1 == 1 {
+            let image = offset + s;
+            let win = image + 0x100;
+            let in_file = (win as usize)
+                .checked_add(0x18)
+                .is_some_and(|end| end <= kernel.len());
+            if in_file {
+                let bytes = &kernel[win as usize..win as usize + 0x18];
+                if bytes.iter().any(|b| *b != 0) {
+                    s += 0x100;
+                    continue;
+                }
+            }
+            return Some(W1Scratch {
+                image,
+                window: 0,
+                reserved_first: 0,
+                reserved_last: 0,
+                inside_anchor: false,
+                source: ScratchSource::OperatorSymbol,
+            });
+        }
+        s += 0x100;
+    }
+}
+
 /// Pick the region a generated profile should carry: the first named
 /// preference that exists and whose safe prefix holds at least one slot.
 ///
@@ -696,5 +889,114 @@ mod tests {
     fn profile_triple_refuses_a_prefix_shorter_than_one_slot() {
         let a = assessment(0x1f, Verdict::Unsafe);
         assert_eq!(profile_triple(&a), None);
+    }
+
+    /* ---- W1 scratch slot (page-free Stage 1) ---------------------------- */
+
+    #[test]
+    fn diting_scratch_lands_on_the_odd_byte_and_reserves_two_slots() {
+        /* The diting: anchor +0x2a3a590 (alias low byte 0x90), delta 0x28000000,
+         * initialized at byte 2, 0x1000 bytes at stride 0x20. */
+        let pick = pick_w1_scratch(0x2a3a590, 0x1000, 0x20, 0x28000000, 2).unwrap();
+        assert_eq!(pick.image, 0x2a3a600, "image offset (anchor + 0x70)");
+        assert_eq!(pick.window, 0x170, "value window inside the region");
+        assert_eq!((pick.reserved_first, pick.reserved_last), (11, 12));
+        let value = 0x28000000u64 + pick.image + 0x100;
+        assert_eq!(value & 0xff, 0, "byte 0 (enforcing) is zero");
+        assert_eq!((value >> 16) & 1, 1, "initialized byte (2) is odd");
+    }
+
+    #[test]
+    fn scratch_fails_closed_when_the_region_cannot_satisfy_the_byte() {
+        /* 5.10-style (initialized at byte 2): the region's value byte 2 is a
+         * property of the region, so a region whose value byte 2 is even has
+         * no valid slot and the picker refuses. */
+        assert_eq!(pick_w1_scratch(0x2000000, 0x1000, 0x20, 0, 2), None);
+    }
+
+    #[test]
+    fn six_six_scratch_uses_an_odd_byte_one() {
+        /* 6.6-style (initialized at byte 1): the CPH2723's anchor/image
+         * numbers; whatever slot is chosen, the value's byte 1 must be odd. */
+        let pick = pick_w1_scratch(0x23019c8, 0x1000, 0x20, 0x28000000, 1).unwrap();
+        let value = 0x28000000u64 + pick.image + 0x100;
+        assert_eq!(value & 0xff, 0, "byte 0 (enforcing) is zero");
+        assert_eq!((value >> 8) & 1, 1, "initialized byte (1) is odd");
+        assert!(pick.window + 0x18 <= 0x1000);
+    }
+
+    #[test]
+    fn scratch_is_refused_when_no_window_fits() {
+        assert_eq!(pick_w1_scratch(0x2a3a590, 0x100, 0x20, 0x28000000, 2), None);
+        assert_eq!(pick_w1_scratch(0x2a3a590, 0x117, 0x20, 0x28000000, 2), None);
+    }
+
+    #[test]
+    fn scratch_window_stays_inside_the_region() {
+        let pick = pick_w1_scratch(0x2a3a590, 0x1000, 0x20, 0x28000000, 2).unwrap();
+        assert!(pick.window + 0x18 <= 0x1000);
+        assert!(pick.reserved_last < 0x1000 / 0x20);
+    }
+
+    /* ---- second-region / operator scratch (Stage 4) -------------------- */
+
+    #[test]
+    fn operator_image_inside_the_anchor_reserves_slots() {
+        let pick =
+            pick_w1_scratch_at(0x2a3a600, 0x2a3a590, 0x1000, 0x20, 0x28000000, 2).unwrap();
+        assert!(pick.inside_anchor);
+        assert_eq!(pick.source, ScratchSource::OperatorImage);
+        assert_eq!((pick.reserved_first, pick.reserved_last), (11, 12));
+    }
+
+    #[test]
+    fn operator_image_outside_the_anchor_reserves_nothing() {
+        /* 5.10.177's bm_pmd scratch: outside the sigreturn anchor. */
+        let pick =
+            pick_w1_scratch_at(0x297a000, 0x2a27598, 0x1000, 0x20, 0x28000000, 2).unwrap();
+        assert!(!pick.inside_anchor);
+        assert_eq!((pick.reserved_first, pick.reserved_last), (0, 0));
+    }
+
+    #[test]
+    fn operator_image_rejects_a_bad_value() {
+        /* byte 0 is not 0 */
+        assert_eq!(
+            pick_w1_scratch_at(0x297a001, 0x2a27598, 0x1000, 0x20, 0x28000000, 2),
+            None
+        );
+        /* byte 2 even (bm_pmd on 5.10.101) */
+        assert_eq!(
+            pick_w1_scratch_at(0x2960000, 0x2a27598, 0x1000, 0x20, 0x28000000, 2),
+            None
+        );
+    }
+
+    #[test]
+    fn symbol_pick_skips_a_nonzero_window() {
+        /* A .data-like region: the first residue window is non-zero, the next
+         * (0x100 later) is zero; the picker must move past the first. */
+        let mut kernel = vec![0u8; 0x10300];
+        kernel[0x10100] = 1;
+        let pick = pick_w1_scratch_in_symbol(0x10000, 0x300, &kernel, 0, 2).unwrap();
+        assert_eq!(pick.image, 0x10100);
+        assert_eq!(pick.source, ScratchSource::OperatorSymbol);
+        assert!(!pick.inside_anchor);
+    }
+
+    #[test]
+    fn symbol_pick_accepts_a_bss_window_past_the_file() {
+        /* bm_pmd on the 6.1.138 layout: the file ends before the bss, so the
+         * window is not in it; the pick lands on the symbol base. */
+        let pick = pick_w1_scratch_in_symbol(0x21d1000, 0x1000, &[], 0x28000000, 2).unwrap();
+        assert_eq!(pick.image, 0x21d1000);
+        /* serial8250_ports on 6.1.25: the residue puts the window at +0x150. */
+        let pick = pick_w1_scratch_in_symbol(0x20b93b0, 0x6a00, &[], 0x28000000, 2).unwrap();
+        assert_eq!(pick.image, 0x20b9400);
+    }
+
+    #[test]
+    fn symbol_pick_refuses_a_short_region() {
+        assert_eq!(pick_w1_scratch_in_symbol(0x10000, 0x100, &[], 0, 2), None);
     }
 }

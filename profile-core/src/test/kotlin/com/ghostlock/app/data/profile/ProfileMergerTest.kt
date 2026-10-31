@@ -39,6 +39,28 @@ class ProfileMergerTest {
     }
 
     @Test
+    fun `the page-free stage-1 blocks survive the merge`() {
+        val imported = valueMapOf(
+            "release" to device,
+            "kernel_major" to 6,
+            "selinux" to valueMapOf("enforcing" to 0L, "initialized" to 1L),
+            "w1_scratch" to valueMapOf("image" to 44279296L),
+            "execution" to valueMapOf(),
+        )
+        val resolved = ProfileMerger.resolveMerged(
+            deviceRelease = device,
+            builtin = null,
+            imported = imported,
+            overrides = null,
+            tuningExecution = null,
+            pair = CpuPairView(0, 1),
+            routePresets = emptyMap(),
+        )
+        assertEquals(valueMapOf("image" to 44279296L), resolved["w1_scratch"])
+        assertEquals(valueMapOf("enforcing" to 0L, "initialized" to 1L), resolved["selinux"])
+    }
+
+    @Test
     fun `a matching imported profile still merges`() {
         val imported = valueMapOf(
             "release" to device,

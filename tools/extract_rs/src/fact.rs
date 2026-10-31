@@ -554,9 +554,8 @@ mod tests {
             route_geometry: geometry,
             cred,
             extra_offsets: extra,
-       
             layouts: None,
-       
+            stage1: None,
             phys_source: "test",
         }
     }

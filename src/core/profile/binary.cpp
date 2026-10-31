@@ -123,6 +123,19 @@ namespace ghostlock::binary_profile {
             OPT("rt_mutex_size", misc.rt_mutex_size),
         };
 
+        /* Page-free Stage 1: selinux_state's field offsets. Optional as a
+         * block -- absence keeps the release-derived layout. */
+        constexpr Field kSelinux[] = {
+            OPT("enforcing", selinux.enforcing),
+            OPT("initialized", selinux.initialized),
+        };
+
+        /* W1's scratch region (image offset). Absence keeps the reclaimed-page
+         * value, i.e. the pre-stage-1 behaviour. */
+        constexpr Field kW1Scratch[] = {
+            OPT("image", w1_scratch.image),
+        };
+
         constexpr Field kWaiter[] = {
             OPT("compact", waiter.compact),
             OPT("pi_tree", waiter.pi_tree),
@@ -196,6 +209,12 @@ namespace ghostlock::binary_profile {
             /* Optional: absence keeps this build's 0x1000 / 0x20 grid. */
             OPT("lock_anchor_bytes", geometry.select_lock_anchor_bytes),
             OPT("lock_anchor_stride", geometry.select_lock_anchor_stride),
+            /* Optional: the AArch32 carrier. Absent/0 keeps the 64-bit route;
+             * the two geometry values are the measured strip home and compat
+             * select buffer depth (docs/analysis/compat-select-carrier-plan.md). */
+            OPT("compat_carrier", geometry.select_compat_carrier),
+            OPT("waiter_home", geometry.select_waiter_home),
+            OPT("select_dst_depth", geometry.select_select_dst_depth),
             PLAIN("enter_delay_us", execution.select_enter_delay_us),
             PLAIN("timeout_us", execution.select_timeout_us),
         };
@@ -245,6 +264,8 @@ namespace ghostlock::binary_profile {
             {"cred", kCred, std::size(kCred)},
             {"offset", kOffset, std::size(kOffset)},
             {"kernel", kKernel, std::size(kKernel)},
+            {"selinux", kSelinux, std::size(kSelinux)},
+            {"w1_scratch", kW1Scratch, std::size(kW1Scratch)},
             {"waiter_layout", kWaiter, std::size(kWaiter)},
             {"execution.recommended_cpus", kExecCpus, std::size(kExecCpus)},
             {"execution.heap", kExecHeap, std::size(kExecHeap)},

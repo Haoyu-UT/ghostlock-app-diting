@@ -25,6 +25,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
@@ -135,6 +136,10 @@ data class GhostlockUiState(
     val dialogMessageRes: Int = 0,
     val dialogItems: List<String> = emptyList(),
     val dialogItemResIds: List<Int> = emptyList(),
+    /** Optional success-grade chip per [dialogItems] entry (route picker). */
+    val dialogItemGrades: List<DialogChip?> = emptyList(),
+    /** A leading LIST row given as a string resource (the page option row). */
+    val dialogLeadingResId: Int? = null,
     val dialogCurrentItemIndex: Int = -1,
     val dialogInput: String = "",
     val dialogConfirmLabelRes: Int = R.string.parse_start,
@@ -589,18 +594,62 @@ private fun GhostlockDialog(
             when (state.dialogType) {
                 DialogType.LIST -> {
                     val items = state.dialogItems.ifEmpty { state.dialogItemResIds.map { stringResource(it) } }
-                    items.forEachIndexed { index, item ->
+                    val leading = state.dialogLeadingResId
+                    val offset = if (leading != null) 1 else 0
+                    if (leading != null) {
                         TextButton(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(bottom = 12.dp),
-                            text = if (index == state.dialogCurrentItemIndex) {
-                                stringResource(R.string.export_current_marker, item)
-                            } else {
-                                item
-                            },
-                            onClick = { actions.onDialogItemSelected(index) },
+                            text = stringResource(leading),
+                            onClick = { actions.onDialogItemSelected(0) },
                         )
+                    }
+                    items.forEachIndexed { index, item ->
+                        val grade = state.dialogItemGrades.getOrNull(index)
+                        val label = if (index == state.dialogCurrentItemIndex) {
+                            stringResource(R.string.export_current_marker, item)
+                        } else {
+                            item
+                        }
+                        if (grade == null) {
+                            /* No chip (image sources, phys choices): keep the
+                             * miuix TextButton's centred label and container. */
+                            TextButton(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(bottom = 12.dp),
+                                text = label,
+                                onClick = { actions.onDialogItemSelected(index + offset) },
+                            )
+                        } else {
+                            val chipColors = ButtonDefaults.textButtonColors()
+                            Row(
+                                /* A chip row: the same TextButton container,
+                                 * with the label left-aligned so the chip sits
+                                 * right after it. The miuix ButtonDefaults
+                                 * values (corner 16.dp, inside margin 16x13.dp)
+                                 * are not exposed to app code; they are read
+                                 * from the library's constants. */
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(bottom = 12.dp)
+                                    .clip(RoundedCornerShape(16.dp))
+                                    .background(chipColors.color)
+                                    .clickable { actions.onDialogItemSelected(index + offset) }
+                                    .padding(horizontal = 16.dp, vertical = 13.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    text = label,
+                                    color = chipColors.textColor,
+                                    /* The text fills the row so the chip is
+                                     * always right-aligned inside the box. */
+                                    modifier = Modifier.weight(1f),
+                                )
+                                DialogBadge(grade)
+                            }
+                        }
                     }
                     TextButton(
                         modifier = Modifier.fillMaxWidth(),
@@ -1438,6 +1487,30 @@ private fun LogPanel(
                 }
             }
         }
+    }
+}
+
+/**
+ * A dialog choice's chip, rendered inline after the option (same row, trailing)
+ * rather than on its own line above it: a colored dot + the short label.
+ */
+@Composable
+private fun DialogBadge(chip: DialogChip) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.padding(start = 8.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(8.dp)
+                .clip(CircleShape)
+                .background(chip.color),
+        )
+        Spacer(Modifier.width(6.dp))
+        Text(
+            text = stringResource(chip.labelRes),
+            fontSize = 11.sp,
+        )
     }
 }
 

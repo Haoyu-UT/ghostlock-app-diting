@@ -388,6 +388,19 @@ pub struct ConfInputs<'a> {
     /// Stage-2 facts. Only `Source::Btf` values are emitted; `None` keeps the
     /// pre-stage-3 profile byte-identical.
     pub layouts: Option<&'a LayoutFacts>,
+    /// Page-free Stage 1 blocks. Absent when their premises did not hold (no
+    /// BTF/template for the selinux layout, or no valid scratch slot).
+    pub stage1: Option<Stage1Conf>,
+}
+
+/// The two page-free Stage 1 profile blocks.
+#[derive(Clone, Copy, Debug)]
+pub struct Stage1Conf {
+    pub selinux_enforcing: u32,
+    pub selinux_initialized: u32,
+    /// "btf" or "release-template", for the fact header.
+    pub selinux_source: &'static str,
+    pub w1_scratch: Option<crate::anchor::W1Scratch>,
 }
 
 /// Renders a flattened, self-contained GLK profile (`--format conf`): no
@@ -458,6 +471,32 @@ pub fn render_conf(input: &ConfInputs<'_>) -> String {
             push_fact(&mut fact_sources, "cred.copy_size", &layouts.cred_copy_size);
         }
     }
+    if let Some(stage1) = input.stage1.as_ref() {
+        fact_sources.push(format!(
+            "selinux.enforcing={} ({})",
+            stage1.selinux_enforcing, stage1.selinux_source
+        ));
+        fact_sources.push(format!(
+            "selinux.initialized={} ({})",
+            stage1.selinux_initialized, stage1.selinux_source
+        ));
+        if let Some(scratch) = stage1.w1_scratch {
+            let reservation = if scratch.inside_anchor {
+                format!(
+                    "reserves anchor slots {}..{}",
+                    scratch.reserved_first, scratch.reserved_last
+                )
+            } else {
+                "second region, no slot reservation".to_string()
+            };
+            fact_sources.push(format!(
+                "w1_scratch.image={} ({}; {})",
+                scratch.image,
+                scratch.source.label(),
+                reservation
+            ));
+        }
+    }
     lines.insert(1, format!("# fact_sources: {}", fact_sources.join("; ")));
     lines.push(match input.phys {
         // Decimal only: HOCON has no `0x` literal, and the Kotlin reader
@@ -505,6 +544,27 @@ pub fn render_conf(input: &ConfInputs<'_>) -> String {
         "fallback",
         &[("to".to_string(), "\"none\"".to_string())],
     );
+    /* Page-free Stage 1. Both blocks are optional: `selinux` states the field
+     * offsets the W1 predicate reads, `w1_scratch` names the zeroed region the
+     * W1 value comes from. Absence keeps the release-derived layout and the
+     * reclaimed-page value. */
+    if let Some(stage1) = input.stage1.as_ref() {
+        push_conf_block(
+            &mut lines,
+            "selinux",
+            &[
+                ("enforcing".to_string(), stage1.selinux_enforcing.to_string()),
+                ("initialized".to_string(), stage1.selinux_initialized.to_string()),
+            ],
+        );
+        if let Some(scratch) = stage1.w1_scratch {
+            push_conf_block(
+                &mut lines,
+                "w1_scratch",
+                &[("image".to_string(), scratch.image.to_string())],
+            );
+        }
+    }
 
     // Execution tuning (`selected_cpus`, the race knobs, route timing) is
     // device/runtime behaviour, not an image property. The extractor omits the
@@ -699,6 +759,7 @@ mod tests {
             extra_offsets: &no_extra_offsets(),
        
             layouts: None,
+            stage1: None,
        
             phys_source: "test",
         });
@@ -739,6 +800,7 @@ mod tests {
             extra_offsets: &no_extra_offsets(),
        
             layouts: None,
+            stage1: None,
        
             phys_source: "test",
         });
@@ -819,6 +881,7 @@ mod tests {
             cred: &conf_cred_6x(),
             extra_offsets: &no_extra_offsets(),
             layouts: Some(&layouts),
+            stage1: None,
        
             phys_source: "test",
         });
@@ -910,6 +973,7 @@ mod tests {
             cred: &conf_cred_6x(),
             extra_offsets: &no_extra_offsets(),
             layouts: Some(&layouts),
+            stage1: None,
         });
         assert!(out.contains("caps_offset = 40"));
         assert!(out.contains("copy_size = 128"));
@@ -962,6 +1026,7 @@ mod tests {
             cred: &conf_cred_5x(&cred, 176),
             extra_offsets: &no_extra_offsets(),
             layouts: Some(&layouts),
+            stage1: None,
         });
         /* The 5.x block is already per-image: its copy is sizeof(cred) (5.x
          * keeps pointers and the rcu head after `security`) and its caps is
@@ -989,6 +1054,7 @@ mod tests {
             cred: &conf_cred_6x(),
             extra_offsets: &no_extra_offsets(),
             layouts: None,
+            stage1: None,
         });
         assert!(out.contains("kernel_phys_load=2818572288 (--phys)"));
         assert!(out.contains("kernel_phys_load = 2818572288"));
@@ -1030,6 +1096,7 @@ mod tests {
             },
        
             layouts: None,
+            stage1: None,
        
             phys_source: "test",
         });
@@ -1210,6 +1277,7 @@ mod tests {
             },
        
             layouts: None,
+            stage1: None,
        
             phys_source: "test",
         });
@@ -1233,6 +1301,7 @@ mod tests {
             extra_offsets: &no_extra_offsets(),
        
             layouts: None,
+            stage1: None,
        
             phys_source: "test",
         });
@@ -1262,6 +1331,7 @@ mod tests {
             extra_offsets: &no_extra_offsets(),
        
             layouts: None,
+            stage1: None,
        
             phys_source: "test",
         });
@@ -1427,6 +1497,7 @@ mod tests {
             extra_offsets: &extra,
        
             layouts: None,
+            stage1: None,
        
             phys_source: "test",
         });

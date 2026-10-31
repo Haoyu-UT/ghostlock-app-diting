@@ -175,11 +175,27 @@ internal class AndroidProfileConfigController(
             }
 
             "select_stack" -> {
-                val shift = value("$routePrefix.waiter_shift")
-                if (shift == null ||
-                    shift < Int.MIN_VALUE.toLong() || shift > Int.MAX_VALUE.toLong()
-                ) {
-                    invalid += "$routePrefix.waiter_shift"
+                /* The AArch32 compat carrier places the stamp from the
+                 * measured geometry (waiter_home / select_dst_depth), not from
+                 * the 64-bit fd_set word shift; a compat profile legitimately
+                 * omits waiter_shift and must state both depths instead. */
+                val compat = value("$routePrefix.compat_carrier") ?: 0L
+                if (compat != 0L) {
+                    for (field in listOf("waiter_home", "select_dst_depth")) {
+                        val current = value("$routePrefix.$field")
+                        if (current == null || current <= 0L ||
+                            current > UInt.MAX_VALUE.toLong()
+                        ) {
+                            invalid += "$routePrefix.$field"
+                        }
+                    }
+                } else {
+                    val shift = value("$routePrefix.waiter_shift")
+                    if (shift == null ||
+                        shift < Int.MIN_VALUE.toLong() || shift > Int.MAX_VALUE.toLong()
+                    ) {
+                        invalid += "$routePrefix.waiter_shift"
+                    }
                 }
             }
 

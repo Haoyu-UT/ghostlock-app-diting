@@ -243,6 +243,49 @@ class ProfileResolverTest {
         assertTrue(errors.any { it.fieldPath == "route.select_stack.lock_anchor_stride" })
     }
 
+    @Test
+    fun `validateMerged accepts the page-free stage-1 blocks`() {
+        val profile = validProfile()
+        profile["selinux"] = valueMapOf("enforcing" to 0L, "initialized" to 2L)
+        profile["w1_scratch"] = valueMapOf("image" to 0x2a3a600L)
+        assertEquals(emptyList<ConfigError>(), ProfileResolver.validateMerged(profile, "select_stack", "none"))
+        assertEquals(2L, ProfileResolver.nativeValue(profile, "select_stack", "none", "selinux.initialized"))
+        assertEquals(0L, ProfileResolver.nativeValue(profile, "select_stack", "none", "selinux.enforcing"))
+        assertEquals(0x2a3a600L, ProfileResolver.nativeValue(profile, "select_stack", "none", "w1_scratch.image"))
+    }
+
+    @Test
+    fun `validateMerged rejects a selinux block that is not the known layout`() {
+        val profile = validProfile()
+        profile["selinux"] = valueMapOf("enforcing" to 1L, "initialized" to 8L)
+        val errors = ProfileResolver.validateMerged(profile, "select_stack", "none")
+        assertTrue(errors.any { it.fieldPath == "selinux.enforcing" })
+        assertTrue(errors.any { it.fieldPath == "selinux.initialized" })
+    }
+
+    @Test
+    fun `validateMerged rejects a scratch whose window leaves the anchor region`() {
+        val profile = validProfile()
+        val route = profile["route"].asValueMap()!!["select_stack"].asValueMap()!!
+        route["lock_anchor_image"] = 0x2a3a590L
+        route["lock_anchor_bytes"] = 0x1000L
+        route["lock_anchor_stride"] = 0x20L
+        profile["w1_scratch"] = valueMapOf("image" to 0x2a3a590L + 0xf00L)
+        val errors = ProfileResolver.validateMerged(profile, "select_stack", "none")
+        assertTrue(errors.any { it.fieldPath == "w1_scratch.image" })
+    }
+
+    @Test
+    fun `validateMerged accepts a scratch inside the anchor with a fitting window`() {
+        val profile = validProfile()
+        val route = profile["route"].asValueMap()!!["select_stack"].asValueMap()!!
+        route["lock_anchor_image"] = 0x2a3a590L
+        route["lock_anchor_bytes"] = 0x1000L
+        route["lock_anchor_stride"] = 0x20L
+        profile["w1_scratch"] = valueMapOf("image" to 0x2a3a600L)
+        assertEquals(emptyList<ConfigError>(), ProfileResolver.validateMerged(profile, "select_stack", "none"))
+    }
+
     private fun sixOneBtfProfile(): MutableMap<String, Any?> {
         val profile = validProfile()
         profile["cred"].asValueMap()!!.apply {

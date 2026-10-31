@@ -104,25 +104,47 @@ tasks.register<Exec>("buildGhostlockNative") {
     outputs.file(file("build/native/ghostlock"))
 }
 
+/* The AArch32 compat carrier helper. It is a static armv7 executable, not a
+ * shared library; packaging it under lib/arm64-v8a/ lets the 64-bit native
+ * exec it from nativeLibraryDir, the same directory as libghostlock.so, with
+ * the app's SELinux domain and seccomp filter (docs/analysis/
+ * compat-select-carrier-plan.md). */
+tasks.register<Exec>("buildGhostlockCompatHelper") {
+    description = "buildGhostlockCompatHelper"
+    workingDir(file("src"))
+    commandLine("make", "compat-helper")
+    val ndk = resolveNdkDir()
+    environment("ANDROID_NDK_HOME", ndk)
+    environment("NDK_ROOT", ndk)
+    inputs.files(
+        fileTree("src") { include("**/*.c", "**/*.h", "**/*.cpp", "**/*.hpp") },
+        file("src/Makefile"),
+    )
+    outputs.file(file("build/native/ghostlock32"))
+}
+
 tasks.register<Copy>("prepareGhostlockJniLibs") {
     description = "prepareGhostlockJniLibs"
     dependsOn("buildGhostlockNative")
-    from("build/native/ghostlock")
+    dependsOn("buildGhostlockCompatHelper")
+    from("build/native/ghostlock") { rename { "libghostlock.so" } }
+    from("build/native/ghostlock32") { rename { "libghostlock32.so" } }
     into("app/src/main/jniLibs/arm64-v8a")
-    rename { "libghostlock.so" }
-    /* Strip only the packaged copy: static libc++ carries its DWARF into the
+    /* Strip only the packaged copies: static libc++ carries its DWARF into the
      * binary, while the top-level ghostlock keeps its symbols for the
      * disassembly comparisons. Paths are captured as plain strings so the
      * configuration cache can serialize this task. */
     val stripPath = File(extractNdkTools().clang)
         .resolveSibling("llvm-strip").absolutePath
-    val packagedPath = File(rootDir, "app/src/main/jniLibs/arm64-v8a/libghostlock.so").absolutePath
+    val packagedDir = File(rootDir, "app/src/main/jniLibs/arm64-v8a")
     doLast {
-        val code = ProcessBuilder(stripPath, "--strip-all", packagedPath)
-            .inheritIO()
-            .start()
-            .waitFor()
-        check(code == 0) { "llvm-strip failed with $code" }
+        for (name in listOf("libghostlock.so", "libghostlock32.so")) {
+            val code = ProcessBuilder(stripPath, "--strip-all", File(packagedDir, name).absolutePath)
+                .inheritIO()
+                .start()
+                .waitFor()
+            check(code == 0) { "llvm-strip $name failed with $code" }
+        }
     }
 }
 

