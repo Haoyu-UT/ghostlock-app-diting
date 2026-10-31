@@ -209,6 +209,12 @@ namespace ghostlock::binary_profile {
             /* Optional: absence keeps this build's 0x1000 / 0x20 grid. */
             OPT("lock_anchor_bytes", geometry.select_lock_anchor_bytes),
             OPT("lock_anchor_stride", geometry.select_lock_anchor_stride),
+            /* Optional: the AArch32 carrier. Absent/0 keeps the 64-bit route;
+             * the two geometry values are the measured strip home and compat
+             * select buffer depth (docs/analysis/compat-select-carrier-plan.md). */
+            OPT("compat_carrier", geometry.select_compat_carrier),
+            OPT("waiter_home", geometry.select_waiter_home),
+            OPT("select_dst_depth", geometry.select_select_dst_depth),
             PLAIN("enter_delay_us", execution.select_enter_delay_us),
             PLAIN("timeout_us", execution.select_timeout_us),
         };

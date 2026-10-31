@@ -167,6 +167,16 @@ namespace ghostlock::profile {
          * 0x1000 and 0x20. See the geometry check in select_stack_route.cpp. */
         std::optional<uint64_t> select_lock_anchor_bytes;
         std::optional<uint64_t> select_lock_anchor_stride;
+        /* Compat (AArch32) select carrier: the select route runs in a 32-bit
+         * helper because these kernels' strip is below the 64-bit pselect
+         * buffer. `waiter_home` is the measured strip home below the compat
+         * entry sp (0x1b0 futex_time32 / 0x1c0 futex_time64) and
+         * `select_dst_depth` the measured compat _newselect buffer depth
+         * (0x1e0). Absent `compat_carrier` (or 0) keeps the 64-bit route.
+         * See docs/analysis/compat-select-carrier-plan.md. */
+        std::optional<uint8_t> select_compat_carrier;
+        std::optional<uint32_t> select_waiter_home;
+        std::optional<uint32_t> select_select_dst_depth;
         /* Sigreturn route: where waiter byte 0 sits inside the 0x200-byte fpsimd
          * copy window `rt_sigreturn`'s restore performs. The value is per build
          * and per restore helper -- the SVE path copies at sp+0x10, the plain
@@ -239,6 +249,12 @@ namespace ghostlock::profile {
         std::optional<uint64_t> lock_anchor_image;
         std::optional<uint64_t> lock_anchor_bytes;
         std::optional<uint64_t> lock_anchor_stride;
+        /* Compat carrier (AArch32 helper). `waiter_home`/`select_dst_depth`
+         * are the measured geometry; the bitmap packer refuses any pair it
+         * cannot cover (in particular 5.10.236's 0x200/0x210 strips). */
+        std::optional<uint8_t> compat_carrier;
+        std::optional<uint32_t> waiter_home;
+        std::optional<uint32_t> select_dst_depth;
     };
 
     struct TcpZerocopyLayout {
@@ -513,6 +529,9 @@ namespace ghostlock::profile {
                            .lock_anchor_image = values_.geometry.select_lock_anchor_image,
                            .lock_anchor_bytes = values_.geometry.select_lock_anchor_bytes,
                            .lock_anchor_stride = values_.geometry.select_lock_anchor_stride,
+                           .compat_carrier = values_.geometry.select_compat_carrier,
+                           .waiter_home = values_.geometry.select_waiter_home,
+                           .select_dst_depth = values_.geometry.select_select_dst_depth,
                        }
                        : SelectStackLayout{};
         }

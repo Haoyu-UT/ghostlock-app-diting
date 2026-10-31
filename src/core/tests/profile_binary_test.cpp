@@ -21,7 +21,7 @@ namespace {
      * block. Asserted with the same value in the Kotlin test
      * (profile-core `NativeProfileDigestTest`), which is what makes the two
      * implementations a checked contract rather than two hopeful copies. */
-    constexpr uint64_t kGoldenSchemaDigest = 0x28706e4538054d46ull;
+    constexpr uint64_t kGoldenSchemaDigest = 0xe620f6d4022894a3ull;
 
     void put_u16(std::string &out, uint16_t value) {
         out.push_back(static_cast<char>(value & 0xff));
@@ -229,6 +229,30 @@ int32_t main(void) {
         assert(!parsed.geometry.select_lock_anchor_bytes.has_value());
         assert(!parsed.geometry.select_lock_anchor_stride.has_value());
 
+        /* The compat carrier's switch and geometry round-trip; absence is what
+         * keeps the 64-bit route on every other profile. */
+        profile::kernel_offsets compat = {};
+        compat.uname_r = "compat";
+        compat.route = ghostlock::profile::kRouteSelectStack;
+        compat.geometry.select_compat_carrier = 1;
+        compat.geometry.select_waiter_home = 0x1b0;
+        compat.geometry.select_select_dst_depth = 0x1e0;
+        assert(round_trip(compat, &parsed, release, sizeof(release)) == 0);
+        assert(parsed.geometry.select_compat_carrier.value_or(0) == 1);
+        assert(parsed.geometry.select_waiter_home.value_or(0) == 0x1b0);
+        assert(parsed.geometry.select_select_dst_depth.value_or(0) == 0x1e0);
+        const profile::TargetProfile compat_profile = profile::TargetProfile::from(&parsed);
+        assert(compat_profile.select_stack_layout().compat_carrier.value_or(0) == 1);
+        assert(compat_profile.select_stack_layout().waiter_home.value_or(0) == 0x1b0);
+        assert(compat_profile.select_stack_layout().select_dst_depth.value_or(0) == 0x1e0);
+
+        profile::kernel_offsets compat_absent = {};
+        compat_absent.uname_r = "compat-absent";
+        compat_absent.route = ghostlock::profile::kRouteSelectStack;
+        assert(round_trip(compat_absent, &parsed, release, sizeof(release)) == 0);
+        assert(!parsed.geometry.select_compat_carrier.has_value());
+        assert(!profile::TargetProfile::from(&parsed).select_stack_layout().compat_carrier.has_value());
+
         /* The multicast route states the same anchor trio through its own
          * section; native keeps one shared storage for every route. The values
          * here are a synthetic transport vector, not a device's approved
@@ -324,6 +348,17 @@ int32_t main(void) {
         assert(parse_doc(doc, &parsed, release, sizeof(release)) == 0);
         assert(parsed.geometry.select_lock_anchor_bytes.value_or(0) == 0x1000);
         assert(parsed.geometry.select_lock_anchor_stride.value_or(0) == 0x20);
+
+        /* The compat carrier's three select-section keys decode by wire name. */
+        doc = build_doc(ghostlock::profile::kRouteSelectStack, "compat",
+                        {{"route.select_stack",
+                          {{"compat_carrier", 1},
+                           {"waiter_home", 0x1b0},
+                           {"select_dst_depth", 0x1e0}}}});
+        assert(parse_doc(doc, &parsed, release, sizeof(release)) == 0);
+        assert(parsed.geometry.select_compat_carrier.value_or(0) == 1);
+        assert(parsed.geometry.select_waiter_home.value_or(0) == 0x1b0);
+        assert(parsed.geometry.select_select_dst_depth.value_or(0) == 0x1e0);
 
         /* The sigreturn route's own section: both copy-window offsets are
          * decoded, and the anchor keys are stated through this route's section
