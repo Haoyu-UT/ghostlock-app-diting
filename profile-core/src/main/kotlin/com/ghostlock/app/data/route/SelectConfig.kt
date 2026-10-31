@@ -27,6 +27,18 @@ data class SelectConfig(
      */
     val lockAnchorBytes: ULong? = null,
     val lockAnchorStride: ULong? = null,
+    /**
+     * AArch32 compat carrier (docs/analysis/compat-select-carrier-plan.md).
+     * When `compat_carrier` is 1 the route runs in the armv7 helper, because
+     * these kernels' stale waiter strip sits below the 64-bit pselect buffer.
+     * `waiter_home` is the measured strip home below the compat entry sp
+     * (0x1b0 futex_time32 / 0x1c0 futex_time64), `select_dst_depth` the
+     * measured compat `_newselect` buffer depth (0x1e0). The native refuses any
+     * pair it cannot cover, so 5.10.236 (0x200/0x210) fails closed.
+     */
+    val compatCarrier: UByte? = null,
+    val waiterHome: UInt? = null,
+    val selectDstDepth: UInt? = null,
 ) : RouteConfig {
     override fun entries(): List<Pair<String, ULong>> = buildList {
         waiterShift?.let { add("waiter_shift" to it.toLong().toULong()) }
@@ -34,6 +46,9 @@ data class SelectConfig(
         lockAnchorImage?.let { add("lock_anchor_image" to it) }
         lockAnchorBytes?.let { add("lock_anchor_bytes" to it) }
         lockAnchorStride?.let { add("lock_anchor_stride" to it) }
+        compatCarrier?.let { add("compat_carrier" to it.toULong()) }
+        waiterHome?.let { add("waiter_home" to it.toULong()) }
+        selectDstDepth?.let { add("select_dst_depth" to it.toULong()) }
         enterDelayUs?.let { add("enter_delay_us" to it.toULong()) }
         timeoutUs?.let { add("timeout_us" to it.toULong()) }
     }
@@ -47,6 +62,9 @@ data class SelectConfig(
         "lock_anchor_image" -> copy(lockAnchorImage = value)
         "lock_anchor_bytes" -> copy(lockAnchorBytes = value)
         "lock_anchor_stride" -> copy(lockAnchorStride = value)
+        "compat_carrier" -> copy(compatCarrier = value.toUByte())
+        "waiter_home" -> copy(waiterHome = value.toUInt())
+        "select_dst_depth" -> copy(selectDstDepth = value.toUInt())
         "enter_delay_us" -> copy(enterDelayUs = value.toUInt())
         "timeout_us" -> copy(timeoutUs = value.toUInt())
         else -> this
@@ -55,7 +73,8 @@ data class SelectConfig(
     companion object {
         private val SchemaKeys = listOf(
             "waiter_shift", "compact_waiter", "lock_anchor_image", "lock_anchor_bytes",
-            "lock_anchor_stride", "enter_delay_us", "timeout_us",
+            "lock_anchor_stride", "compat_carrier", "waiter_home", "select_dst_depth",
+            "enter_delay_us", "timeout_us",
         )
 
         val EMPTY = SelectConfig(null, null, null, null)
@@ -68,6 +87,9 @@ data class SelectConfig(
             lockAnchorImage = value("lock_anchor_image")?.toULong(),
             lockAnchorBytes = value("lock_anchor_bytes")?.toULong(),
             lockAnchorStride = value("lock_anchor_stride")?.toULong(),
+            compatCarrier = value("compat_carrier")?.toUByte(),
+            waiterHome = value("waiter_home")?.toUInt(),
+            selectDstDepth = value("select_dst_depth")?.toUInt(),
         )
     }
 }

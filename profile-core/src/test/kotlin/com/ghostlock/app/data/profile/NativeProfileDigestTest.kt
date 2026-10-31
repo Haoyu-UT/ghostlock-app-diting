@@ -17,7 +17,7 @@ class NativeProfileDigestTest {
      * two implementations are a checked contract rather than two hopeful
      * copies — change one and its own test fails.
      */
-    private val goldenDigest = 0x28706e4538054d46uL
+    private val goldenDigest = 0xe620f6d4022894a3uL
 
     private fun document(
         values: Map<String, Long> = emptyMap(),

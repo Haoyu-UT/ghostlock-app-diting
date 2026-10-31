@@ -56,6 +56,10 @@ object ProfileResolver {
             "lock_anchor_image" -> "lock_anchor_image"
             "lock_anchor_bytes" -> "lock_anchor_bytes"
             "lock_anchor_stride" -> "lock_anchor_stride"
+            /* The AArch32 compat carrier's switch and measured geometry. */
+            "compat_carrier" -> "compat_carrier"
+            "waiter_home" -> "waiter_home"
+            "select_dst_depth" -> "select_dst_depth"
             /* The sigreturn route's per-build copy-window offsets. Bare paths,
              * like the select route's own geometry keys above, so both the
              * active route's branch and its fallback branch are searched. */
