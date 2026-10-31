@@ -15,6 +15,9 @@ object ProfileResolver {
         "kernel_phys_load", "kernel_phys_offset", "execution",
         /* Stage 3: optional per-image waiter layout, carried by the wire. */
         "waiter_layout",
+        /* Page-free Stage 1: selinux_state field offsets and W1's scratch
+         * region. Optional; absence keeps the release layout / the page path. */
+        "selinux", "w1_scratch",
     )
     private val RequiredTopLevel = setOf(
         "release", "schema_version", "kernel_major", "route", "task_struct", "cred", "offset",
@@ -141,6 +144,82 @@ object ProfileResolver {
             }
         }
         errors += validateLayoutGroups(profile, route, fallbackTo)
+        errors += validateStage1Blocks(profile, route, fallbackTo)
+        return errors
+    }
+
+    /**
+     * Page-free Stage 1 blocks. Both are optional -- a profile without them is
+     * the page path and the release-derived selinux layout, i.e. every profile
+     * that predates the keys. When present they must describe one coherent
+     * layout: `enforcing` is the struct's first byte on every sampled image,
+     * `initialized` is a byte offset inside the value, and a scratch that lies
+     * inside the route's lock-anchor region is the slot the allocator reserves
+     * (its 0x18-byte collateral window must stay inside the region).
+     */
+    private fun validateStage1Blocks(
+        profile: Map<String, Any?>,
+        route: String?,
+        fallbackTo: String?,
+    ): List<ConfigError> {
+        val errors = mutableListOf<ConfigError>()
+        profile["selinux"]?.let { raw ->
+            val block = raw as? Map<*, *>
+            if (block == null) {
+                errors += ConfigError("selinux", "not an object")
+            } else {
+                when (val enforcing = block["enforcing"]) {
+                    null -> errors += ConfigError("selinux.enforcing", "missing")
+                    !is Number -> errors += ConfigError("selinux.enforcing", "not a number")
+                    else -> if (enforcing.toLong() != 0L) {
+                        errors += ConfigError("selinux.enforcing", "must be 0")
+                    }
+                }
+                when (val initialized = block["initialized"]) {
+                    null -> errors += ConfigError("selinux.initialized", "missing")
+                    !is Number -> errors += ConfigError("selinux.initialized", "not a number")
+                    else -> if (initialized.toLong() !in 0L..7L) {
+                        errors += ConfigError("selinux.initialized", "must be a byte offset")
+                    }
+                }
+            }
+        }
+        profile["w1_scratch"]?.let { raw ->
+            val block = raw as? Map<*, *>
+            if (block == null) {
+                errors += ConfigError("w1_scratch", "not an object")
+                return@let
+            }
+            val image = block["image"]
+            when (image) {
+                null -> errors += ConfigError("w1_scratch.image", "missing")
+                !is Number -> errors += ConfigError("w1_scratch.image", "not a number")
+                else -> if (image.toLong() <= 0L) {
+                    errors += ConfigError("w1_scratch.image", "must be positive")
+                } else {
+                    val anchorPrefix = route?.let { "route.$it" }
+                        ?: fallbackTo?.takeIf { it != "none" }?.let { "fallback.route.$it" }
+                        ?: "route"
+                    val anchorImage = profile.getLongAt("$anchorPrefix.lock_anchor_image")
+                    val anchorBytes = profile.getLongAt("$anchorPrefix.lock_anchor_bytes")
+                    if (anchorImage != null && anchorBytes != null &&
+                        image.toLong() >= anchorImage &&
+                        image.toLong() < anchorImage + anchorBytes
+                    ) {
+                        /* Inside the anchor: this is the reserved slot. The
+                         * value is alias(image) + 0x100 and the erase's
+                         * collateral spans 0x18 bytes from it. */
+                        val window = image.toLong() - anchorImage + 0x100
+                        if (window + 0x18 > anchorBytes) {
+                            errors += ConfigError(
+                                "w1_scratch.image",
+                                "collateral window leaves the anchor region",
+                            )
+                        }
+                    }
+                }
+            }
+        }
         return errors
     }
 

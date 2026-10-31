@@ -32,6 +32,17 @@ data class NativeProfileDocument(
     val mmStructSz: UInt?,
     /** Stage-3 per-image layout facts; absent = the native release fallback. */
     val rtMutexSize: UInt? = null,
+    /**
+     * Page-free Stage 1: `selinux_state`'s field offsets. Absent = the native
+     * release-derived layout (enforcing 0; initialized 2 below 6.6, 1 from 6.6).
+     */
+    val selinuxEnforcing: UInt? = null,
+    val selinuxInitialized: UInt? = null,
+    /**
+     * Page-free Stage 1: the image offset of W1's scratch region. Absent = the
+     * reclaimed-page value, i.e. the pre-stage-1 behaviour.
+     */
+    val w1ScratchImage: ULong? = null,
     val waiterLayout: WaiterLayoutOffsets = WaiterLayoutOffsets(),
     val execution: ExecutionTuning,
     val safeMode: UInt,
@@ -104,6 +115,17 @@ data class NativeProfileDocument(
                 WireEntry("kernelsnitch_collisions", kernelsnitchCollisions?.toULong()),
                 WireEntry("mm_struct_sz", mmStructSz?.toULong()),
                 WireEntry("rt_mutex_size", rtMutexSize?.toULong()),
+            ),
+        )
+        add(
+            "selinux" to listOf(
+                WireEntry("enforcing", selinuxEnforcing?.toULong()),
+                WireEntry("initialized", selinuxInitialized?.toULong()),
+            ),
+        )
+        add(
+            "w1_scratch" to listOf(
+                WireEntry("image", w1ScratchImage),
             ),
         )
         add(
@@ -549,6 +571,9 @@ data class NativeProfileDocument(
                 kernelsnitchCollisions = vuOrNull("kernelsnitch.collisions"),
                 mmStructSz = vuOrNull("kernelsnitch.mm_struct_sz"),
                 rtMutexSize = vuOrNull("kernelsnitch.rt_mutex_size"),
+                selinuxEnforcing = vuOrNull("selinux.enforcing"),
+                selinuxInitialized = vuOrNull("selinux.initialized"),
+                w1ScratchImage = vulOrNull("w1_scratch.image"),
                 waiterLayout = WaiterLayoutOffsets(
                     compact = vbOrNull("waiter_layout.compact"),
                     piTree = vuOrNull("waiter_layout.pi_tree"),
@@ -605,6 +630,9 @@ data class NativeProfileDocument(
             private var kernelsnitchCollisions: UInt? = null
             private var mmStructSz: UInt? = null
             private var rtMutexSize: UInt? = null
+            private var selinuxEnforcing: UInt? = null
+            private var selinuxInitialized: UInt? = null
+            private var w1ScratchImage: ULong? = null
             private var waiterLayout = WaiterLayoutOffsets()
             private var execution = ExecutionTuning()
             private var routeConfig: RouteConfig = routeKind.emptyConfig()
@@ -684,6 +712,15 @@ data class NativeProfileDocument(
                         "kernelsnitch_collisions" -> kernelsnitchCollisions = raw.toUInt()
                         "mm_struct_sz" -> mmStructSz = raw.toUInt()
                         "rt_mutex_size" -> rtMutexSize = raw.toUInt()
+                    }
+
+                    "selinux" -> when (key) {
+                        "enforcing" -> selinuxEnforcing = raw.toUInt()
+                        "initialized" -> selinuxInitialized = raw.toUInt()
+                    }
+
+                    "w1_scratch" -> when (key) {
+                        "image" -> w1ScratchImage = raw
                     }
 
                     "waiter_layout" -> waiterLayout = when (key) {
@@ -780,6 +817,9 @@ data class NativeProfileDocument(
                 kernelsnitchCollisions = kernelsnitchCollisions,
                 mmStructSz = mmStructSz,
                 rtMutexSize = rtMutexSize,
+                selinuxEnforcing = selinuxEnforcing,
+                selinuxInitialized = selinuxInitialized,
+                w1ScratchImage = w1ScratchImage,
                 waiterLayout = waiterLayout,
                 execution = execution,
                 safeMode = metaSafeMode,

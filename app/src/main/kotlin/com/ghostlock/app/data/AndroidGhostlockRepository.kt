@@ -54,6 +54,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         const val OffsetsFileName = "offsets.conf"
         const val LegacyOffsetsFileName = "offsets.json"
         const val FeasibleReportFileName = "offsets_feasible.json"
+        const val OptionsReportFileName = "offsets_options.json"
         const val UserProfilesDirectoryName = "user_profiles"
         const val EditSessionPreferences = "ghostlock_edit_session"
         const val ExtractBinaryName = "libextract.so"
@@ -319,6 +320,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     ): ParseResult {
         val parsedFile = File(filesDir, "offsets_parse.tmp")
         val feasibleFile = File(filesDir, FeasibleReportFileName)
+        val optionsFile = File(filesDir, OptionsReportFileName)
         var tempBootFile: File? = null
         var tempXblFile: File? = null
         return try {
@@ -345,6 +347,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
 
             parsedFile.delete()
             feasibleFile.delete()
+            optionsFile.delete()
             val args = buildList {
                 add(effectiveInput)
                 if (effectiveXblPath != null) {
@@ -381,6 +384,8 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                         filesDir.absolutePath,
                         "--feasible-out",
                         feasibleFile.absolutePath,
+                        "--options-out",
+                        optionsFile.absolutePath,
                     ),
                 )
                 if (route != null) {
@@ -415,6 +420,10 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 if (reportText != null) {
                     writeSidecar("generation.json", reportText.toByteArray(StandardCharsets.UTF_8))
                 }
+                val optionsText = optionsFile.takeIf { it.isFile }?.readText()
+                if (optionsText != null) {
+                    writeSidecar("options.json", optionsText.toByteArray(StandardCharsets.UTF_8))
+                }
                 writeSidecar(
                     "generation.meta",
                     generationMeta(
@@ -429,12 +438,13 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 exit
             }
             val report = feasibleFile.takeIf { it.isFile }?.readText()?.let(FeasibleReport::parse)
+            val options = optionsFile.takeIf { it.isFile }?.readText()?.let(OptionSuperset::parse)
             if (code == 7) {
                 val routes = report?.routes.orEmpty()
                 if (routes.none { it.verdict == FeasibleReport.VerdictFeasible }) {
                     return ParseResult.Failed(7, "route ambiguity without a feasible-route report")
                 }
-                return ParseResult.Ambiguous(routes)
+                return ParseResult.Ambiguous(routes, options)
             }
             if (code != 0 || !parsedFile.isFile) return ParseResult.Failed(code)
             val document = parsedFile.readText()
@@ -460,6 +470,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 physLoadPresent = filtered.any { it.getLongAt("kernel_phys_load") != null },
                 physOffsetPresent = filtered.any { it.getLongAt("kernel_phys_offset") != null },
                 documentText = document,
+                options = options,
             )
         } catch (error: CancellationException) {
             throw error
@@ -468,6 +479,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         } finally {
             parsedFile.delete()
             feasibleFile.delete()
+            optionsFile.delete()
             tempBootFile?.delete()
             tempXblFile?.delete()
         }

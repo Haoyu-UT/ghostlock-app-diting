@@ -25,6 +25,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
@@ -135,6 +136,10 @@ data class GhostlockUiState(
     val dialogMessageRes: Int = 0,
     val dialogItems: List<String> = emptyList(),
     val dialogItemResIds: List<Int> = emptyList(),
+    /** Optional success-grade chip per [dialogItems] entry (route picker). */
+    val dialogItemGrades: List<RouteGrade?> = emptyList(),
+    /** A leading LIST row given as a string resource (the page option row). */
+    val dialogLeadingResId: Int? = null,
     val dialogCurrentItemIndex: Int = -1,
     val dialogInput: String = "",
     val dialogConfirmLabelRes: Int = R.string.parse_start,
@@ -589,18 +594,50 @@ private fun GhostlockDialog(
             when (state.dialogType) {
                 DialogType.LIST -> {
                     val items = state.dialogItems.ifEmpty { state.dialogItemResIds.map { stringResource(it) } }
-                    items.forEachIndexed { index, item ->
+                    val leading = state.dialogLeadingResId
+                    val offset = if (leading != null) 1 else 0
+                    if (leading != null) {
                         TextButton(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(bottom = 12.dp),
-                            text = if (index == state.dialogCurrentItemIndex) {
-                                stringResource(R.string.export_current_marker, item)
-                            } else {
-                                item
-                            },
-                            onClick = { actions.onDialogItemSelected(index) },
+                            text = stringResource(leading),
+                            onClick = { actions.onDialogItemSelected(0) },
                         )
+                    }
+                    items.forEachIndexed { index, item ->
+                        val grade = state.dialogItemGrades.getOrNull(index)
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            if (grade != null) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.padding(start = 16.dp, top = 4.dp),
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(8.dp)
+                                            .clip(CircleShape)
+                                            .background(grade.color),
+                                    )
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(
+                                        text = stringResource(grade.labelRes),
+                                        fontSize = 11.sp,
+                                    )
+                                }
+                            }
+                            TextButton(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(bottom = 12.dp),
+                                text = if (index == state.dialogCurrentItemIndex) {
+                                    stringResource(R.string.export_current_marker, item)
+                                } else {
+                                    item
+                                },
+                                onClick = { actions.onDialogItemSelected(index + offset) },
+                            )
+                        }
                     }
                     TextButton(
                         modifier = Modifier.fillMaxWidth(),

@@ -1,5 +1,7 @@
 package com.ghostlock.app.domain.model
 
+import com.ghostlock.app.data.OptionSuperset
+
 data class CpuPair(val primary: Int, val consumer: Int) {
     override fun toString(): String = "$primary,$consumer"
 }
@@ -407,6 +409,8 @@ sealed interface ParseResult {
          * before it can be selected for a run.
          */
         val documentText: String? = null,
+        /** The extractor's option superset (all routes/candidates/plans). */
+        val options: OptionSuperset? = null,
     ) : ParseResult
 
     /**
@@ -414,7 +418,11 @@ sealed interface ParseResult {
      * verdicts and exited 7 without a profile; the caller asks the user which
      * route to generate and calls [parseSource] again with that route.
      */
-    data class Ambiguous(val routes: List<RouteVerdict>) : ParseResult
+    data class Ambiguous(
+        val routes: List<RouteVerdict>,
+        /** The option superset, when the extractor wrote one. */
+        val options: OptionSuperset? = null,
+    ) : ParseResult
 
     data class RequiresOverwrite(
         val releases: List<String>,

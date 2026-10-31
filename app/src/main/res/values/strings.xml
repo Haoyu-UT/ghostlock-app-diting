@@ -66,6 +66,12 @@
     <string name="parse_lock_title">Lock source — choose one</string>
     <string name="parse_lock_page">Page — the lock lives in the reclaimed payload page; it cannot pick a wrong kernel object, lower success rate</string>
     <string name="parse_lock_anchor">Anchor — use the image\'s zeroed .bss region; higher success if the region is correct, a wrong region can corrupt kernel data</string>
+    <string name="parse_route_grade_high">high success rate</string>
+    <string name="parse_route_grade_medium">medium success rate</string>
+    <string name="parse_route_grade_bad">bad success rate</string>
+    <string name="parse_plan_title">Page-free anchor space — choose one</string>
+    <string name="parse_plan_title_conditional">No safe page-free space — choose page or a needs-review space</string>
+    <string name="parse_plan_page">Page — W1 from the reclaimed page (no page-free)</string>
     <string name="stride_title">Slab stride</string>
     <string name="stride_subtitle">Measured from %1$d leaks on this device</string>
     <string name="stride_level_confirmed">Confirmed</string>

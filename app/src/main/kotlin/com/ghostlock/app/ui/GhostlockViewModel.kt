@@ -6,6 +6,11 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.ghostlock.app.R
 import com.ghostlock.app.data.MeasuredProfileStore
+import com.ghostlock.app.data.OptionDecision
+import com.ghostlock.app.data.OptionPlan
+import com.ghostlock.app.data.OptionSuperset
+import com.ghostlock.app.data.RoutePlans
+import com.ghostlock.app.data.decision
 import com.ghostlock.app.domain.model.CpuPair
 import com.ghostlock.app.domain.model.ExternalProfileInfo
 import com.ghostlock.app.domain.model.KernelSnapshot
@@ -75,7 +80,7 @@ private data class ParseRequest(
     val route: String? = null,
 )
 
-private enum class ParseDialogStage { Mode, PhysImage, Route, Lock, Source }
+private enum class ParseDialogStage { Mode, PhysImage, Route, Plan, Lock, Source }
 
 class GhostlockViewModel(
     private val repository: GhostlockRepository,
@@ -110,7 +115,14 @@ class GhostlockViewModel(
     /** The pass that reported Ambiguous, re-run with the picked route. */
     private var pendingRouteParse: ParseRequest? = null
     private var pendingRouteChoices: List<RouteVerdict> = emptyList()
+    /** The option superset from the ambiguous pass, when the extractor wrote one. */
+    private var pendingRouteOptions: OptionSuperset? = null
     private var pendingLockParse: ParseResult.Parsed? = null
+    /** The page-free option offer on screen. */
+    private var pendingPlanParse: ParseResult.Parsed? = null
+    private var pendingPlanChoices: List<OptionPlan> = emptyList()
+    private var pendingPlanPageOffered = false
+    private var pendingPlanRoute = ""
 
     /** The generated document and its stride evidence, held while the picker is up. */
     private var pendingStrideParse: ParseResult.Parsed? = null
@@ -1206,14 +1218,53 @@ class GhostlockViewModel(
             ParseDialogStage.Route -> {
                 val parse = pendingRouteParse
                 val route = pendingRouteChoices.getOrNull(index)?.route
+                val options = pendingRouteOptions
                 pendingRouteParse = null
                 pendingRouteChoices = emptyList()
+                pendingRouteOptions = null
                 parseDialogStage = ParseDialogStage.Mode
                 if (parse != null && route != null) {
                     appendLog("route chosen: $route")
+                    /* Keep the sidecar re-run path; when the superset is
+                     * present the route choice itself needs no second pass. */
                     pendingParse = parse.copy(route = route)
-                    launchParse()
+                    val synthetic = options?.let { parsedFromOptions(it, route) }
+                    if (synthetic != null) {
+                        viewModelScope.launch(Dispatchers.IO) { advancePhys(synthetic) }
+                    } else {
+                        launchParse()
+                    }
                 }
+            }
+
+            ParseDialogStage.Plan -> {
+                val parse = pendingPlanParse
+                val route = pendingPlanRoute
+                val pageOffered = pendingPlanPageOffered
+                val choices = pendingPlanChoices
+                pendingPlanParse = null
+                pendingPlanChoices = emptyList()
+                pendingPlanPageOffered = false
+                pendingPlanRoute = ""
+                parseDialogStage = ParseDialogStage.Mode
+                val options = parse?.options
+                if (parse == null || options == null) return
+                val plans = options.plansFor(route) ?: return
+                if (pageOffered && index == 0) {
+                    /* Page-based: the lock-source choice still applies when a
+                     * safe anchor exists. */
+                    if (plans.anchorOnly != null && showLockDialog(parse)) return
+                    val cut = options.cut(route, plans.page) ?: return
+                    appendLog("option: page (no page-free)")
+                    viewModelScope.launch { continueParsed(parse, cut) }
+                    return
+                }
+                val plan = choices.getOrNull(index - if (pageOffered) 1 else 0) ?: return
+                val cut = options.cut(route, plan) ?: return
+                appendLog(
+                    "option: " + plan.label + if (plan.conditioned) " (needs review)" else "",
+                )
+                viewModelScope.launch { continueParsed(parse, cut) }
             }
 
             ParseDialogStage.Lock -> {
@@ -1291,8 +1342,17 @@ class GhostlockViewModel(
         if (parseDialogStage == ParseDialogStage.Route) {
             pendingRouteParse = null
             pendingRouteChoices = emptyList()
+            pendingRouteOptions = null
             parseDialogStage = ParseDialogStage.Mode
             appendLog("result: route choice cancelled")
+        }
+        if (parseDialogStage == ParseDialogStage.Plan) {
+            pendingPlanParse = null
+            pendingPlanChoices = emptyList()
+            pendingPlanPageOffered = false
+            pendingPlanRoute = ""
+            parseDialogStage = ParseDialogStage.Mode
+            appendLog("result: option choice cancelled")
         }
         if (parseDialogStage == ParseDialogStage.Lock) {
             pendingLockParse = null
@@ -1600,6 +1660,7 @@ class GhostlockViewModel(
                          * second pass forces the pick with --route. */
                         pendingRouteParse = request
                         pendingRouteChoices = feasible
+                        pendingRouteOptions = result.options
                         parseDialogStage = ParseDialogStage.Route
                         mutableState.update {
                             it.copy(
@@ -1610,6 +1671,8 @@ class GhostlockViewModel(
                                     "${choice.route} — ${choice.reason}"
                                 },
                                 dialogItemResIds = emptyList(),
+                                dialogItemGrades = feasible.map { RouteGrade.of(it.route) },
+                                dialogLeadingResId = null,
                                 dialogCurrentItemIndex = -1,
                                 /* The picker must be the only overlay on
                                  * screen; a log sheet behind it would swallow
@@ -1728,29 +1791,120 @@ class GhostlockViewModel(
         }
         appendLog("profile generated: ${result.releases.joinToString()}")
         appendLog("result: profile generated; export it to use it")
-        /* The lock source is the user's choice: page (safe, lower rate) or the
-         * generated anchor (higher rate if the zero-page region is correct).
-         * The extractor only emits a triple for routes that use one. */
-        if (result.hasAnchor) {
-            pendingLockParse = result
-            parseDialogStage = ParseDialogStage.Lock
-            mutableState.update {
-                it.copy(
-                    dialogVisible = true,
-                    dialogType = DialogType.LIST,
-                    dialogTitleRes = R.string.parse_lock_title,
-                    dialogItems = emptyList(),
-                    dialogItemResIds = listOf(
-                        R.string.parse_lock_page,
-                        R.string.parse_lock_anchor,
-                    ),
-                    dialogCurrentItemIndex = -1,
-                    executionSheetVisible = false,
-                )
-            }
-            return
+        /* Page-free options first, per the operator rule: one safe option is
+         * taken automatically, several are offered without a page row, and
+         * page is offered only when no safe option exists. */
+        val options = result.options
+        val plans = options?.let { superset ->
+            val route = result.route
+                ?: superset.routes.firstOrNull { it.verdict == OptionSuperset.Feasible }?.route
+            route?.let { superset.plansFor(it) }
         }
+        if (options != null && plans != null) {
+            when (val decision = plans.decision()) {
+                is OptionDecision.Auto -> {
+                    val cut = options.cut(plans.route, decision.plan)
+                    if (cut != null) {
+                        appendLog("option: ${decision.plan.label} (auto)")
+                        continueParsed(result, cut)
+                        return
+                    }
+                }
+                is OptionDecision.Offer -> {
+                    showPlanDialog(result, plans, decision)
+                    return
+                }
+                OptionDecision.NoPageFree -> Unit
+            }
+        }
+        /* No page-free option: the lock source remains the user's choice. */
+        if (showLockDialog(result)) return
         continueParsed(result, document)
+    }
+
+    /** The page/anchor lock-source dialog; false when there is no anchor. */
+    private fun showLockDialog(result: ParseResult.Parsed): Boolean {
+        if (!result.hasAnchor) return false
+        pendingLockParse = result
+        parseDialogStage = ParseDialogStage.Lock
+        mutableState.update {
+            it.copy(
+                dialogVisible = true,
+                dialogType = DialogType.LIST,
+                dialogTitleRes = R.string.parse_lock_title,
+                dialogItems = emptyList(),
+                dialogItemResIds = listOf(
+                    R.string.parse_lock_page,
+                    R.string.parse_lock_anchor,
+                ),
+                dialogItemGrades = emptyList(),
+                dialogLeadingResId = null,
+                dialogCurrentItemIndex = -1,
+                executionSheetVisible = false,
+            )
+        }
+        return true
+    }
+
+    /** The page-free option list; the UI adds a page row only when offered. */
+    private fun showPlanDialog(
+        result: ParseResult.Parsed,
+        plans: RoutePlans,
+        decision: OptionDecision.Offer,
+    ) {
+        pendingPlanParse = result
+        pendingPlanChoices = decision.options
+        pendingPlanPageOffered = decision.pageOffered
+        pendingPlanRoute = plans.route
+        parseDialogStage = ParseDialogStage.Plan
+        mutableState.update {
+            it.copy(
+                dialogVisible = true,
+                dialogType = DialogType.LIST,
+                dialogTitleRes = if (decision.pageOffered) {
+                    R.string.parse_plan_title_conditional
+                } else {
+                    R.string.parse_plan_title
+                },
+                dialogItems = decision.options.map { plan -> plan.label },
+                dialogItemResIds = emptyList(),
+                dialogItemGrades = emptyList(),
+                dialogLeadingResId = if (decision.pageOffered) {
+                    R.string.parse_plan_page
+                } else {
+                    null
+                },
+                dialogCurrentItemIndex = -1,
+                executionSheetVisible = false,
+            )
+        }
+    }
+
+    /**
+     * A parse result synthesized from the superset: the route choice is a cut,
+     * not a second extractor run. The sidecar re-run path still applies when a
+     * physical source is missing.
+     */
+    private fun parsedFromOptions(options: OptionSuperset, route: String): ParseResult.Parsed? {
+        val plans = options.plansFor(route) ?: return null
+        val plan = when (val decision = plans.decision()) {
+            is OptionDecision.Auto -> decision.plan
+            else -> plans.safeOptions.firstOrNull() ?: plans.anchorOnly ?: plans.page
+        }
+        val document = options.cut(route, plan) ?: return null
+        return ParseResult.Parsed(
+            releases = listOf(options.release),
+            missing = if (options.physLoad == null) setOf("kernel_phys_load") else emptySet(),
+            documentName = options.release.replace(Regex("[^A-Za-z0-9._-]"), "_") + ".conf",
+            route = route,
+            anchor = plan.anchorName?.let { "info: plan anchor $it" },
+            hasAnchor = plan.anchor != null,
+            physSource = options.physSource,
+            physLoadPresent = options.physLoad != null,
+            physOffsetPresent = options.physOffset != null,
+            documentText = document,
+            options = options,
+        )
     }
 
     /**
@@ -1887,6 +2041,8 @@ class GhostlockViewModel(
                 dialogMessageRes = 0,
                 dialogItems = emptyList(),
                 dialogItemResIds = emptyList(),
+                dialogItemGrades = emptyList(),
+                dialogLeadingResId = null,
                 dialogCurrentItemIndex = -1,
                 dialogExportLog = false,
                 dialogInput = "",
