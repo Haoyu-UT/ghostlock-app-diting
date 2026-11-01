@@ -78,7 +78,8 @@ Support is organized by **kernel family**, not by phone model or by a list of in
 If your kernel belongs to one of those families and is not patched for CVE-2026-43499, the app can
 generate a profile from your own image and try to run it. The built-in profiles are only the ones
 that have passed independent verification; for a kernel that is not built in, you can generate a
-profile yourself.
+profile yourself. The exact bundled list is in
+[`docs/kernel_profiles/BUNDLED_PROFILES.md`](docs/kernel_profiles/BUNDLED_PROFILES.md).
 
 Kernels outside these families have no derivation template and are currently out of scope.
 
