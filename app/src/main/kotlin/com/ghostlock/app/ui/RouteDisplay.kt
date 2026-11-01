@@ -11,8 +11,9 @@ package com.ghostlock.app.ui
  * They are not the same thing and a profile carries both keys independently.
  * "compact" is a waiter layout, never 32-bit; "compat" is the 32-bit route.
  *
- * Grades are the measured completion rates from the 2026-10-31 release matrix;
- * a build that has not been device-measured is [RouteGrade.Unmeasured].
+ * Grades are a route-level mechanism hint, never a per-kernel claim: the
+ * kernel build decides feasibility and geometry (the verdict covers both), and
+ * does not change a route's delivery mechanism.
  */
 object RouteDisplay {
     private const val COMPACT = "compact_waiter"
@@ -30,40 +31,22 @@ object RouteDisplay {
         return if (tags.isEmpty()) route else "$route (${tags.joinToString(", ")})"
     }
 
-    fun grade(route: String, geometry: Map<String, Long>, release: String?): RouteGrade? {
-        val compat = (geometry[COMPAT] ?: 0L) != 0L
-        val r = release.orEmpty()
-        return when (route) {
-            "select_stack" -> when {
-                compat -> when {
-                    // Cell D: 10/10 on the era 5.10.81 rig.
-                    r.startsWith("5.10.81-") -> RouteGrade.High
-                    // QEMU-only (no ROM on disk); never claim a measured rate.
-                    r.startsWith("5.10.101-") -> RouteGrade.Unmeasured
-                    r.startsWith("5.10.43-") -> RouteGrade.Unmeasured
-                    else -> RouteGrade.Unmeasured
-                }
-                // Cell A (10/10), G (10/10), H (10/10); I is postponed.
-                r.startsWith("5.10.236-") -> RouteGrade.High
-                r.startsWith("6.1.138-") -> RouteGrade.High
-                r.startsWith("6.6.66-") -> RouteGrade.High
-                // Cell I: 10/10 on the page-free 6.12.23 profile.
-                r.startsWith("6.12.23-") -> RouteGrade.High
-                else -> RouteGrade.Unmeasured
-            }
-            // Cell F: 10/10; no other family has a measured tcp layout.
-            "tcp_zerocopy" -> if (r.startsWith("6.1.138-")) RouteGrade.High
-                else RouteGrade.Unmeasured
-            // Cell C: 10/10 on the ksun 5.10.236 kernel, the only
-            // multicast-feasible image of that release.
-            "multicast_waiter" -> if (r.startsWith("5.10.236-")) RouteGrade.High
-                else RouteGrade.Unmeasured
-            // Cell B: 6/10 on 5.10.236; the shipped 5.10.81/101 sigreturn
-            // profiles have no release-build series.
-            "sigreturn" -> if (r.startsWith("5.10.236-")) RouteGrade.Medium
-                else RouteGrade.Unmeasured
-            else -> null
-        }
+    /**
+     * The route-level grade. It is a property of the route's mechanism, not of
+     * the kernel build: the build decides whether the route is feasible and
+     * what its geometry is, and the verdict handles both. The measured matrix
+     * supports the ordering, but is not encoded per kernel here.
+     */
+    fun grade(route: String): RouteGrade? = when (route) {
+        // select (page-free when the profile carries anchor + scratch), tcp
+        // (page-based by construction) and multicast all carry device-backed
+        // route series.
+        "select_stack", "tcp_zerocopy", "multicast_waiter" -> RouteGrade.High
+        // The fpsimd delivery reads ~50-60% across the 5.10.236 series
+        // (8/15, 5/12, 6/11, and the 2026-10-31 B cell 6/10 with four
+        // reboots); the route-level rate is measured and the failures are real.
+        "sigreturn" -> RouteGrade.Medium
+        else -> null
     }
 
     private val NON_COMPACT_FAMILIES = setOf("6.6", "6.12")

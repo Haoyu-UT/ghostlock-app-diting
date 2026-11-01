@@ -5,9 +5,9 @@ import com.ghostlock.app.R
 
 /**
  * The route picker's success-grade chip. This is route-level UI copy, not an
- * extractor fact; the ordering comes from the 2026-10-31 release matrix
- * (`external/port/release-matrix-2026-10-31/`). A kernel build that has not
- * been device-measured is [Unmeasured], never guessed.
+ * extractor fact and not a per-kernel claim: the grade describes the route's
+ * delivery mechanism, while the kernel build only decides feasibility and
+ * geometry. A route without a clean route-level series is [Unmeasured].
  */
 /** A colored dot + short label rendered above a dialog choice. */
 interface DialogChip {

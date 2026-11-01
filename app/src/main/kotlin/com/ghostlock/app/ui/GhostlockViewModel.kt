@@ -1680,8 +1680,7 @@ class GhostlockViewModel(
                                 },
                                 dialogItemResIds = emptyList(),
                                 dialogItemGrades = feasible.map { choice ->
-                                    val geometry = routeOptions?.route(choice.route)?.geometry.orEmpty()
-                                    RouteDisplay.grade(choice.route, geometry, routeOptions?.release)
+                                    RouteDisplay.grade(choice.route)
                                 },
                                 dialogLeadingResId = null,
                                 dialogCurrentItemIndex = -1,

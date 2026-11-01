@@ -8,9 +8,7 @@ class RouteDisplayTest {
     private val select236 = "5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284"
     private val select66 = "6.6.66-android15-8-g29d86c5fc9dd-abogki428889875-4k"
     private val compat81 = "5.10.81-android12-9-00001-g6cd504626bae-ab8485363"
-    private val compat101 = "5.10.101-android12-9-00005-ga829d48e78bd-ab9206161"
     private val tcp61 = "6.1.138-android14-11-g44bda9e8f6e9-ab13792638"
-    private val select612 = "6.12.23-android16-5-g5a0e85dd9db0-ab14499855-4k"
 
     @Test
     fun `select labels its waiter shape inline`() {
@@ -65,47 +63,11 @@ class RouteDisplayTest {
     }
 
     @Test
-    fun `grades follow the measured release matrix`() {
-        assertEquals(
-            RouteGrade.High,
-            RouteDisplay.grade("select_stack", mapOf("compact_waiter" to 1L), select236),
-        )
-        assertEquals(
-            RouteGrade.High,
-            RouteDisplay.grade("select_stack", mapOf("waiter_shift" to -2L), select66),
-        )
-        assertEquals(
-            RouteGrade.High,
-            RouteDisplay.grade("select_stack", mapOf("compact_waiter" to 1L), tcp61),
-        )
-        assertEquals(
-            RouteGrade.High,
-            RouteDisplay.grade("tcp_zerocopy", mapOf("compact_waiter" to 1L), tcp61),
-        )
-        assertEquals(
-            RouteGrade.High,
-            RouteDisplay.grade("select_stack", mapOf("compat_carrier" to 1L), compat81),
-        )
-        assertEquals(
-            RouteGrade.Unmeasured,
-            RouteDisplay.grade("select_stack", mapOf("compat_carrier" to 1L), compat101),
-        )
-        assertEquals(
-            RouteGrade.Medium,
-            RouteDisplay.grade("sigreturn", emptyMap(), select236),
-        )
-        assertEquals(
-            RouteGrade.High,
-            RouteDisplay.grade("multicast_waiter", mapOf("compact_waiter" to 1L), select236),
-        )
-        assertEquals(
-            RouteGrade.Unmeasured,
-            RouteDisplay.grade("multicast_waiter", mapOf("compact_waiter" to 1L), "5.10.246-gki"),
-        )
-        assertEquals(
-            RouteGrade.High,
-            RouteDisplay.grade("select_stack", mapOf("waiter_shift" to 0L), select612),
-        )
-        assertNull(RouteDisplay.grade("unknown", emptyMap(), select236))
+    fun `grades are route-level and do not depend on the kernel build`() {
+        assertEquals(RouteGrade.High, RouteDisplay.grade("select_stack"))
+        assertEquals(RouteGrade.High, RouteDisplay.grade("tcp_zerocopy"))
+        assertEquals(RouteGrade.High, RouteDisplay.grade("multicast_waiter"))
+        assertEquals(RouteGrade.Medium, RouteDisplay.grade("sigreturn"))
+        assertNull(RouteDisplay.grade("unknown"))
     }
 }
