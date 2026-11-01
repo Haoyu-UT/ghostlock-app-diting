@@ -26,7 +26,10 @@ import java.nio.file.Files
 @Config(sdk = [35])
 class ControllerInternalsTest {
     private val context: Application = RuntimeEnvironment.getApplication()
-    private val release = "6.1.118-android14-11-ga3b9c44908dd-ab13320413"
+    /* A profile that still carries a fallback route (tcp_zerocopy -> select_stack):
+     * the r8 cuts gave the page-free profiles `fallback { to = "none" }`, so only
+     * the six untouched tcp_zerocopy assets can exercise the fallback tuning. */
+    private val release = "6.1.138-android14-11-g151cf2b6bfbe-ab13719792"
     private val pair = CpuPair(primary = 0, consumer = 1)
 
     private fun withController(
