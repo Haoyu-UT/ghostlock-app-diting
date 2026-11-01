@@ -1,200 +1,186 @@
-# GhostLock — `diting` port (Redmi K50 Ultra, 5.10.236)
+# GhostLock — broad kernel support, measured success
 
 > 中文: [README_ZH.md](README_ZH.md)
 
+Temporary root for Android kernels that have not yet patched CVE-2026-43499.
+
+This repository is a fork of [YuKongA/ghostlock-app](https://github.com/YuKongA/ghostlock-app).
+**This branch rebuilds the parts of the pipeline that decide whether a generated profile is
+accurate and whether a run completes.**
+
+## Design principles
+
+1. Support comes from a profile generator that reads the kernel image, not from a hand-maintained
+   list of builds.
+2. Built-in profiles do not define the support boundary. A kernel that is not listed can generate
+   its own profile, and an upstream profile the maintainer has not personally tested is not removed
+   for that reason.
+3. A correct profile runs at the full success rate its route is capable of.
+
+## Profile generation accuracy
+
+Tested against 40+ kernels: every one produces an accurate profile, identical to the results seen on
+the real device or in the emulator. The full list is in [`docs/DESIGN.md`](docs/DESIGN.md).
+
+## Root success rate
+
+Measured on real phones, one run per fresh boot. The tables were measured with the r8
+release-candidate build and are split into three groups by how much a run depends on a page. When
+the same phone, kernel and route appear twice, the two rows are two page-dependency configurations.
+
+**Fully page-free**
+
+| Phone | Kernel | Route | Completed | Typical time | Measured |
+|---|---|---|---|---|---|
+| Redmi K50 Ultra (`diting`) | 5.10.236 | `select_stack` | 10/10 | 13.8–15.9 s | 2026-10-31 |
+| Redmi K50 Ultra (`diting`) | 5.10.236 | `sigreturn` | 6/10<br>(4 runs rebooted mid-run) | 12.8–13.4 s | 2026-10-31 |
+| Redmi K50 Ultra (`diting`) | 5.10.236<br>(custom build) | `multicast_waiter` | 10/10 | 12.5–14.0 s | 2026-10-31 |
+| Redmi K50 Ultra (`diting`) | 5.10.81 | `select_stack`<br>(32-bit compat) | 10/10 | 6.6–7.8 s | 2026-10-31 |
+| POCO X6 Pro 5G (`duchamp`) | 6.1.138 | `select_stack` | 10/10 | 20.8–23.1 s | 2026-11-01 |
+| OnePlus 13T | 6.6.66 | `select_stack` | 10/10 | 22.3–22.7 s | 2026-11-01 |
+| Xiaomi K90 Pro Max (`myron`) | 6.12.23 | `select_stack` | 10/10 | 20.3–22.6 s | 2026-10-31 |
+
+**Partly page-based**
+
+| Phone | Kernel | Route | Completed | Typical time | Measured |
+|---|---|---|---|---|---|
+| POCO X6 Pro 5G (`duchamp`) | 6.1.138 | `select_stack` | 10/10 | 35.3–46.1 s | 2026-10-31 |
+| OnePlus 13T | 6.6.66 | `select_stack` | 10/10 | 45.9–69.5 s | 2026-10-31 |
+
+**Fully page-based**
+
+| Phone | Kernel | Route | Completed | Typical time | Measured |
+|---|---|---|---|---|---|
+| POCO X6 Pro 5G (`duchamp`) | 6.1.138 | `tcp_zerocopy` | 10/10 | 25.0–39.3 s | 2026-10-31 |
+
+*All numbers are from the r8 release-candidate build.*
+
+## Prerequisites
+
+> [!WARNING]
+> **Do not try this on vivo/iQOO phones, or on any phone with built-in anti-root protection. The
+> maintainer does not own such a phone, the attack flow has not been tuned for it, and there is a
+> risk of bricking the device.**  
+> **You use this app entirely at your own risk.**
+
+- Android 12 or newer.
+- The kernel and its security patch level are not yet patched for CVE-2026-43499.
+- A KernelSU-family root manager is installed first: KernelSU, BakaSU (formerly ReSukiSU), or
+  KowSU. Each manager gained temporary-root support in a different version; use the newest one you
+  can.
+
 ## Supported devices
 
-| Kernel | Devices | Codename | Status |
-|---|---|---|---|
-| `5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284` | Redmi K50 Ultra · Xiaomi 12T Pro | `diting` | **tested end to end** — Global `OS2.0.206.0`–`OS3.0.6.0` |
-| `5.10.226-android12-9-00064-gea4a6f067d3f-ab12969919` | Redmi K50 Ultra · Xiaomi 12T Pro | `diting` | **tested end to end** — Global `OS2.0.3.0`–`OS2.0.205.0` |
-| `5.10.209-android12-9-00019-g4ea09a298bb4-ab12292661` | Redmi K50 Ultra · Xiaomi 12T Pro | `diting` | **tested end to end** — Global `OS1.0.11.0` · `OS1.0.12.0` · `OS2.0.1.0` · `OS2.0.2.0` |
+Support is organized by **kernel family**, not by phone model or by a list of individual builds:
 
-The Redmi K50 Ultra is codename `diting` (SM8475 / Snapdragon 8+ Gen 1). **Xiaomi 12T Pro is the
-same physical device** — one codename, three retail names (also sold as the Redmi K50 Extreme
-Edition). It is not a second port.
+**5.10 · 5.15 · 6.1 · 6.6 · 6.12**
 
-Reported as possibly sharing the build, but **untested**:
+If your kernel belongs to one of those families and is not patched for CVE-2026-43499, the app can
+generate a profile from your own image and try to run it. The built-in profiles are only the ones
+that have passed independent verification; for a kernel that is not built in, you can generate a
+profile yourself.
 
-| Retail name | Codename | SoC | vs. the tested device |
-|---|---|---|---|
-| Xiaomi 12S Ultra | `thor` | SM8475 | same SoC |
-| Xiaomi 12 | `cupid` | SM8450 | different SoC |
-| Redmi Note 13 Pro 5G | `garnet` | SM7435 | different SoC |
-| POCO X6 5G | `garnet` | SM7435 | different SoC |
-| POCO F5 | `marble` | SM7475 | different SoC |
-| Redmi Pad Pro | `dizi` / `ruan` | SM7435 | different SoC |
+Kernels outside these families have no derivation template and are currently out of scope.
 
-None of these has been run. Only the Xiaomi 12S Ultra is on the same SoC as the tested device; for
-the rest, **a dedicated profile may be required** — a device on a different SoC is not expected to
-ship the same certified kernel build.
+## Quick start
 
-This fork also **removes 24 upstream kernels** from the supported list, because its
-compact-waiter change breaks them. The full table, including which devices those 24 covered, is in
-[`docs/kernel_profiles/SUPPORTED_DEVICES.md`](docs/kernel_profiles/SUPPORTED_DEVICES.md).
+1. Install the APK and open the app.
+2. The home screen checks your kernel.
+3. If it reads **Supported / Profile ready**, keep the app in the foreground and tap **Run**.
+4. Wait for `KernelSU ready`. `su` works until the next reboot.
 
-## About this fork
+## Generating a profile
 
-A fork of **[YuKongA/ghostlock-app](https://github.com/YuKongA/ghostlock-app)**. Upstream supports
-5.15 / 6.1 / 6.6 / 6.12 — **5.10 is not among them**: there is no built-in profile for it, and no
-5.10 family entry in the offset extractor. This fork adds one, plus the fixes that turning it on
-required.
+> [!WARNING]
+> Some fields in a profile are measured on the phone itself. Do not generate a profile for any
+> kernel other than the one the phone is running.
 
-**For the app itself — usage, the offset extractor, the profile schema, the porting guide — read
-[upstream's README](https://github.com/YuKongA/ghostlock-app#readme).** This page only covers what
-the port changed and what it has been shown to do.
+1. Note the exact OS build.
+2. For a Qualcomm phone, get `boot.img`, `xbl_config.img` and `uefi.img` from the same OS build;
+   for a MediaTek phone, get `boot.img`, `vendor_boot.img` and `dtbo.img`. Extract them from the
+   full OTA's `payload.bin`, or from the fastboot package, and copy them to the phone's storage.
+3. Open the app and tap **Generate profile** on the home screen:
 
-## Status
+   <img src="docs/images/profile-generation/en/01-home.png" width="520" alt="The generate-profile entry on the home screen">
 
-Verified end-to-end on a **stock, unpatched kernel** — no root beforehand, no instrumentation:
+4. Choose **Parse local image**, then pick `boot.img` (or `payload.bin`):
 
-| stage | result |
-|---|---|
-| W1 — SELinux → permissive | works |
-| W2 — child credential write (`child uid = 0` → `child is root!`) | works |
-| W3 — seccomp filter bypass | works |
-| Handoff — root script as `uid=0`, KernelSU loaded, SELinux back to enforcing | works, `native exited code=0` |
+   | Source | Image type |
+   |---|---|
+   | <img src="docs/images/profile-generation/en/02-source.png" width="360" alt="Source selection"> | <img src="docs/images/profile-generation/en/03-image-type.png" width="360" alt="Image-type selection"> |
 
-Repeat runs in one boot are stable as well: **8 consecutive runs completed, with no freeze and no
-reboot**, after fixing the two causes that ended earlier series — anchor slots reused across
-processes
-([`anchor-slot-persistence-plan.md`](docs/analysis/anchor-slot-persistence-plan.md)) and
-`init_cred` freed under the rooted children
-([`init-cred-lifetime-plan.md`](docs/analysis/init-cred-lifetime-plan.md)).
+5. Attach the platform image the app asks for (skipping is not recommended — the physical address
+   may be wrong):
+   - Qualcomm: `xbl_config.img`; if the physical load is still missing, `uefi.img`.
+   - MediaTek: `vendor_boot.img`; if the offset is still missing, `dtbo.img`.
 
-Root is **temporary**. KernelSU is late-loaded from the exploit, so it is gone on reboot; the
-bootloader is unlocked throughout. Relocking (which wipes data) is a separate, later step and has
-not been done.
+   <img src="docs/images/profile-generation/en/04-physical.png" width="420" alt="The xbl_config prompt on a Qualcomm phone">
 
-### KernelSU handoff
+6. If the app asks **Multiple routes are available — choose one**, pick from the row descriptions.
+   The grade on the right is about the route itself, not about your kernel; it reads **not
+   measured** when there is no evidence:
 
-The chain completes and hands off either way; whether the **KernelSU module** ends up loaded depends
-on a **late-load-capable `ksud`** being reachable. The app copies one out of an installed manager it
-recognises — `me.weishu.kernelsu` (KernelSU), `me.weishu.kernelsu.pr` (KernelSU-Next),
-`com.resukisu.resukisu` (ReSukiSU) or `com.kowx712.supermanager` — into its own files directory, and
-the root script prefers that copy. The verified setup is **ReSukiSU** (`com.resukisu.resukisu`):
+   <img src="docs/images/profile-generation/en/05-route.png" width="420" alt="Route selection">
 
-```
-[ksu] [*] ksud=/data/user/0/com.ghostlock.app/files/ksud
-[ksu] [+] KernelSU module loaded
-[+] KernelSU ready
-```
+7. If the app asks for a page-free plan, choose from the row descriptions. Each row states where
+   the lock and the value come from; the dangerous Samsung serial-port area is labelled separately:
 
-A manager outside that list — the earlier `com.sukisu.ultra`, for example — is not matched, and the
-script falls through to `/data/adb/ksu/bin/ksud`, some builds of which have no `late-load`
-subcommand, leaving the module unloaded. A late-load-capable `ksud` executable at
-**`/data/local/tmp/ksud`** is also picked up; per KernelSU's LKM design, that binary carries its own
-`kernelsu.ko`, so no separate module file is needed.
+   <img src="docs/images/profile-generation/en/06-plan.png" width="420" alt="Page-free anchor space selection">
 
-### Open regression — read this before using the fork on anything but a 5.10 device
+8. If **Slab stride** appears, pick a value marked **Confirmed** or **Consistent**, or skip it and
+   merge the measurement from the home screen later.
 
-**This fork breaks 24 of upstream's built-in profiles.** It is a defect in the fork, not in
-GhostLock — upstream supports those devices normally, and nothing here affects it.
+9. **Export** the profile, then select it. A generated profile that is not exported is lost when
+   you leave the screen.
 
-The change that makes the compact waiter work on 5.10 sits on a code path shared with every kernel
-family, so the **19 built-in 6.1 profiles and 5 built-in 5.15 profiles** now build a waiter whose
-priority is written to the wrong field. The families disagree on the waiter layout — 5.10 has
-`int prio` at `0x40`, while 5.15 and 6.1 have `unsigned int wake_state` at `0x40` and `int prio` at
-`0x44` — and the fork writes the 5.10 pair unconditionally.
+## If a run fails
 
-6.6 and 6.12 are unaffected, as they don't use the compact waiter. The devices those 24 kernels
-covered are listed in
-[`docs/kernel_profiles/SUPPORTED_DEVICES.md`](docs/kernel_profiles/SUPPORTED_DEVICES.md), and the
-analysis with the planned fix is in
-[`docs/analysis/waiter-layout-family-gating-plan.md`](docs/analysis/waiter-layout-family-gating-plan.md).
-**Do not build this fork for a 5.15 or 6.1 device until that is fixed.**
+- **Reboot and retry.** A fresh boot is the strongest single lever; one attempt per boot.
+- **Check the plan and route choice** if the app offered one; each option can produce a different
+  success rate.
+- **Export the log** and attach it to the issue, together with the profile-generation log and the
+  attack-run log.
 
-## What the port changed
+## Why the success rate is higher
 
-The route is **`select_stack`** (the pselect path), with `waiter_shift = -2` and the 5.10
-**compact** waiter — the 10-word
-`{tree_entry, pi_tree_entry, task, lock, int prio, u64 deadline, ww_ctx}` shape, derived statically
-from `boot.img` and confirmed live on the device with kprobes (the waiter and the `stack_fds`
-buffer land on the same stack address, delta 0).
+An exploit has many steps, and a mistake in any one of them lowers the success rate of the whole
+chain. This branch optimizes the following steps:
 
-The chain on top of the profile:
+1. **The main routes no longer depend on a sprayed page.** The old route leaked a page, freed it,
+   reclaimed it with controlled contents, and hoped the allocator returned the same page; a page
+   reclaimed elsewhere could take the phone down. The lock used for the write now sits in a fixed,
+   all-zero region of the kernel. (`tcp_zerocopy` is the exception: its lock is a crafted object
+   and stays page-based by construction.)
+2. **Profiles are generated from measurable facts.** The app fills a profile from facts where it
+   has them and falls back to heuristics only where it has none. A profile that was a few bytes off
+   used to fail in the middle of the chain; that class of failure is gone.
+3. **Older 5.10 kernels get a route that fits.** Two extra routes cover kernels the default route
+   cannot reach: one for older 5.10 layouts, and a 32-bit helper for 5.10.43 / 5.10.81 / 5.10.101,
+   whose stack layouts are outside the 64-bit route's reach.
+4. **A failed attempt cleans up after itself.** Kernel state left behind by one attempt used to
+   spoil the next. The app disarms after every attempt and retries the early stages, so one miss
+   does not end the run.
+5. **A stage that cannot finish stops.** A walk that would never end used to leave the app waiting
+   indefinitely. A stage that cannot complete now stops and reports where it stopped.
+6. **The log says what happened.** The app logs with as little delay as it can and can export the
+   log.
 
-| commit | change |
-|---|---|
-| `6c8b18a` | Disarm the ghost on 5.x kernels; line-buffer the run log |
-| `c1b8569` | Keep the victim's protocol fds out of the select route's fd range |
-| `765b137` | Snapshot and restore every fd the select route's `dup2` pass clobbers |
-| `9acf2f1` | Perform zero writes through the erase's collateral (the 5.10 leaf layout) |
-| `a703604` | Carry `lock_anchor_image` from the profile document through to the wire |
-| `6e70e8c` | Port plans and analysis documents |
-| `0f76309` | Make the anchor region's slots safe, batched and profile-sized |
-| `75f64c1` | Report why the W2 verifier gave up |
-| `30f0c14` | Keep `init_cred` alive for the boot (the cred pin) |
-| `55f3413` | Derive the lock anchor's region from the kernel image (`--anchor-scan`) |
-| `f08c49c` | Retry the cred pin and never fail a run for it |
-| `81d0cdb` | **r3**: bundle the profile, police the applied layers, digest the wire, and let a fresh install reach its first run |
+## Acknowledgements
 
-The last two fd fixes were the difference between "the write lands" and "the chain completes" —
-before them the route's `dup2` pass silently destroyed long-lived descriptors, so the W2 victim saw
-EOF one dance before its write landed.
-
-`81d0cdb` is the r3 change set in one commit: the built-in profile and the layer rules that stop an
-import or an old build's overrides from changing a run silently, the schema digest native refuses to
-run without, the fix that lets a fresh install run at all, and the SELinux policy working copy that
-no longer accumulates in app storage. The release notes are in the port repository; the device gate
-that verified it is described in `PORT-PLAN.md` there.
-
-## Reproducing
-
-The diting profiles ship as **built-in assets**, so a device on one of those exact kernels needs no
-import and no setup. Two layers used to outrank a built-in profile and no longer do: an imported document
-is **not applied** while a bundled profile covers your kernel, and parameter overrides apply **only
-when the installed build wrote them**. Both stay stored — the app raises a one-time *"Disabled by
-this update"* notice saying what is off and why, keeps a banner on the profile screen, and re-saving
-an override from Parameters re-enables it immediately. See `PORT-PLAN.md` Phase 8 in the project
-notes for the full rule.
-
-To port a *different* build, extract your own profile and then bundle or import it:
-
-1. Extract on a host. The physical load comes from the bootloader's own image — `--xbl-config`
-   (or `--uefi`) for Qualcomm, `--vendor-boot`/`--dtbo` for MediaTek — or from `--phys`; with
-   neither, the profile leaves it `null` and the native's compiled default applies. The tool does
-   **not** read `/proc/iomem`:
-
-   ```sh
-   ghostlock-extract boot.img --phys 0xa8000000 --format conf --out profile.conf
-   ```
-
-   Add `--explain` to print the per-key fact table (value, domain, source, confidence) to
-   stderr; the profile output is unchanged.
-
-2. Either add it under `app/src/main/assets/kernel_profiles/` and register it in `index.conf` (then
-   it is the authoritative layer for that kernel), or import it as a user document on a kernel that
-   has no bundled profile.
-3. Run. The phantom-process trimmer does **not** need to be disabled — that advice is obsolete:
-   runs were measured to complete with it at its default, and it cannot be turned off before the
-   first successful run anyway, since it needs root.
-
-A profile is specific to one exact kernel build, so extract one for your own device as above rather
-than reusing a file from here — the values differ per build, and a mismatch fails at W1.
-
-## Layout
-
-- [`docs/analysis/`](docs/analysis/) — design notes and analysis behind this port, including the
-  regression described above.
-- [`docs/kernel_profiles/`](docs/kernel_profiles/) — upstream's porting guide and profile schema,
-  unchanged.
-
-## Reporting a problem
-
-Open an issue — <https://github.com/Haoyu-UT/ghostlock-app-diting/issues/new/choose>. The form asks for a
-screenshot of **Settings → About phone → 全部参数与信息**, scrolled down: it carries your kernel version and
-your ROM channel, which is where triage starts. Every run is kept on the device: tap **Export log & report** on the
-main screen, pick the run, and save the zip wherever you like — that zip is what to attach.
-
-Check `uname -r` first — **a different kernel is not a bug**, it is a device this port was never derived
-for. See [Supported devices](#supported-devices).
-
-## Credits & License
-
-Fork of [YuKongA/ghostlock-app](https://github.com/YuKongA/ghostlock-app), Apache License 2.0 (see
-[LICENSE](LICENSE)). Upstream in turn credits:
+This repository is a fork of [YuKongA/ghostlock-app](https://github.com/YuKongA/ghostlock-app),
+Apache License 2.0. Upstream in turn credits:
 
 - [NebuSec/CyberMeowfia](https://github.com/NebuSec/CyberMeowfia)
 - [JoinChang/ghostlock-oneplus](https://github.com/JoinChang/ghostlock-oneplus)
 - [x-spy/CVE-2026-43499-popsicle](https://github.com/x-spy/CVE-2026-43499-popsicle)
+
+The app also uses [miuix](https://github.com/compose-miuix-ui/miuix),
+[Shizuku](https://github.com/RikkaApps/Shizuku),
+[Typesafe Config](https://github.com/lightbend/config) and Apache Commons Compress. The diting 5.10
+offsets were initially based on the OPPO Reno10 Pro+ (CPH2521).
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE). Root is temporary and probabilistic. The built-in
+profiles are based on real-device or emulator verification; the actual run result is what counts.
+You use this software entirely at your own risk.

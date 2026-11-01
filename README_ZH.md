@@ -1,169 +1,154 @@
-# GhostLock — `diting` 移植版（Redmi K50 Ultra，5.10.236）
+# 为广泛内核支持及成功率优化的GhostLock
 
 > English: [README.md](README.md)
 
+为尚未修补 CVE-2026-43499 漏洞的安卓内核提供临时 root。
+
+本仓库是 [YuKongA/ghostlock-app](https://github.com/YuKongA/ghostlock-app) 的分支。
+**本分支优化了决定配置文件导出准确性和漏洞利用成功率的关键部分**。
+
+## 本分支的设计哲学
+1. 内核支持来自精确的配置生成器，而不是逐一内置。
+2. 内置配置不定义支持范围。未列出的内核可以自行生成；未由维护者亲自测试的上游配置也不会因此移除。
+3. 每个正确的配置文件以没有妥协的成功率执行。
+
+## 配置文件生成准确性
+测试使用40+个内核，全部准确生成配置文件，与实机/模拟器结果完全相同。具体清单见[`docs/DESIGN_ZH.md`](docs/DESIGN_ZH.md)。
+
+## root成功率
+
+在真机上测量，每次重启只跑一次。
+下表使用r8的发布候选构建测得，按是否使用页面分为三组。同一手机/内核/路线出现两行时，是两种页面依赖配置的两次测量。
+
+**完全免页面**
+
+| 手机 | 内核 | 路线 | 完成 | 典型耗时 | 测量于 |
+|---|---|---|---|---|---|
+| Redmi K50 Ultra（`diting`） | 5.10.236 | `select_stack` | 10/10 | 13.8–15.9 秒 | 2026-10-31 |
+| Redmi K50 Ultra（`diting`） | 5.10.236 | `sigreturn` | 6/10<br>（4 次运行中重启） | 12.8–13.4 秒 | 2026-10-31 |
+| Redmi K50 Ultra（`diting`） | 5.10.236<br>(custom build) | `multicast_waiter` | 10/10 | 12.5–14.0 秒 | 2026-10-31 |
+| Redmi K50 Ultra（`diting`） | 5.10.81 | `select_stack`<br>（32 位兼容） | 10/10 | 6.6–7.8 秒 | 2026-10-31 |
+| POCO X6 Pro 5G（`duchamp`） | 6.1.138 | `select_stack` | 10/10 | 20.8–23.1 秒 | 2026-11-01 |
+| OnePlus 13T | 6.6.66 | `select_stack` | 10/10 | 22.3–22.7 秒 | 2026-11-01 |
+| Xiaomi K90 Pro Max（`myron`） | 6.12.23 | `select_stack` | 10/10 | 20.3–22.6 秒 | 2026-10-31 |
+
+**部分使用页面**
+
+| 手机 | 内核 | 路线 | 完成 | 典型耗时 | 测量于 |
+|---|---|---|---|---|---|
+| POCO X6 Pro 5G（`duchamp`） | 6.1.138 | `select_stack` | 10/10 | 35.3–46.1 秒 | 2026-10-31 |
+| OnePlus 13T | 6.6.66 | `select_stack` | 10/10 | 45.9–69.5 秒 | 2026-10-31 |
+
+**完全基于页面**
+
+| 手机 | 内核 | 路线 | 完成 | 典型耗时 | 测量于 |
+|---|---|---|---|---|---|
+| POCO X6 Pro 5G（`duchamp`） | 6.1.138 | `tcp_zerocopy` | 10/10 | 25.0–39.3 秒 | 2026-10-31 |
+
+*数字来自r8候选构建。*
+
+## 使用前提
+> [!WARNING]
+> **vivo/iQOO 及未来任何内置反 root 的机型禁止直接尝试，维护者不持有这类机型，攻击流程未对其优化，有变砖的风险。**  
+> **使用本 App 的一切风险由使用者自行承担。**
+
+- 系统为Android 12 或更高。
+- 内核及安全补丁尚未修补 CVE-2026-43499 漏洞。
+- 提前安装下列 root 管理器之一： KernelSU、BakaSU（曾是ReSukiSU）或 KowSU。每个管理器支持临时 root 的首个版本各不相同，尽可能下载新版。
+
 ## 支持的设备
 
-| Kernel | 机型 | 代号 | 状态 |
-|---|---|---|---|
-| `5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284` | Redmi K50 Ultra · Xiaomi 12T Pro | `diting` | **已端到端验证** —— Global `OS2.0.206.0`–`OS3.0.6.0` |
-| `5.10.226-android12-9-00064-gea4a6f067d3f-ab12969919` | Redmi K50 Ultra · Xiaomi 12T Pro | `diting` | **已端到端验证** —— Global `OS2.0.3.0`–`OS2.0.205.0`（2026-10-10） |
-| `5.10.209-android12-9-00019-g4ea09a298bb4-ab12292661` | Redmi K50 Ultra · Xiaomi 12T Pro | `diting` | **已端到端验证** —— Global `OS1.0.11.0` · `OS1.0.12.0` · `OS2.0.1.0` · `OS2.0.2.0`（2026-10-10） |
+支持按内核家族划分，不按机型或具体构建逐一列举：
 
-Redmi K50 Ultra 的代号是 `diting`（SM8475 / 骁龙 8+ Gen 1）。**Xiaomi 12T Pro 是同一台设备**——
-同一个代号，三个零售名（也称 Redmi K50 至尊版）。它不是第二个移植。
+**5.10 · 5.15 · 6.1 · 6.6 · 6.12**
 
-据称可能共用同一构建、但**未经验证**的机型：
+只要内核属于以上家族且尚未修补 CVE-2026-43499，App 就可以从你自己的镜像文件尝试生成配置并运行。内置配置仅为通过独立验证的部分，未内置可以自行生成。
 
-| 机型 | 代号 | SoC | 与已验证机型相比 |
-|---|---|---|---|
-| Xiaomi 12S Ultra | `thor` | SM8475 | 同 SoC |
-| Xiaomi 12 | `cupid` | SM8450 | SoC 不同 |
-| Redmi Note 13 Pro 5G | `garnet` | SM7435 | SoC 不同 |
-| POCO X6 5G | `garnet` | SM7435 | SoC 不同 |
-| POCO F5 | `marble` | SM7475 | SoC 不同 |
-| Redmi Pad Pro | `dizi` / `ruan` | SM7435 | SoC 不同 |
+以上家族之外的内核目前没有对应的推导模板，不在支持范围内。
 
-均未实际运行过。其中只有 Xiaomi 12S Ultra 与已验证机型同 SoC；其余机型**可能需要单独的
-profile**——SoC 不同，预计不会搭载同一份经过认证的内核构建。
+## 快速开始
 
-本 fork 还从支持列表中**移除了 24 个上游内核**，因为本 fork 的 compact waiter 改动会破坏它们。
-完整表格（含这 24 个内核覆盖哪些机型）见
-[`docs/kernel_profiles/SUPPORTED_DEVICES_ZH.md`](docs/kernel_profiles/SUPPORTED_DEVICES_ZH.md)。
+1. 安装 APK 并打开 App。
+2. 首页会检查你的内核。
+3. 若显示受支持 / 配置已就绪，保持 App 在前台，点执行。
+4. 等到 `KernelSU ready`。`su` 在下次重启前可用。
 
-## 关于本 fork
+## 自行生成配置
 
-本仓库是 **[YuKongA/ghostlock-app](https://github.com/YuKongA/ghostlock-app)** 的 fork。
-上游支持 5.15 / 6.1 / 6.6 / 6.12——**5.10 不在其中**：既没有内置配置，偏移提取器也没有 5.10 的
-族条目。本 fork 补上了这一款，以及让它跑通所必需的几处修复。
+> [!WARNING]
+配置文件的部分字段来自于本机实测，不要为当前运行内核之外的任何其他内核生成配置文件。
 
-**关于 App 本身——使用方法、偏移提取器、配置 schema、移植指南——请阅读
-[上游 README](https://github.com/YuKongA/ghostlock-app/blob/main/README_ZH.md)。**
-本页只说明移植改了什么、以及已经验证到什么程度。
+1. 记下确切的系统版本。
+2. 高通机型：取得同一OS版本的 `boot.img`、`xbl_config.img`、`uefi.img`，联发科机型：取得同一OS版本的 `boot.img`、`vendor_boot.img`、`dtbo.img`（从完整 OTA 的 `payload.bin` ，或 fastboot 包提取），放到手机存储中。
+3. 打开 App，点首页的 **生成配置**：
 
-## 当前状态
+   <img src="docs/images/profile-generation/01-home.png" width="520" alt="首页的生成配置入口">
 
-已在**原厂、未打补丁的内核**上端到端验证通过——事先无 root，无任何插桩：
+4. 选择 **解析本地镜像**，再按手上的文件选择 **boot.img**（或 `payload.bin`）：
 
-| 阶段 | 结果 |
-|---|---|
-| W1 — SELinux 改为 permissive | 通过 |
-| W2 — 子进程凭据覆写（`child uid = 0` → `child is root!`） | 通过 |
-| W3 — 绕过 seccomp 过滤器 | 通过 |
-| 交接 — root 脚本以 `uid=0` 运行、KernelSU 加载、SELinux 恢复 enforcing | 通过，`native exited code=0` |
+   | 选择来源 | 选择镜像类型 |
+   |---|---|
+   | <img src="docs/images/profile-generation/02-source.png" width="360"> | <img src="docs/images/profile-generation/03-image-type.png" width="360"> |
 
-单次启动内连续多次运行同样稳定：**连续 8 次运行全部完成，无死机、无重启**。此前终结多轮系列的两个
-原因均已修复——anchor 槽位跨进程复用
-（[`anchor-slot-persistence-plan.md`](docs/analysis/anchor-slot-persistence-plan.md)），以及
-`init_cred` 被已 root 的子进程释放
-（[`init-cred-lifetime-plan.md`](docs/analysis/init-cred-lifetime-plan.md)）。
+5. 按提示附加平台镜像（不建议跳过，物理地址可能不准）：
+   - 高通：`xbl_config.img`；若物理地址仍缺，再附加 `uefi.img`。
+   - 联发科：`vendor_boot.img`；若偏移仍缺，再附加 `dtbo.img`。
 
-root 是**临时的**。KernelSU 由漏洞利用现场 late-load，因此重启即失效；全程 bootloader 保持
-解锁。重新上锁（会清空数据）是后续独立步骤，目前尚未执行。
+   <img src="docs/images/profile-generation/04-physical.png" width="420" alt="高通机型的 xbl_config 提示">
 
-### KernelSU 交接
+6. 如果 App 询问 **多条路线均可用，请选择一条**，按行内说明选择；右侧是**路线本身**的
+   建议等级（与内核型号无关），没有依据时显示“未测量”：
 
-无论哪种情况，整条链都会跑完并交接；**KernelSU 模块**最终能否加载，取决于能否找到
-**支持 late-load 的 `ksud`**。App 会从已安装且被它识别的管理器中复制一个——`me.weishu.kernelsu`
-（KernelSU）、`me.weishu.kernelsu.pr`（KernelSU-Next）、`com.resukisu.resukisu`（ReSukiSU）、
-`com.kowx712.supermanager`——到自己的 files 目录，root 脚本优先使用这份副本。已验证的组合是
-**ReSukiSU**（`com.resukisu.resukisu`）：
+   <img src="docs/images/profile-generation/05-route.png" width="420" alt="路线选择">
 
-```
-[ksu] [*] ksud=/data/user/0/com.ghostlock.app/files/ksud
-[ksu] [+] KernelSU module loaded
-[+] KernelSU ready
-```
+7. 如果 App 询问免页面方案，按行内说明选择。每一行都写明了锚点与取值的区域，危险的
+   三星串口区域会单独标注：
 
-不在该列表中的管理器——例如更早用过的 `com.sukisu.ultra`——不会被匹配，脚本会回退到
-`/data/adb/ksu/bin/ksud`，其中部分构建没有 `late-load` 子命令，模块因此不会加载。把一个
-**支持 late-load 的 `ksud`**（可执行文件）放到 **`/data/local/tmp/ksud`** 同样会被采用；
-按 KernelSU 的 LKM 设计，该二进制内部自带 `kernelsu.ko`，无需另放模块文件。
+   <img src="docs/images/profile-generation/06-plan.png" width="420" alt="免页面锚点空间选择">
 
-### 未修复的回归——除 5.10 机型外，使用本 fork 前请先读这一段
+8. 若出现 **Slab 跨度**，选择标有“已确认”或“结果一致”的值；也可以跳过，之后用主页的
+   测量数据合并：
 
-**本 fork 破坏了上游 24 个内置配置。** 这是本 fork 自身的缺陷，而非 GhostLock 的问题——上游对这些
-机型的支持一切正常，本仓库不会影响上游。
+   <img src="docs/images/profile-generation/07-stride.png" width="420" alt="Slab 跨度选择">
 
-让 compact waiter 在 5.10 上工作的那处改动，位于与所有内核族共用的代码路径上，因此**19 个内置
-6.1 配置与 5 个内置 5.15 配置**现在会把 waiter 的优先级写进错误的字段。各内核对 waiter 布局的定义
-并不一致——5.10 的 `int prio` 位于 `0x40`，而 5.15 与 6.1 的 `unsigned int wake_state` 位于 `0x40`、
-`int prio` 位于 `0x44`——而本 fork 无条件地按 5.10 的写法写入。
+9. **导出**配置，再选择使用。生成的配置未保存退出会消失。
 
-6.6 与 6.12 不受影响（它们不使用 compact waiter）。这 24 个内核所覆盖的机型见
-[`docs/kernel_profiles/SUPPORTED_DEVICES_ZH.md`](docs/kernel_profiles/SUPPORTED_DEVICES_ZH.md)，
-完整分析与修复方案见
-[`docs/analysis/waiter-layout-family-gating-plan.md`](docs/analysis/waiter-layout-family-gating-plan.md)。
-**在该问题修复之前，请勿用本 fork 为 5.15 或 6.1 设备构建。**
+## 如果运行失败
 
-## 移植改动了什么
+- **重启后重试。** 全新启动是最有效的手段；每次重启仅尝试一次。
+- **看方案/路线选择**（如果 App 询问过）每个选项都有可能产生不同的成功率。
+- **导出日志** 并附在 issue 中。同时提交配置文件生成的日志和执行攻击的日志。
 
-路线为 **`select_stack`**（pselect 路径），`waiter_shift = -2`，使用 5.10 的 **compact**
-waiter —— 10 字布局
-`{tree_entry, pi_tree_entry, task, lock, int prio, u64 deadline, ww_ctx}`。该几何由 `boot.img`
-静态推导，并用 kprobe 在设备上实测确认（waiter 与 `stack_fds` 缓冲区落在同一栈地址，delta 为 0）。
+## 成功率改善的原理
 
-配置之外，链路改动如下：
+漏洞利用有很多环节，每个环节的失误都会降低全链路成功率。这个分支优化了以下环节：
 
-| commit | 改动 |
-|---|---|
-| `6c8b18a` | 在 5.x 内核上关闭 ghost；运行日志改为行缓冲 |
-| `c1b8569` | 让受害进程的协议 fd 避开 select 路线的 fd 区间 |
-| `765b137` | 快照并恢复 select 路线 `dup2` 过程覆盖的每一个 fd |
-| `9acf2f1` | 零值写入改由 erase 的 collateral 完成（5.10 leaf 布局） |
-| `a703604` | 让 `lock_anchor_image` 从配置文档一路传到 wire |
-| `6e70e8c` | 移植计划与分析文档 |
-| `0f76309` | 让 anchor 区域的槽位安全、按批预留并按配置尺寸划分 |
-| `75f64c1` | 说明 W2 校验器为何放弃 |
-| `30f0c14` | 让 `init_cred` 在整个启动周期内存活（cred pin） |
-| `55f3413` | 从内核镜像推导 lock anchor 区域（`--anchor-scan`） |
-| `f08c49c` | cred pin 改为重试，且不再因它让整次运行失败 |
+1. **主要路线不再依赖于"喷射内存页"。** 旧路线泄漏一个页，释放并用受控内容回收，然后祈祷分配器交回同一页；页面被回收会直接造成死机。现在写入用的锁位于内核中一块固定的全零区域，运行直接使用固定的内核区域。（`tcp_zerocopy` 路线除外。）
+2. **配置生成时更多使用可测量的事实。** App 更多基于事实填充配置文件，仅在无事实可用时基于经验填充。
+   过去"关键字段差几个字节"的配置会在链路中途失败；这一类失败被消除了。
+3. **更老的 5.10 内核也有适配的路线。** 两条额外路线覆盖默认路线够不到的内核：一条面向旧
+   5.10 布局的路径，以及一个用于 5.10.43 / 5.10.81 / 5.10.101 的 32 位小助手——
+   这些内核的栈布局超出了 64 位路线的覆盖范围。
+4. **攻击失败后清理留下的垃圾。** 上一次失败留下的内核状态会干扰下一次尝试。App 在每次尝试
+   后解除残留状态并重试早期阶段，一次失败不会拖垮整次运行。
+5. **不会无限尝试。** 过去一条永远不会结束的内核遍历会让 App 无限等待。现在无法完成的阶段
+   会停止并报告停在哪一步。
+6. **基于日志的迭代。** App 尽力以最小延迟记录日志并支持导出。
 
-后两处 fd 修复是「写入能落地」与「整条链跑通」的分界：在此之前，路线的 `dup2` 过程会静默销毁
-长期存活的描述符，导致 W2 的受害子进程在写入落地前一轮就看到 EOF 退出。
+## 致谢
 
-## 复现步骤
-
-配置文件**不是**内置资源，而是以用户文档方式导入。
-
-1. 在主机上提取。物理加载地址来自引导程序自身的镜像——高通用 `--xbl-config`（或 `--uefi`），
-   联发科用 `--vendor-boot`/`--dtbo`——或用 `--phys` 显式给出；两者都没有时，profile 留空，
-   由 native 的编译默认值生效。工具**不再读取** `/proc/iomem`：
-
-   ```sh
-   ghostlock-extract boot.img --phys 0xa8000000 --format conf --out profile.conf
-   ```
-
-   加 `--explain` 会把每个键的事实表（值、domain、source、confidence）打到 stderr；
-   profile 输出保持不变。
-
-2. 在 App 中导入：**配置参数 → 导入 offsets.conf（v2）**。导入的用户文档优先于内置配置。
-3. 用 root shell 设置 `settings_enable_monitor_phantom_procs = false`。否则 Android 的
-   phantom-process 清理机制会在运行中途 SIGKILL 掉 native 进程（272 个 spray 子进程远超平台上限），
-   其现象与漏洞利用失败无法区分。该设置需要 `WRITE_SECURE_SETTINGS`，`adb shell` 无法写入。
-4. 运行。
-
-profile 与具体的内核构建一一对应，请按上述步骤为自己的设备提取，而不要直接复用它人的文件——
-各构建的取值并不相同，不匹配会在 W1 阶段失败。
-
-## 目录
-
-- [`docs/analysis/`](docs/analysis/) —— 本移植的设计笔记与分析，包括上文所述的回归问题。
-- [`docs/kernel_profiles/`](docs/kernel_profiles/) —— 上游的移植指南与配置 schema，未改动。
-
-## 反馈问题
-
-请开 issue —— <https://github.com/Haoyu-UT/ghostlock-app-diting/issues/new/choose>。表单会要一张
-**设置 → 关于手机 → 全部参数与信息** 的截图（记得向下滚动）：里面有你的内核版本和 ROM 渠道，
-排查就是从这里开始的。每次运行后日志都会自动归档，通常只差选一次文件。
-
-先核对 `uname -r` —— **内核不同不是 bug**，而是本移植从未为其推导过的设备。见[支持的设备](#支持的设备)。
-
-## 致谢与许可
-
-本仓库是 [YuKongA/ghostlock-app](https://github.com/YuKongA/ghostlock-app) 的 fork，
-采用 Apache License 2.0（见 [LICENSE](LICENSE)）。上游另致谢：
+本仓库是 [YuKongA/ghostlock-app](https://github.com/YuKongA/ghostlock-app) 的分支，
+采用 Apache License 2.0。上游另致谢：
 
 - [NebuSec/CyberMeowfia](https://github.com/NebuSec/CyberMeowfia)
 - [JoinChang/ghostlock-oneplus](https://github.com/JoinChang/ghostlock-oneplus)
 - [x-spy/CVE-2026-43499-popsicle](https://github.com/x-spy/CVE-2026-43499-popsicle)
+
+App 还使用了 [miuix](https://github.com/compose-miuix-ui/miuix)、
+[Shizuku](https://github.com/RikkaApps/Shizuku)、
+[Typesafe Config](https://github.com/lightbend/config) 与 Apache Commons Compress。
+diting 5.10 的偏移最初参考了 OPPO Reno10 Pro+（CPH2521）。
+
+## 许可
+
+Apache License 2.0——见 [LICENSE](LICENSE)。root 是临时的、概率性的。内置配置文件基于实机或模拟器验证，以实际运行结果为准。使用本软件的风险由使用者自行承担。
