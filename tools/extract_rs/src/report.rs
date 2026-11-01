@@ -1501,11 +1501,13 @@ mod tests {
        
             phys_source: "test",
         });
+        /* The r8 bundle dropped its 5.15 assets; this is the hardware-validated
+         * profile as it shipped before the drop, kept as the rendering oracle. */
         let bundled = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../app/src/main/assets/kernel_profiles/5.15.189-android13-8-00016-g51bba4309aac-ab14546557.conf"
+            "/tests/fixtures/5.15.189-android13-8-00016-g51bba4309aac-ab14546557.conf"
         ))
-        .expect("bundled 5.15.189 profile");
+        .expect("the 5.15.189 rendering fixture");
         let generated = flatten_conf(&generated);
         let bundled = flatten_conf(&bundled);
 
