@@ -9,6 +9,7 @@
 #include "profile/model.h"
 
 #include <cassert>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 
@@ -30,6 +31,7 @@ namespace {
 
 int main() {
     using ghostlock::kernel::KIMAGE_TEXT_BASE;
+    using ghostlock::kernel::P0_KERNEL_PHYS_LOAD;
     using ghostlock::kernel::P0_PAGE_OFFSET;
     using ghostlock::kernel::P0_PHYS_OFFSET;
 
@@ -66,6 +68,21 @@ int main() {
         ghostlock::profile::TargetProfile profile(transport);
         ResolvedAddresses addresses;
         assert(addresses.init_for_soc(&profile, SocFamily::Qcom) == 0);
+        assert(addresses.phys_offset == P0_PHYS_OFFSET);
+    }
+
+    /* MTK without a bootloader-derived pair is refused: the compiled MTK
+     * default is not a witness (0x40000000, 0x40080000/+0x40000000 and
+     * 0x80000000 are all in the sampled fleet). Qualcomm keeps its default. */
+    {
+        const auto transport = make_transport(0x1000, std::nullopt, std::nullopt);
+        ghostlock::profile::TargetProfile profile(transport);
+        ResolvedAddresses addresses;
+        errno = 0;
+        assert(addresses.init_for_soc(&profile, SocFamily::Mtk) == -1);
+        assert(errno == EINVAL);
+        assert(addresses.init_for_soc(&profile, SocFamily::Qcom) == 0);
+        assert(addresses.phys_load() == P0_KERNEL_PHYS_LOAD);
         assert(addresses.phys_offset == P0_PHYS_OFFSET);
     }
 

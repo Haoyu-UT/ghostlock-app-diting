@@ -1,16 +1,59 @@
 package com.ghostlock.app.domain.model
 
 import com.ghostlock.app.data.OptionSuperset
+import java.util.Locale
 
 data class CpuPair(val primary: Int, val consumer: Int) {
     override fun toString(): String = "$primary,$consumer"
 }
+
+/**
+ * The profile's CPU hint, accepted only when it names one of the device's own
+ * candidate pairs. A hint from another device (8/9 on an 8-core phone, a
+ * negative value, or a value that overflows an Int) is ignored rather than
+ * displayed or acted on; the session pair remains the only pinning input.
+ */
+internal fun customCpuPairHint(
+    primary: Long,
+    consumer: Long,
+    candidates: List<CpuPair>,
+    devicePair: CpuPair?,
+): CpuPair? {
+    if (primary !in 0L..Int.MAX_VALUE.toLong() || consumer !in 0L..Int.MAX_VALUE.toLong()) return null
+    val pair = CpuPair(primary.toInt(), consumer.toInt())
+    return pair.takeIf { it in candidates && it != devicePair }
+}
+
+/** True when the runtime SoC string names a MediaTek part. */
+internal fun isMediaTekSoc(socName: String): Boolean {
+    val soc = socName.lowercase(Locale.ROOT)
+    return soc.contains("mediatek") || soc.contains("mtk") ||
+        /* ro.soc.model / ro.board.platform are `MTxxxx` on MediaTek; mirror the
+         * native detector's prefix rule. */
+        soc.startsWith("mt") ||
+        soc.contains("dimensity") || soc.contains("helio")
+}
+
+/**
+ * Whether the resolved physical pair may be used on this device.
+ *
+ * A profile-supplied pair is always usable. A missing pair falls back to the
+ * compiled platform default only on platforms where that default has a track
+ * record (Qualcomm's per-generation KernelBaseAddr). MediaTek has no reliable
+ * compiled default -- the sampled fleet uses 0x40000000, 0x40080000/+0x40000000
+ * and 0x80000000 -- so an MTK device without a bootloader-derived pair is not
+ * runnable; it must supply vendor_boot/dtbo and re-parse.
+ */
+internal fun physicalPairUsable(socName: String, pairKnown: Boolean): Boolean =
+    pairKnown || !isMediaTekSoc(socName)
 
 data class KernelSnapshot(
     val deviceName: String,
     val kernelRelease: String,
     val socName: String = "",
     val kernelSupported: Boolean,
+    /** The kernel is known but its physical layout is missing on this MTK device. */
+    val devicePairMissing: Boolean = false,
     val cpuPairs: List<CpuPair>,
     val cpuPairLabels: List<String>,
     val selectedCpuPair: Int,
@@ -284,6 +327,9 @@ data class ProfileConfig(
      * demand rather than cached, so it needs the pair the caller resolved with.
      */
     val pair: CpuPair = CpuPair(0, 0),
+    /** Resolved physical pair; null when the profile carries none for this device. */
+    val physLoad: Long? = null,
+    val physOffset: Long? = null,
     /** Layer state of this resolution; null when nothing resolved. */
     val layers: ProfileLayers? = null,
     /** Hierarchical view of every numeric leaf, override flags included. */

@@ -19,6 +19,12 @@ pub struct Meta {
     pub release: String,
     pub corpus: Option<String>,
     pub phys: Option<u64>,
+    /// Phone codename the entry's sidecars belong to; drives the --device cut.
+    /// This is the primary device (the first of [devices]).
+    pub device: Option<String>,
+    /// Every device sidecar set under `devices/<codename>/`, in meta order.
+    /// Empty on a legacy root-sidecar entry.
+    pub devices: Vec<String>,
     pub image: Option<PathBuf>,
 }
 
@@ -46,6 +52,8 @@ pub fn parse_meta(dir: &Path) -> Option<Meta> {
     let mut release = None;
     let mut corpus = None;
     let mut phys = None;
+    let mut device = None;
+    let mut devices: Vec<String> = Vec::new();
     let mut image = None;
     for line in text.lines() {
         let line = line.trim();
@@ -60,6 +68,13 @@ pub fn parse_meta(dir: &Path) -> Option<Meta> {
             "release" => release = Some(value.trim_matches('"').to_string()),
             "corpus" => corpus = Some(value.to_string()),
             "phys" => phys = parse_phys(value),
+            "device" => device = Some(value.trim_matches('"').to_string()),
+            "devices" => devices.extend(
+                value
+                    .split(',')
+                    .map(|part| part.trim().trim_matches('"').to_string())
+                    .filter(|part| !part.is_empty()),
+            ),
             "image" => image = Some(dir.join(value)),
             _ => {}
         }
@@ -83,11 +98,33 @@ pub fn parse_meta(dir: &Path) -> Option<Meta> {
             }
         }
     }
+    /* The directory shape is authoritative too: an entry migrated to
+     * `devices/<codename>/` but whose meta has not gained the `devices` line
+     * still runs every device set. */
+    if devices.is_empty() {
+        if let Ok(entries) = std::fs::read_dir(dir.join("devices")) {
+            let mut names: Vec<String> = entries
+                .flatten()
+                .filter(|entry| entry.path().is_dir())
+                .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+                .collect();
+            names.sort();
+            devices = names;
+        }
+    }
+    if let Some(primary) = &device {
+        if !devices.iter().any(|name| name.eq_ignore_ascii_case(primary)) {
+            devices.insert(0, primary.clone());
+        }
+    }
+    let device = device.or_else(|| devices.first().cloned());
     Some(Meta {
         dir: dir.to_path_buf(),
         release,
         corpus,
         phys,
+        device,
+        devices,
         image,
     })
 }
@@ -154,10 +191,22 @@ pub struct Run {
     pub args: Vec<String>,
 }
 
-fn build_command(bin: &str, meta: &Meta) -> Command {
+/// The sidecar directory for one device: `devices/<codename>/` when it exists,
+/// else the entry root (a legacy or not-yet-migrated single set).
+pub fn sidecar_dir_for(meta: &Meta, device: Option<&str>) -> PathBuf {
+    if let Some(device) = device {
+        let path = meta.dir.join("devices").join(device);
+        if path.is_dir() {
+            return path;
+        }
+    }
+    meta.dir.clone()
+}
+
+fn build_command(bin: &str, meta: &Meta, sidecar_dir: &Path) -> Command {
     let mut command = Command::new(bin);
     command.arg(meta.image());
-    let sidecars = sidecar_args(&meta.dir);
+    let sidecars = sidecar_args(sidecar_dir);
     if sidecars.is_empty() {
         if let Some(phys) = meta.phys {
             command.arg("--phys").arg(format!("0x{phys:x}"));
@@ -176,8 +225,87 @@ pub fn options_path(meta: &Meta) -> PathBuf {
 /// Run the maximal invocation: every sidecar, `--options-out <out>`, and a
 /// temporary conf profile. The route is left unforced, so an ambiguous image
 /// exits 7 after writing the document.
+///
+/// An entry with `devices/<codename>/` sets runs the extractor once per device
+/// and merges the per-device derivations into one superset: the first device's
+/// run supplies the shared top-level sections, and `devices[]` collects all.
 pub fn run_options(bin: &str, meta: &Meta, out: &Path) -> Run {
-    let mut command = build_command(bin, meta);
+    if meta.devices.is_empty() {
+        return run_options_one(bin, meta, &meta.dir, None, out);
+    }
+    let mut base: Option<serde_json::Value> = None;
+    let mut merged: Vec<serde_json::Value> = Vec::new();
+    let mut last: Option<Run> = None;
+    for device in &meta.devices {
+        let dir = sidecar_dir_for(meta, Some(device));
+        let stem = out
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("options.json");
+        let tmp = out.with_file_name(format!("{stem}.{device}.tmp"));
+        let run = run_options_one(bin, meta, &dir, Some(device), &tmp);
+        let ok = matches!(run.exit, Some(0) | Some(7));
+        if !ok || !tmp.is_file() {
+            let _ = std::fs::remove_file(&tmp);
+            return run;
+        }
+        let text = std::fs::read_to_string(&tmp).unwrap_or_else(|err| {
+            panic!("{}: cannot read {device} superset: {err}", meta.release)
+        });
+        let _ = std::fs::remove_file(&tmp);
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|err| {
+            panic!("{}: invalid {device} superset JSON: {err}", meta.release)
+        });
+        let entries = value
+            .get("devices")
+            .and_then(|entries| entries.as_array())
+            .cloned()
+            .unwrap_or_default();
+        merged.extend(entries);
+        match &base {
+            None => base = Some(value),
+            Some(base_value) => {
+                for key in ["release", "kernel_major", "routes"] {
+                    assert_eq!(
+                        base_value.get(key),
+                        value.get(key),
+                        "{}: superset section {key:?} differs between devices",
+                        meta.release
+                    );
+                }
+                /* The `w1_scratch` and top-level phys are pair-dependent; every
+                 * other common block is image-level and must agree. */
+                if let (Some(a), Some(b)) = (
+                    base_value.get("profile").and_then(|v| v.as_object()),
+                    value.get("profile").and_then(|v| v.as_object()),
+                ) {
+                    for (block, entries) in a {
+                        if block.is_empty() || block == "w1_scratch" {
+                            continue;
+                        }
+                        assert_eq!(
+                            Some(entries),
+                            b.get(block),
+                            "{}: profile block {block:?} differs between devices",
+                            meta.release
+                        );
+                    }
+                }
+            }
+        }
+        last = Some(run);
+    }
+    let mut base = base.expect("at least one device");
+    if !merged.is_empty() {
+        base["devices"] = serde_json::Value::Array(merged);
+    }
+    let text = serde_json::to_string_pretty(&base).expect("serialize merged superset");
+    std::fs::write(out, text + "\n").expect("write merged superset");
+    last.expect("at least one device run")
+}
+
+fn run_options_one(bin: &str, meta: &Meta, sidecars: &Path, device: Option<&str>, out: &Path) -> Run {
+    let mut command = build_command(bin, meta, sidecars);
     let profile = out.with_extension("conf.tmp");
     command
         .arg("--format")
@@ -186,6 +314,9 @@ pub fn run_options(bin: &str, meta: &Meta, out: &Path) -> Run {
         .arg(&profile)
         .arg("--options-out")
         .arg(out);
+    if let Some(device) = device {
+        command.arg("--device").arg(device);
+    }
     let args: Vec<String> = command
         .get_args()
         .map(|arg| arg.to_string_lossy().into_owned())
@@ -203,13 +334,23 @@ pub fn run_options(bin: &str, meta: &Meta, out: &Path) -> Run {
 /// The CLI's default conf render for a route: `--anchor` with no operator
 /// flags, which follows the same auto plan as the cut.
 pub fn run_auto_conf(bin: &str, meta: &Meta, route: &str) -> Run {
-    let mut command = build_command(bin, meta);
+    let device = meta.device.clone().or_else(|| meta.devices.first().cloned());
+    run_auto_conf_for(bin, meta, route, device.as_deref())
+}
+
+/// The CLI's default conf render for one explicit device sidecar set.
+pub fn run_auto_conf_for(bin: &str, meta: &Meta, route: &str, device: Option<&str>) -> Run {
+    let dir = sidecar_dir_for(meta, device);
+    let mut command = build_command(bin, meta, &dir);
     command
         .arg("--format")
         .arg("conf")
         .arg("--route")
         .arg(route)
         .arg("--anchor");
+    if let Some(device) = device {
+        command.arg("--device").arg(device);
+    }
     let args: Vec<String> = command
         .get_args()
         .map(|arg| arg.to_string_lossy().into_owned())
@@ -226,7 +367,8 @@ pub fn run_auto_conf(bin: &str, meta: &Meta, route: &str) -> Run {
 /// The no-disassembly control for one route (negative test for a foreign
 /// family constant leaking into another family's profile).
 pub fn run_no_disasm(bin: &str, meta: &Meta, route: &str) -> Run {
-    let mut command = build_command(bin, meta);
+    let dir = sidecar_dir_for(meta, meta.device.as_deref());
+    let mut command = build_command(bin, meta, &dir);
     command
         .arg("--format")
         .arg("conf")

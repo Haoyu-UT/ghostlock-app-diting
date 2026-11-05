@@ -160,14 +160,17 @@ internal class UserProfileStore(
         if (entries.isEmpty()) return null
         entries.forEach {
             LegacyProfileConverter.convertValue(it)
-            /* Exports are v2: the conversion has seeded any v1 gap, and the
-             * marker keeps a re-import from being seeded again. */
-            it["schema_version"] = 1
+            /* A schema-v2 physical map is the device-scoped pair; preserve it
+             * instead of flattening the export back to the v1 marker. */
+            it["schema_version"] = if (hasPhysMaps(it)) 2 else 1
         }
         return HoconSupport.render(
             if (entries.size == 1) entries.first() else ValueList().apply { addAll(entries) },
         )
     }
+
+    private fun hasPhysMaps(entry: ValueMap): Boolean =
+        entry["kernel_phys_load"] is Map<*, *> || entry["kernel_phys_offset"] is Map<*, *>
 
     /** Filename (and base name) to verbatim text, for include resolution. */
     fun documents(): Map<String, String> {

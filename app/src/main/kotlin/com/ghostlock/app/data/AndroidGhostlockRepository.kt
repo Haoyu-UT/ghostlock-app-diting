@@ -6,6 +6,7 @@ import android.content.Context
 import android.os.Build
 import android.provider.MediaStore
 import android.system.Os
+import android.util.Log
 import androidx.core.content.edit
 import androidx.core.net.toUri
 import com.ghostlock.app.BuildConfig
@@ -16,11 +17,13 @@ import com.ghostlock.app.domain.model.ExternalProfileInfo
 import com.ghostlock.app.domain.model.KernelSnapshot
 import com.ghostlock.app.domain.model.LegacyProfileState
 import com.ghostlock.app.domain.model.physSourceFromLines
+import com.ghostlock.app.domain.model.physicalPairUsable
 import com.ghostlock.app.domain.model.MeasuredFactInfo
 import com.ghostlock.app.domain.model.MeasuredKernelInfo
 import com.ghostlock.app.domain.model.MeasurementMergeRow
 import com.ghostlock.app.domain.model.OffsetCandidate
 import com.ghostlock.app.data.ota.OtaPayloadExtractor
+import com.ghostlock.app.data.profile.PerDevicePhys
 import com.ghostlock.app.domain.model.OffsetImportResult
 import com.ghostlock.app.domain.model.ParseResult
 import com.ghostlock.app.domain.model.ProfileConfig
@@ -194,11 +197,24 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         val recommendShizuku = release in builtinProfiles.recommendShizuku ||
             importedOffsetsRecommendShizuku(release)
         val shizukuActive = if (shizukuPreferenceSet) shizukuEnabled else recommendShizuku
+        val socName = resolveSocName()
+        val kernelKnown = isKernelSupported()
+        /* A known kernel is not enough on MediaTek: the compiled pair there is
+         * wrong on most of the fleet, so the resolved profile must carry the
+         * bootloader-derived pair (from the device map or the parse flow). */
+        val profile = if (kernelKnown) {
+            runCatching { profileController.load(release, currentPairOrZero()) }.getOrNull()
+        } else {
+            null
+        }
+        val pairKnown = profile?.physLoad != null && profile.physOffset != null
+        val usable = kernelKnown && physicalPairUsable(socName, pairKnown)
         return KernelSnapshot(
             deviceName = resolveDeviceName(),
             kernelRelease = release,
-            socName = resolveSocName(),
-            kernelSupported = isKernelSupported(),
+            socName = socName,
+            kernelSupported = usable,
+            devicePairMissing = kernelKnown && !usable,
             cpuPairs = cpuPairs.toList(),
             cpuPairLabels = cpuPairLabels.toList(),
             selectedCpuPair = selectedCpuPair,
@@ -348,6 +364,21 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             parsedFile.delete()
             feasibleFile.delete()
             optionsFile.delete()
+            /* The profile is generated for this phone. The v2 map key is the
+             * first non-generic identity (Build.DEVICE, then the vendor, then
+             * the boot image). When every identity is a mainline/vendor
+             * placeholder there is no unique codename: write the legacy v1
+             * all-device form instead of inventing a device key. */
+            val deviceKey = DeviceIdentity.uniqueProfileKey()
+            val deviceCandidates =
+                DeviceIdentity.candidates(Build.DEVICE, DeviceIdentity.aliases())
+            if (deviceKey == null) {
+                onLog(
+                    "identity: all candidates are generic " +
+                        "(${deviceCandidates.joinToString(", ")}); " +
+                        "writing a v1 all-device profile",
+                )
+            }
             val args = buildList {
                 add(effectiveInput)
                 if (effectiveXblPath != null) {
@@ -365,6 +396,10 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 if (dtboPath != null) {
                     add("--dtbo")
                     add(dtboPath)
+                }
+                if (deviceKey != null) {
+                    add("--device")
+                    add(deviceKey)
                 }
                 /* --format conf: the extractor output is already the flattened
                  * profile (no includes, credential template inlined), so the
@@ -457,7 +492,10 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 .filter { (it["release"] as? String).orEmpty().isNotEmpty() }
             if (filtered.isEmpty()) return ParseResult.AlreadyPresent
             val releases = freshReleases(filtered)
-            val missing = missingSidecarFields(filtered)
+            /* A v2 document carries the pair as a per-device map; the presence
+             * checks must see this device's entry, not `getLongAt` on a map. */
+            val resolved = filtered.map { resolvedForDevice(it, deviceCandidates) }
+            val missing = missingSidecarFields(resolved)
             val name = parsedDocumentName(releases)
             ParseResult.Parsed(
                 releases = releases,
@@ -467,8 +505,8 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 anchor = anchorLine(captured),
                 hasAnchor = document.contains("lock_anchor_image"),
                 physSource = physSourceFromLines(captured),
-                physLoadPresent = filtered.any { it.getLongAt("kernel_phys_load") != null },
-                physOffsetPresent = filtered.any { it.getLongAt("kernel_phys_offset") != null },
+                physLoadPresent = resolved.any { it.getLongAt("kernel_phys_load") != null },
+                physOffsetPresent = resolved.any { it.getLongAt("kernel_phys_offset") != null },
                 documentText = document,
                 options = options,
             )
@@ -1151,11 +1189,17 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     override suspend fun writeProfileDocument(uri: String, text: String): Boolean =
         withContext(Dispatchers.IO) {
             runCatching {
-                appContext.contentResolver.openOutputStream(uri.toUri(), "wt")?.use { stream ->
-                    stream.write(text.toByteArray(StandardCharsets.UTF_8))
-                } ?: return@runCatching false
+                val resolver = appContext.contentResolver
+                val target = uri.toUri()
+                /* Some DocumentsProviders reject the "wt" mode even though the
+                 * file was created; "w" truncates too, so try it first. */
+                val stream = runCatching { resolver.openOutputStream(target, "w") }.getOrNull()
+                    ?: resolver.openOutputStream(target, "wt")
+                    ?: return@runCatching false
+                stream.use { it.write(text.toByteArray(StandardCharsets.UTF_8)) }
                 true
-            }.getOrDefault(false)
+            }.onFailure { Log.w("GhostLock", "profile write failed: $uri", it) }
+                .getOrDefault(false)
         }
 
     /* ---- editing session: in-memory, export-only ---- */
@@ -1285,10 +1329,13 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 overrides[release].asValueMap()?.let { applyLegacyOverride(entry, it) }
             }
         }
-        entries.forEach { it["schema_version"] = 1 }
+        entries.forEach { it["schema_version"] = if (hasPhysMaps(it)) 2 else 1 }
         val document = if (entries.size == 1) entries.first() else ValueList().apply { addAll(entries) }
         return HoconSupport.render(document)
     }
+
+    private fun hasPhysMaps(entry: ValueMap): Boolean =
+        entry["kernel_phys_load"] is Map<*, *> || entry["kernel_phys_offset"] is Map<*, *>
 
     override suspend fun finishLegacyCleanup(): Boolean = withContext(Dispatchers.IO) {
         runCatching {
@@ -1379,6 +1426,10 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
      * Fields a parsed profile still lacks that only an xbl_config FDT or uefi
      * memory map can fill. Used to prompt for the optional sidecars.
      */
+    /** Resolve a schema-v2 per-device pair for the running device, if present. */
+    private fun resolvedForDevice(entry: ValueMap, candidates: List<String>): ValueMap =
+        runCatching { PerDevicePhys.resolveFor(entry, candidates).document }.getOrDefault(entry)
+
     private fun missingSidecarFields(entries: List<ValueMap>): Set<String> =
         if (entries.isNotEmpty() && entries.all { it.getLongAt("kernel_phys_load") == null }) {
             setOf("kernel_phys_load")
@@ -1547,7 +1598,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         stdin: ByteArray? = null,
         frameStdin: Boolean = false,
         onProcess: ((Process) -> Unit)? = null,
-    ): Int = runInterruptible {
+    ): Int = runInterruptible(Dispatchers.IO) {
         val process = builder.start()
         synchronized(processes) { processes += process }
         if (stdin != null) {

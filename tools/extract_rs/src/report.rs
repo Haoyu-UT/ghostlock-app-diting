@@ -408,15 +408,23 @@ pub struct Stage1Conf {
 /// inlined, keys and nesting matching `app/src/main/assets/kernel_profiles/`.
 /// Fields without a derived value are omitted rather than written as `null`.
 pub fn render_conf(input: &ConfInputs<'_>) -> String {
+    render_conf_with_device(input, None)
+}
+
+/// Renders the profile with the physical pair keyed by `device` (schema v2).
+/// The option superset and every other render stay device-neutral; this is the
+/// cut/runnable form, and the app resolves the map for the running device.
+pub fn render_conf_with_device(input: &ConfInputs<'_>, device: Option<&str>) -> String {
     let release = input.release;
     let major = release
         .split('.')
         .next()
         .and_then(|part| part.parse::<u32>().ok());
+    let schema_version = if device.is_some() { 2 } else { 1 };
     let mut lines = vec![
         format!("# GhostLock kernel profile: {release} (HOCON, self-contained)."),
         format!("release = \"{release}\""),
-        "schema_version = 1".to_string(),
+        format!("schema_version = {schema_version}"),
         format!("kernel_major = {}", major.unwrap_or(0)),
         "recommend_shizuku = 0".to_string(),
     ];
@@ -497,18 +505,20 @@ pub fn render_conf(input: &ConfInputs<'_>) -> String {
             ));
         }
     }
+    if let Some(name) = device {
+        fact_sources.insert(0, format!("device={name}"));
+    }
     lines.insert(1, format!("# fact_sources: {}", fact_sources.join("; ")));
-    lines.push(match input.phys {
-        // Decimal only: HOCON has no `0x` literal, and the Kotlin reader
-        // (`getLongAt`) accepts a Number only, so a hex spelling would be
-        // silently dropped on import. An unknown phys is an explicit `null`.
-        Some(phys) => format!("kernel_phys_load = {phys}"),
-        None => "kernel_phys_load = null".to_string(),
-    });
-    lines.push(match input.phys_offset {
-        Some(offset) => format!("kernel_phys_offset = {offset}"),
-        None => "kernel_phys_offset = null".to_string(),
-    });
+    /* Decimal only: HOCON has no `0x` literal, and the Kotlin reader
+     * (`getLongAt`) accepts a Number only, so a hex spelling would be silently
+     * dropped on import. An unknown phys is an explicit `null`. */
+    let phys_line = |key: &str, value: Option<u64>| match (device, value) {
+        (Some(name), Some(v)) => format!("{key} = {{ {name} = {v} }}"),
+        (None, Some(v)) => format!("{key} = {v}"),
+        (_, None) => format!("{key} = null"),
+    };
+    lines.push(phys_line("kernel_phys_load", input.phys));
+    lines.push(phys_line("kernel_phys_offset", input.phys_offset));
     if let Some(route) = input.route {
         // The chosen route keeps its whole field universe even when no
         // geometry could be derived, so the import carries the recommendation
@@ -720,7 +730,7 @@ mod tests {
     use super::{
         CONF_TASK_FIELDS, ConfExtraOffsets, ConfInputs, build_report, conf_cred_5x, conf_cred_6x,
         conf_route_geometry, conf_route_geometry_with_sigreturn, pselect_waiter_shift_for,
-        render_conf,
+        render_conf, render_conf_with_device,
     };
     use crate::derive::Cred5x;
     use crate::fact::{Confidence, Domain, Fact, Source};
@@ -741,6 +751,35 @@ mod tests {
 
     fn no_extra_offsets() -> ConfExtraOffsets {
         ConfExtraOffsets::default()
+    }
+
+    #[test]
+    fn device_render_keys_the_physical_pair() {
+        let (symbols, structs) = conf_fixture();
+        let geometry: Vec<(&'static str, i64)> = vec![("waiter_shift", -2)];
+        let inputs = ConfInputs {
+            release: "5.10.198-android12-9-00085-g226a9632f13d-ab11136126",
+            phys: Some(0x4000_0000),
+            phys_offset: Some(0x4000_0000),
+            symbols: &symbols,
+            structs: &structs,
+            route: Some("select_stack"),
+            route_geometry: &geometry,
+            cred: &conf_cred_6x(),
+            extra_offsets: &no_extra_offsets(),
+            layouts: None,
+            stage1: None,
+            phys_source: "vendor_boot header (MediaTek)",
+        };
+        let device = render_conf_with_device(&inputs, Some("yunluo"));
+        assert!(device.contains("schema_version = 2"));
+        assert!(device.contains("kernel_phys_load = { yunluo = 1073741824 }"));
+        assert!(device.contains("kernel_phys_offset = { yunluo = 1073741824 }"));
+        assert!(device.contains("device=yunluo;"));
+        let neutral = render_conf(&inputs);
+        assert!(neutral.contains("schema_version = 1"));
+        assert!(neutral.contains("kernel_phys_load = 1073741824"));
+        assert!(!neutral.contains("device="));
     }
 
     #[test]

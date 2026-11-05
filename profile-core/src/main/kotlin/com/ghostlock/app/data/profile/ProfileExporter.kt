@@ -58,13 +58,16 @@ object ProfileExporter {
             /* Reference templates are not device profiles and are not exported. */
             if (release.endsWith("-template")) continue
             val parsed = parseFile(File(srcDir, file), srcDir) ?: error("cannot parse $file")
-            val actualRelease = parsed["release"] as? String ?: error("$file has no release")
+            /* The exporter is device-neutral: a schema-v2 physical map resolves
+             * to null here, exactly as it does on a device that is not listed. */
+            val resolved = PerDevicePhys.resolve(parsed, null)
+            val actualRelease = resolved["release"] as? String ?: error("$file has no release")
             require(actualRelease == release) { "index/file release mismatch for $file" }
-            val route = routeNameOf(parsed, routes)
-            val fallbackTo = fallbackOf(parsed)
+            val route = routeNameOf(resolved, routes)
+            val fallbackTo = fallbackOf(resolved)
             val merged = ProfileMerger.resolveMerged(
                 deviceRelease = actualRelease,
-                builtin = parsed,
+                builtin = resolved,
                 imported = null,
                 overrides = null,
                 tuningExecution = tuningExecution,

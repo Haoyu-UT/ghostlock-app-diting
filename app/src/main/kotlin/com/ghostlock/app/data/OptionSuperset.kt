@@ -57,6 +57,14 @@ data class OptionRoute(
     val geometry: Map<String, Long>,
 )
 
+/** One device sidecar set's physical derivation from the superset's `devices[]`. */
+data class OptionDevice(
+    val device: String,
+    val physLoad: Long?,
+    val physOffset: Long?,
+    val physSource: String,
+)
+
 data class RoutePlans(
     val route: String,
     val page: OptionPlan,
@@ -104,7 +112,13 @@ data class OptionSuperset(
     /** `profile[block][key]` from the route-less common render; values keep
      * their HOCON spelling (`"null"`, quoted strings, decimals). */
     val profile: Map<String, Map<String, String>>,
+    /** Every device derivation the extractor recorded (`--device`); empty on
+     * a legacy device-neutral pass. */
+    val devices: List<OptionDevice> = emptyList(),
 ) {
+    /** The device key this superset was generated for, when it has one. */
+    val device: String? get() = devices.firstOrNull()?.device
+
     fun route(name: String): OptionRoute? = routes.firstOrNull { it.route == name }
 
     fun plansFor(name: String): RoutePlans? = plans.firstOrNull { it.route == name }
@@ -114,13 +128,27 @@ data class OptionSuperset(
      * extractor) plus the selected route, anchor and scratch. No derivation
      * happens here.
      */
-    fun cut(route: String, plan: OptionPlan): String? {
+    fun cut(route: String, plan: OptionPlan, device: String? = null): String? {
         val routeOption = routes.firstOrNull { it.route == route && it.verdict == Feasible }
             ?: return null
         val top = profile[""] ?: return null
+        val selected = device?.let { name -> devices.firstOrNull { it.device.equals(name, true) } }
+            ?: devices.firstOrNull()
         val document = linkedMapOf<String, Any?>()
         for (key in TopLevelKeys) {
+            /* The physical pair is device-scoped: write the selected device's
+             * schema-v2 map instead of the common render's scalar. */
+            if (selected != null &&
+                (key == "schema_version" || key == "kernel_phys_load" || key == "kernel_phys_offset")
+            ) {
+                continue
+            }
             top[key]?.let { document[key] = literal(it) }
+        }
+        if (selected != null) {
+            document["schema_version"] = 2L
+            document["kernel_phys_load"] = selected.physLoad?.let { mapOf(selected.device to it) }
+            document["kernel_phys_offset"] = selected.physOffset?.let { mapOf(selected.device to it) }
         }
         val block = linkedMapOf<String, Any?>()
         routeOption.geometry.forEach { (key, value) -> block[key] = value }
@@ -201,6 +229,16 @@ data class OptionSuperset(
                         .mapNotNull { plan(it) },
                 )
             }
+            val devices = root["devices"].asValueList().orEmpty().mapNotNull { entry ->
+                val map = entry.asValueMap() ?: return@mapNotNull null
+                val device = map["device"] as? String ?: return@mapNotNull null
+                OptionDevice(
+                    device = device,
+                    physLoad = (map["kernel_phys_load"] as? Number)?.toLong(),
+                    physOffset = (map["kernel_phys_offset"] as? Number)?.toLong(),
+                    physSource = map["phys_source"] as? String ?: "unset",
+                )
+            }
             OptionSuperset(
                 release = root["release"] as? String ?: return@runCatching null,
                 kernelMajor = (root["kernel_major"] as? Number)?.toInt(),
@@ -210,6 +248,7 @@ data class OptionSuperset(
                 routes = routes,
                 plans = plans,
                 profile = profile,
+                devices = devices,
             )
         }.getOrNull()
 

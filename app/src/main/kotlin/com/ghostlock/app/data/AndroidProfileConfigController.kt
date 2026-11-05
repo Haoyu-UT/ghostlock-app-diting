@@ -6,6 +6,7 @@ import android.os.Build
 import androidx.core.content.edit
 import com.ghostlock.app.BuildConfig
 import com.ghostlock.app.data.profile.CpuPairView
+import com.ghostlock.app.data.profile.PerDevicePhys
 import com.ghostlock.app.data.profile.ProfileMerger
 import com.ghostlock.app.data.profile.ProfileResolver
 import com.ghostlock.app.data.route.RouteKind
@@ -37,12 +38,19 @@ internal class AndroidProfileConfigController(
     private val preferences: SharedPreferences,
     private val buildIdentity: String = BuildConfig.BUILD_IDENTITY,
     /**
-     * Device codename for the device-tuning preset. The measured route timing
-     * is a property of this phone, not of the kernel image, so a generated
-     * profile must not carry it; the app merges it here instead. Injectable so
-     * the host tests can pin it.
+     * Primary device identity (`Build.DEVICE`) used to look up `device_defaults`
+     * and the per-device physical maps. The measured route timing and the
+     * bootloader physical layout are properties of this phone, not of the
+     * kernel image; the profile carries null and the app resolves them here.
+     * Injectable so the host tests can pin it.
+     *
+     * `Build.DEVICE` is not always unique: on MediaTek mainline builds it can
+     * be the generic `missi` while the hardware codename is the vendor device
+     * (`spinel`). [deviceAliases] carries those fallback identities, tried in
+     * order after this one.
      */
     private val deviceCodename: String? = Build.DEVICE,
+    private val deviceAliases: List<String> = DeviceIdentity.aliases(),
     /** Live runs: empty. Editor sessions: their private in-memory map. */
     private val overrideStore: OverrideStore = EmptyOverrideStore,
     /** Pins the source for an editor session; null follows the stored choice. */
@@ -52,6 +60,8 @@ internal class AndroidProfileConfigController(
     private val assetLoader = AssetConfigLoader(appContext)
     private val lock = Any()
     private var forcedSelection: ProfileSelection? = forcedSelection
+    private val deviceCandidates: List<String> =
+        DeviceIdentity.candidates(deviceCodename, deviceAliases)
 
     override suspend fun load(release: String, pair: CpuPair): ProfileConfig {
         val overrides = activeOverrides(release)
@@ -87,6 +97,8 @@ internal class AndroidProfileConfigController(
             release = release,
             hasProfile = true,
             pair = pair,
+            physLoad = full.getLongAt("kernel_phys_load"),
+            physOffset = full.getLongAt("kernel_phys_offset"),
             layers = resolution.layers.copy(
                 uncarriedKeys = uncarriedRouteKeys(full, route),
             ),
@@ -439,6 +451,12 @@ internal class AndroidProfileConfigController(
         pair: CpuPair,
         extraValues: Map<String, Long>,
     ): String? {
+        /* Keep the selected document's schema-v2 physical maps for the export:
+         * the resolved view carries the running device's scalar pair, but the
+         * other devices' entries must survive and an edited value is written
+         * into the running device's entry. */
+        val selection = currentSelection(release)
+        val source = selection?.let { runCatching { loadSource(release, it).document }.getOrNull() }
         val resolved = resolve(release, pair, activeOverrides(release)).profile ?: return null
         val view = resolved.copyValue().asValueMap() ?: return null
         for ((path, value) in extraValues) view.setValueAt(path, value)
@@ -453,7 +471,49 @@ internal class AndroidProfileConfigController(
         view["execution"].asValueMap()?.remove("selected_cpus")
         fillRouteExecutionDefaults(view)
         trimRouteTuning(view)
+        if (source != null) injectPhysMaps(view, source)
+        if (view["kernel_phys_load"] !is Map<*, *> && view["kernel_phys_offset"] !is Map<*, *>) {
+            view["schema_version"] = 1
+        }
         return HoconSupport.render(view)
+    }
+
+    /**
+     * Restore the source's per-device physical maps into an export. The
+     * running device's entry takes the resolved value (the editor override or
+     * the source's own value); every other device key is preserved. A source
+     * field that is null stays null (the native default), and an edited value
+     * for a device the source did not carry adds its key.
+     */
+    private fun injectPhysMaps(view: ValueMap, source: ValueMap) {
+        val loadMap = source["kernel_phys_load"] as? Map<*, *>
+        val offsetMap = source["kernel_phys_offset"] as? Map<*, *>
+        if (loadMap == null && offsetMap == null) return
+        val matched = runCatching {
+            PerDevicePhys.resolveFor(source, deviceCandidates).device
+        }.getOrNull()
+        val key = matched ?: deviceCodename ?: deviceCandidates.firstOrNull()
+        view["schema_version"] = 2
+        view["kernel_phys_load"] = physMap(loadMap, key, view.getLongAt("kernel_phys_load"))
+        view["kernel_phys_offset"] = physMap(offsetMap, key, view.getLongAt("kernel_phys_offset"))
+    }
+
+    private fun physMap(sourceMap: Map<*, *>?, device: String?, value: Long?): Any? {
+        if (sourceMap == null) return null
+        val out = linkedMapOf<String, Any?>()
+        for ((rawName, rawValue) in sourceMap) {
+            val name = rawName as? String ?: continue
+            out[name] = rawValue
+        }
+        if (device != null) {
+            val existing = out.keys.firstOrNull { it.equals(device, ignoreCase = true) }
+            if (value != null) {
+                out[existing ?: device] = value
+            } else if (existing != null) {
+                out.remove(existing)
+            }
+        }
+        return out
     }
 
     /** Renders the resolved profile verbatim (no trimming) for debug dumps. */
@@ -697,13 +757,14 @@ internal class AndroidProfileConfigController(
         document: ValueMap,
         overrides: ValueMap?,
     ): ValueMap {
+        val resolvedDocument = PerDevicePhys.resolveFor(document, deviceCandidates).document
         val tuningExecution = readExecutionTuning()
         val routePresets = ProfileConfig.Routes
             .mapNotNull { route -> readExecutionRoute(route)?.let { route to it } }
             .toMap()
         return ProfileMerger.resolveMerged(
             deviceRelease = release,
-            builtin = document,
+            builtin = resolvedDocument,
             imported = null,
             overrides = overrides,
             tuningExecution = tuningExecution,
@@ -759,7 +820,8 @@ internal class AndroidProfileConfigController(
         val path = (entry["file"] as? String).orEmpty()
         val document = HoconSupport.parseValue(readAsset("$BuiltinDirectory/$path")).asValueMap()
             ?: error("profile is not an object")
-        require((document["schema_version"] as? Number)?.toInt() == 1) {
+        val documentSchema = (document["schema_version"] as? Number)?.toInt()
+        require(documentSchema == 1 || documentSchema == 2) {
             "unsupported profile schema"
         }
         require(document["release"] == entry["release"]) {
@@ -855,12 +917,7 @@ internal class AndroidProfileConfigController(
     internal fun readExecutionTuning(): ValueMap? = runCatching {
         val common = HoconSupport.parseValue(readAsset("$BuiltinDirectory/execution-tuning.conf"))
             .asValueMap()?.get("execution").asValueMap()
-        val devicePreset = if (isDitingDevice()) {
-            HoconSupport.parseValue(readAsset("$BuiltinDirectory/execution-diting.conf"))
-                .asValueMap()?.get("execution").asValueMap()
-        } else {
-            null
-        }
+        val devicePreset = readDeviceExecutionDefaults()
         when {
             common == null -> devicePreset
             devicePreset == null -> common
@@ -868,9 +925,22 @@ internal class AndroidProfileConfigController(
         }
     }.getOrNull()
 
-    /** The measured route timing belongs to this phone, not to a kernel. */
-    private fun isDitingDevice(): Boolean =
-        deviceCodename.equals("diting", ignoreCase = true)
+    /**
+     * The measured route timing belongs to this phone, not to a kernel. The
+     * table is data keyed by the device identities (Build.DEVICE first, then
+     * the vendor/boot-image aliases); a device without an entry gets the
+     * generic tuning from execution-tuning.conf.
+     */
+    private fun readDeviceExecutionDefaults(): ValueMap? = runCatching {
+        val entries = HoconSupport.parseValue(readAsset("$BuiltinDirectory/device_defaults.conf"))
+            .asValueMap()?.get("device_defaults").asValueMap() ?: return null
+        val entry = deviceCandidates.asSequence()
+            .mapNotNull { device ->
+                entries.entries.firstOrNull { it.key.equals(device, ignoreCase = true) }
+            }
+            .firstOrNull() ?: return null
+        entry.value.asValueMap()?.get("execution").asValueMap()
+    }.getOrNull()
 
     /** Creates null placeholders for invalid fields the document does not carry. */
     private fun materializeInvalidPaths(profile: ValueMap, invalidPaths: Set<String>) {

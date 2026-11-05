@@ -15,6 +15,7 @@ import com.ghostlock.app.data.RoutePlans
 import com.ghostlock.app.data.ScratchInAnchor
 import com.ghostlock.app.data.decision
 import com.ghostlock.app.domain.model.CpuPair
+import com.ghostlock.app.domain.model.customCpuPairHint
 import com.ghostlock.app.domain.model.ExternalProfileInfo
 import com.ghostlock.app.domain.model.KernelSnapshot
 import com.ghostlock.app.domain.model.LegacyProfileState
@@ -313,8 +314,12 @@ class GhostlockViewModel(
             .firstOrNull { it.path == "execution.selected_cpus.main" }?.value ?: return null
         val consumer = config.general
             .firstOrNull { it.path == "execution.selected_cpus.consumer" }?.value ?: return null
-        val pair = CpuPair(main.toInt(), consumer.toInt())
-        return pair.takeIf { it != snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) }
+        return customCpuPairHint(
+            main,
+            consumer,
+            snapshot.cpuPairs,
+            snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair),
+        )
     }
 
     /** Route edits are draft-only; saving the session commits them. */
@@ -1065,7 +1070,13 @@ class GhostlockViewModel(
         val snapshot = kernelSnapshot ?: return
         if (!snapshot.kernelSupported) {
             if (beginOperation()) {
-                appendLog("result: exploit chain unsupported by this kernel")
+                appendLog(
+                    if (snapshot.devicePairMissing) {
+                        "result: device physical layout missing; attach vendor_boot/dtbo (MediaTek) and re-parse"
+                    } else {
+                        "result: exploit chain unsupported by this kernel"
+                    },
+                )
                 endOperation()
             }
             return
@@ -1258,13 +1269,13 @@ class GhostlockViewModel(
                     /* Page-based: the lock-source choice still applies when a
                      * safe anchor exists. */
                     if (plans.anchorOnly != null && showLockDialog(parse)) return
-                    val cut = options.cut(route, plans.page) ?: return
+                    val cut = options.cut(route, plans.page, options.device) ?: return
                     appendLog("option: page (no page-free)")
                     viewModelScope.launch { continueParsed(parse, cut) }
                     return
                 }
                 val plan = choices.getOrNull(index - if (pageOffered) 1 else 0) ?: return
-                val cut = options.cut(route, plan) ?: return
+                val cut = options.cut(route, plan, options.device) ?: return
                 appendLog(
                     "option: " + plan.label + if (plan.conditioned) " (needs review)" else "",
                 )
@@ -1818,7 +1829,7 @@ class GhostlockViewModel(
         if (options != null && plans != null) {
             when (val decision = plans.decision()) {
                 is OptionDecision.Auto -> {
-                    val cut = options.cut(plans.route, decision.plan)
+                    val cut = options.cut(plans.route, decision.plan, options.device)
                     if (cut != null) {
                         appendLog("option: ${decision.plan.label} (auto)")
                         continueParsed(result, cut)
@@ -1933,7 +1944,7 @@ class GhostlockViewModel(
             is OptionDecision.Auto -> decision.plan
             else -> plans.safeOptions.firstOrNull() ?: plans.anchorOnly ?: plans.page
         }
-        val document = options.cut(route, plan) ?: return null
+        val document = options.cut(route, plan, options.device) ?: return null
         return ParseResult.Parsed(
             releases = listOf(options.release),
             missing = if (options.physLoad == null) setOf("kernel_phys_load") else emptySet(),
@@ -1965,9 +1976,31 @@ class GhostlockViewModel(
             runningRelease in result.releases
         ) {
             appendLog("stride: probing the mm_struct slab on the running kernel")
-            runCatching {
-                repository.probeStride(runningRelease, document, pair, ::appendLog)
-            }.getOrNull()
+            /* The route/plan dialogs hide the log sheet so they stay tappable.
+             * The probe then runs for seconds to minutes with nothing on
+             * screen but the home; re-show the sheet (non-dismissible) and keep
+             * the screen awake for its duration so the wait is visible and the
+             * save prompt cannot be delayed by a sleeping activity. The parse
+             * operation has normally ended by now; if it has not, do not let
+             * its `running` flag hide the progress. */
+            if (!beginOperation(showLogSheet = true)) {
+                mutableState.update {
+                    it.copy(
+                        running = true,
+                        executionSheetVisible = true,
+                        executionSheetDismissible = false,
+                    )
+                }
+            }
+            send(GhostlockEffect.KeepScreenAwake(true))
+            try {
+                runCatching {
+                    repository.probeStride(runningRelease, document, pair, ::appendLog)
+                }.getOrNull()
+            } finally {
+                send(GhostlockEffect.KeepScreenAwake(false))
+                endOperation()
+            }
         } else {
             null
         }
@@ -1997,6 +2030,9 @@ class GhostlockViewModel(
                 )
             }
         } else {
+            /* No stride picker: the save prompt takes over. Close the probe
+             * sheet first so the SAF activity is not left behind a modal. */
+            mutableState.update { it.copy(executionSheetVisible = false) }
             finishGeneratedProfile(
                 document,
                 result.documentName,

@@ -52,6 +52,10 @@ class ProfileLayerPolicyTest {
             externalProfiles = external,
             preferences = preferences,
             buildIdentity = TestBuild,
+            /* The bundled 5.10 timing is now a diting default; resolve as the
+             * authoring device so the bundled value and the layer assertions
+             * stay meaningful. */
+            deviceCodename = "diting",
         )
     }
 
@@ -199,7 +203,7 @@ class ProfileLayerPolicyTest {
         check(text.isNotBlank()) { "the bundled profile is missing from the assets" }
         return text
             .replace("release = \"$bundledRelease\"", "release = \"$release\"")
-            .replace("route_wait_ms = $bundledRouteWaitMs", "route_wait_ms = $routeWaitMs")
+            .replace("route_wait_ms = null", "route_wait_ms = $routeWaitMs")
     }
 
     private companion object {

@@ -68,6 +68,12 @@ struct Cli {
     /// kernel physical load address (hex or decimal); overrides defaults
     #[arg(long, value_parser = parse_int)]
     phys: Option<u64>,
+    /// the phone codename the physical pair belongs to; --format conf and the
+    /// cut emit schema v2 with `kernel_phys_load = { <device> = <value> }`.
+    /// With --options-out the superset records this device's derivation; the
+    /// store harness runs once per device and merges the entries.
+    #[arg(long)]
+    device: Option<String>,
     /// output format: text (JSON), json, or conf (flattened GLK profile HOCON)
     #[arg(long, value_parser = ["text", "json", "conf"], default_value = "text")]
     format: String,
@@ -921,6 +927,9 @@ fn run(cli: &Cli) -> Result<i32> {
     if cli.options_out.is_some() && cli.format != "conf" {
         eprintln!("warning: --options-out is only meaningful with --format conf; ignoring");
     }
+    if cli.device.is_some() && cli.format != "conf" {
+        eprintln!("warning: --device is only meaningful with --format conf; ignoring");
+    }
     let output = if cli.format == "conf" {
         let release_text = release
             .as_deref()
@@ -1615,6 +1624,7 @@ fn run(cli: &Cli) -> Result<i32> {
                 phys_load: kernel_phys_load,
                 phys_offset: kernel_phys_offset,
                 phys_source,
+                device: cli.device.as_deref(),
                 verdicts: &route_verdicts,
                 geometry: &all_geometry,
                 initialized,
@@ -1643,7 +1653,7 @@ fn run(cli: &Cli) -> Result<i32> {
             };
             eprint!("{}", fact::explain_conf(&inputs, &provenance).render());
         }
-        report::render_conf(&inputs)
+        report::render_conf_with_device(&inputs, cli.device.as_deref())
     } else {
         let report_value = report::build_report(
             release.as_deref(),

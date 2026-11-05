@@ -74,6 +74,14 @@ namespace ghostlock::memory {
             errno = EINVAL;
             return -1;
         }
+        /* MTK has no reliable compiled default: the sampled fleet uses
+         * 0x40000000, 0x40080000/+0x40000000 and 0x80000000. A profile without
+         * a bootloader-derived pair must not run there; the app gates this
+         * first and this check makes a bypass impossible. */
+        if (family == SocFamily::Mtk && !values->misc.kernel_phys_load.value_or(0)) {
+            errno = EINVAL;
+            return -1;
+        }
         *this = ResolvedAddresses{};
         soc = family;
         const auto image = target::KernelAddress<target::ImageAddressDomain>(kernel::KIMAGE_TEXT_BASE)

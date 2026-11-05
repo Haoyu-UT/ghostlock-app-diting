@@ -38,7 +38,7 @@ class UserProfileStoreTest {
         schema_version = 1
         kernel_major = 6
         recommend_shizuku = 0
-        kernel_phys_load = 0xA8000000
+        kernel_phys_load = 2818572288
         route {
           select_stack {
             waiter_shift = -2
@@ -250,6 +250,44 @@ class UserProfileStoreTest {
             assertEquals(listOf("6.1.118-test"), store.releasesOf("offsets.json"))
             assertEquals(listOf("a", "b"), store.releasesOf("multi.json"))
             assertTrue(store.releasesOf("missing.json").isEmpty())
+        }
+    }
+
+    private val v2MapDocument = """
+        release = "5.10.198-test"
+        schema_version = 2
+        kernel_major = 5
+        kernel_phys_load = { diting = 2818572288 }
+        kernel_phys_offset = { diting = 2147483648 }
+        route {
+          select_stack {
+            waiter_shift = -2
+          }
+        }
+    """.trimIndent()
+
+    @Test
+    fun `export preserves a v2 physical map`() {
+        withStore { store ->
+            store.save("v2.conf", v2MapDocument)
+            val exported = store.exportHocon("v2.conf") ?: error("no export")
+            val entry = HoconSupport.parseValue(exported).asValueMap() ?: error("not an entry")
+            assertEquals(2, (entry["schema_version"] as Number).toInt())
+            val load = entry["kernel_phys_load"] as? Map<*, *> ?: error("no load map")
+            assertEquals(2818572288L, (load["diting"] as Number).toLong())
+            val offset = entry["kernel_phys_offset"] as? Map<*, *> ?: error("no offset map")
+            assertEquals(2147483648L, (offset["diting"] as Number).toLong())
+        }
+    }
+
+    @Test
+    fun `export keeps a v1 document at schema 1`() {
+        withStore { store ->
+            store.save("v1.conf", extractorConf)
+            val exported = store.exportHocon("v1.conf") ?: error("no export")
+            val entry = HoconSupport.parseValue(exported).asValueMap() ?: error("not an entry")
+            assertEquals(1, (entry["schema_version"] as Number).toInt())
+            assertEquals(0xa8000000L, (entry["kernel_phys_load"] as Number).toLong())
         }
     }
 

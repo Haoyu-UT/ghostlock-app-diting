@@ -81,7 +81,10 @@ object ProfileMerger {
                 continue
             }
             for ((key, value) in defaults) {
-                if (!existing.containsKey(key)) existing[key] = value
+                /* null means "use the shipped default", the same contract as the
+                 * execution tuning keys: an explicit null must not shadow the
+                 * route preset. */
+                if (existing[key] == null) existing[key] = value
             }
         }
     }

@@ -33,17 +33,37 @@ class NativeDocumentEquivalenceTest {
 
         val root = Files.createTempDirectory("native-doc-equivalence").toFile()
         try {
-            val controller = AndroidProfileConfigController(
-                context = context,
-                externalProfiles = FakeExternalProfileStore(),
-                preferences = context.getSharedPreferences("native-doc-equivalence", 0)
-                    .also { it.edit().clear().commit() },
-            )
+            /* The migrated profiles carry their physical pair in a per-device
+             * map and their timing null. Resolve each with its authoring device
+             * so the frozen bytes still describe the shipped no-op on that
+             * device; a device-neutral resolution is covered by
+             * ExporterAgreementTest. */
+            val controllers = mutableMapOf<String?, AndroidProfileConfigController>()
+            fun controllerFor(release: String): AndroidProfileConfigController {
+                val device = when {
+                    release == "5.10.101-android12-9-00001-gf4c0e37dbcde-ab8596533" -> "yunluo"
+                    release == "5.10.168-android12-9-00001-g81e7418c6466-ab10486262" -> "rubens"
+                    release.startsWith("5.10.") -> "diting"
+                    release == "6.6.89-android15-8-g5a0ffb447c1d-ab13771415-4k" -> "dew"
+                    else -> null
+                }
+                return controllers.getOrPut(device) {
+                    AndroidProfileConfigController(
+                        context = context,
+                        externalProfiles = FakeExternalProfileStore(),
+                        preferences = context.getSharedPreferences(
+                            "native-doc-equivalence-$device",
+                            0,
+                        ).also { it.edit().clear().commit() },
+                        deviceCodename = device,
+                    )
+                }
+            }
             val computed = LinkedHashMap<String, String>()
             for ((release, _) in golden) {
-                val config = controller.load(release, pair)
+                val config = controllerFor(release).load(release, pair)
                 assertTrue("$release did not resolve", config.hasProfile)
-                val bytes = controller.nativeDocument(config)
+                val bytes = controllerFor(release).nativeDocument(config)
                 assertNotNull("$release has no native document", bytes)
                 computed[release] = sha256(bytes!!)
             }

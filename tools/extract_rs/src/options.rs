@@ -2,8 +2,10 @@
 //!
 //! One document per kernel. The app consumes it for the route picker and the
 //! page-vs-conditional prompt; the test corpus keeps it as the single golden.
-//! A runnable profile is a **cut** of this document: `(superset, route, plan)`,
-//! not a separate derivation.
+//! A runnable profile is a **cut** of this document:
+//! `(superset, route, plan, device)`, not a separate derivation. The document
+//! carries one full derivation per device sidecar set in `devices[]`; the
+//! top-level sections are the first (primary) device.
 //!
 //! Policy (operator, 2026-10-31):
 //! - `dump_skip.zeroes`/`__dump_skip.zeroes`, `bm_pmd` and `serial8250_ports`
@@ -57,6 +59,29 @@ pub struct Superset {
     /// The common profile blocks rendered once (route-less). A cut selects a
     /// route and plan and prepends the route block to these maps.
     pub profile: BTreeMap<String, BTreeMap<String, String>>,
+    /// Every device sidecar set derived for this kernel, in generation order.
+    /// The top-level pair/candidates/plans above are the first (primary)
+    /// device; a cut for another device selects its entry here. The scratch
+    /// placement is a function of the physical delta, so the candidates and
+    /// plans are per device even though the routes and common profile blocks
+    /// are image-level and shared.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<DeviceDerivation>,
+}
+
+/// One device's physical-pair derivation for a kernel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceDerivation {
+    pub device: String,
+    pub kernel_phys_load: Option<u64>,
+    pub kernel_phys_offset: Option<u64>,
+    /// `xbl_config FDT`, `uefi memory map`, `vendor_boot header (MediaTek)`,
+    /// `pair.conf`, … .
+    pub phys_source: String,
+    /// Named anchor candidates with this device's scratch placements.
+    pub candidates: Vec<CandidateOption>,
+    /// The device's page/auto/attested plans (the scratch is pair-dependent).
+    pub plans: Vec<RoutePlans>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -98,7 +123,7 @@ impl ScratchPlacement {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CandidateOption {
     pub name: String,
     pub image: u64,
@@ -130,7 +155,7 @@ pub struct Plan {
     pub reason: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutePlans {
     pub route: String,
     pub page: Plan,
@@ -189,6 +214,10 @@ pub struct Input<'a> {
     pub phys_load: Option<u64>,
     pub phys_offset: Option<u64>,
     pub phys_source: &'a str,
+    /// The device these sidecars belong to. When set, the superset records a
+    /// [DeviceDerivation] entry (the CLI and the store harness run once per
+    /// device and merge the entries).
+    pub device: Option<&'a str>,
     /// Route verdicts, in the extractor's stable order.
     pub verdicts: &'a [RouteVerdict],
     /// Full geometry per feasible route (the cut needs all of them).
@@ -235,6 +264,18 @@ pub fn build(input: &Input<'_>) -> Superset {
                 .unwrap_or_default(),
         })
         .collect();
+    let devices = input
+        .device
+        .map(|device| DeviceDerivation {
+            device: device.to_string(),
+            kernel_phys_load: input.phys_load,
+            kernel_phys_offset: input.phys_offset,
+            phys_source: input.phys_source.to_string(),
+            candidates: candidates.clone(),
+            plans: plans.clone(),
+        })
+        .into_iter()
+        .collect();
     Superset {
         schema_version: SCHEMA_VERSION,
         profile: parse_conf_blocks(input.common_profile),
@@ -246,6 +287,7 @@ pub fn build(input: &Input<'_>) -> Superset {
         routes,
         candidates,
         plans,
+        devices,
     }
 }
 
@@ -445,11 +487,33 @@ impl PlanKind {
 /// No derivation happens here; the common blocks were rendered once and the
 /// route/plan select which of the already-derived options is written.
 pub fn cut(superset: &Superset, route: &str, kind: PlanKind) -> Option<String> {
+    cut_with_device(superset, route, kind, None)
+}
+
+/// The runnable cut for one device: the physical pair is written as a schema-v2
+/// per-device map. The device's pair and plans are selected from `devices[]`;
+/// without one the cut uses the primary device's top-level sections.
+pub fn cut_with_device(
+    superset: &Superset,
+    route: &str,
+    kind: PlanKind,
+    device: Option<&str>,
+) -> Option<String> {
     let route_option = superset
         .routes
         .iter()
         .find(|option| option.route == route && option.verdict == "feasible")?;
-    let plans = superset.plans.iter().find(|plans| plans.route == route)?;
+    let derivation = device.and_then(|name| {
+        superset
+            .devices
+            .iter()
+            .find(|entry| entry.device.eq_ignore_ascii_case(name))
+    });
+    let plans = derivation
+        .map(|entry| entry.plans.as_slice())
+        .unwrap_or(superset.plans.as_slice())
+        .iter()
+        .find(|plans| plans.route == route)?;
     let plan = match kind {
         PlanKind::Page => &plans.page,
         /* Auto = the first safe page-free option; without one, the safe
@@ -462,16 +526,40 @@ pub fn cut(superset: &Superset, route: &str, kind: PlanKind) -> Option<String> {
             .unwrap_or(&plans.page),
         PlanKind::Attested => plans.page_free.iter().find(|plan| plan.conditioned)?,
     };
-    Some(render_cut(superset, route, route_option, plan, kind.label()))
+    let phys = derivation.map(|entry| (entry.kernel_phys_load, entry.kernel_phys_offset));
+    Some(render_cut(
+        superset,
+        route,
+        route_option,
+        plan,
+        kind.label(),
+        device,
+        phys,
+    ))
 }
 
 /// Materialize one explicitly selected option (the app's picker). The plan is
 /// taken from the superset's `page_free` list (or `anchor_only`/`page`).
 pub fn cut_plan(superset: &Superset, route: &str, plan: &Plan) -> Option<String> {
+    cut_plan_with_device(superset, route, plan, None)
+}
+
+pub fn cut_plan_with_device(
+    superset: &Superset,
+    route: &str,
+    plan: &Plan,
+    device: Option<&str>,
+) -> Option<String> {
     let route_option = superset
         .routes
         .iter()
         .find(|option| option.route == route && option.verdict == "feasible")?;
+    let derivation = device.and_then(|name| {
+        superset
+            .devices
+            .iter()
+            .find(|entry| entry.device.eq_ignore_ascii_case(name))
+    });
     let label = plan
         .anchor_name
         .as_deref()
@@ -482,7 +570,16 @@ pub fn cut_plan(superset: &Superset, route: &str, plan: &Plan) -> Option<String>
             )
         })
         .unwrap_or_else(|| "page".to_string());
-    Some(render_cut(superset, route, route_option, plan, &label))
+    let phys = derivation.map(|entry| (entry.kernel_phys_load, entry.kernel_phys_offset));
+    Some(render_cut(
+        superset,
+        route,
+        route_option,
+        plan,
+        &label,
+        device,
+        phys,
+    ))
 }
 
 fn render_cut(
@@ -491,6 +588,8 @@ fn render_cut(
     route_option: &RouteOption,
     plan: &Plan,
     label: &str,
+    device: Option<&str>,
+    phys: Option<(Option<u64>, Option<u64>)>,
 ) -> String {
     let top = superset.profile.get("").cloned().unwrap_or_default();
     let value = |key: &str| top.get(key).cloned();
@@ -501,18 +600,38 @@ fn render_cut(
         ),
         format!("# cut from the option superset: route={route} plan={label}"),
     ];
-    for key in [
-        "release",
-        "schema_version",
-        "kernel_major",
-        "recommend_shizuku",
-        "kernel_phys_load",
-        "kernel_phys_offset",
-    ] {
+    for key in ["release", "kernel_major", "recommend_shizuku"] {
         if let Some(value) = value(key) {
             lines.push(format!("{key} = {value}"));
         }
     }
+    let schema_version = if device.is_some() { 2 } else { 1 };
+    lines.push(format!("schema_version = {schema_version}"));
+    /* A device derivation selects its own pair. The legacy single-device
+     * superset has no derivation and carries the pair in the top-level profile;
+     * a derivation with a null pair is still authoritative (emit null, never
+     * fall back to another device's pair). */
+    let has_derivation = device.is_some() && phys.is_some();
+    let (load_override, offset_override) = match phys {
+        Some((load, offset)) if device.is_some() => (load, offset),
+        _ => (None, None),
+    };
+    let phys_line = |key: &str, override_value: Option<u64>| {
+        if has_derivation {
+            match (device, override_value) {
+                (Some(name), Some(v)) => format!("{key} = {{ {name} = {v} }}"),
+                _ => format!("{key} = null"),
+            }
+        } else {
+            match (device, value(key)) {
+                (Some(name), Some(v)) if v != "null" => format!("{key} = {{ {name} = {v} }}"),
+                (None, Some(v)) => format!("{key} = {v}"),
+                _ => format!("{key} = null"),
+            }
+        }
+    };
+    lines.push(phys_line("kernel_phys_load", load_override));
+    lines.push(phys_line("kernel_phys_offset", offset_override));
     lines.push("route {".to_string());
     lines.push(format!("  {route} {{"));
     let mut geometry: BTreeMap<&str, &i64> = route_option
@@ -779,6 +898,7 @@ mod tests {
                 page_free: vec![page_free],
             }],
             profile,
+            devices: Vec::new(),
         }
     }
 
