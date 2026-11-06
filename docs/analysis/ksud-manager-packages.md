@@ -105,5 +105,8 @@ refusal and the Shizuku parity, which upstream's version does not have. Device c
 Max (`myron`): the Advanced → root管理器 picker lists SukiSU Ultra v4.2.1 as a confirmed late-load
 candidate, the selection persists, and Auto restores. The run-start layout is device-verified on the diting as well (run
 `20261107-001936`: ReSukiSU confirmed and selected, staged copy used, `exploit complete` →
-`KernelSU ready`, `state=completed`); the no-suitable block and the Shizuku service path remain
-code-reviewed (both devices have a suitable manager; Shizuku not running).
+`KernelSU ready`, `state=completed`). The no-suitable refusal is device-verified too (2026-11-07,
+diting: ReSukiSU uninstalled → picker notice, scan `1 candidate(s), 0 suitable`, `state=failed`
+with `refusing to start the exploit`, no native; reinstalled → `state=completed`; record in
+`external/port/ksud-no-suitable-2026-11-07/`). The Shizuku service path remains code-reviewed
+(Shizuku not running on either test phone).
