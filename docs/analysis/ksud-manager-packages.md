@@ -68,11 +68,15 @@ com.kowx712.supermanager
 
 ## Limits
 
-- **Not device-tested.** No phone with a KernelSU-Next manager was available. The invocation and
-  the embedded KMI module make it the same late-load path as KernelSU/ReSukiSU, but a device run
-  is the gate. A KernelSU-Next v3.4.2+ device whose `uname -r` KMI is in their release set
-  (`android12-5.10`, `android13-5.15`, `android14-5.15`, `android14-6.1`, `android15-6.6`,
-  `android16-6.12`, `android17-6.18`) is the right test.
+- **Device-tested for detection, selection and staging (2026-11-07); `late-load` itself remains
+  the gate.** On the diting (v3.4.2 installed next to ReSukiSU), the scan reported
+  `3 candidate(s), 2 suitable`, Auto selected `com.rifsxd.ksunext`, the staged copy was its
+  7,059,584 B `libksud.so`, and the chain completed (run `20261107-010223`, record in
+  `external/port/ksunext-ondevice-2026-11-07/`). The rig boots with `kernelsu` already loaded, so
+  `late-load` was skipped; a KernelSU-Next v3.4.2+ device without the module — whose `uname -r`
+  KMI is in their release set (`android12-5.10`, `android13-5.15`, `android14-5.15`,
+  `android14-6.1`, `android15-6.6`, `android16-6.12`, `android17-6.18`) — is still the right test
+  for the vermagic rewrite and the embedded module.
 - The loaded module is the installed manager's own, so the manager's userspace matches it by
   construction.
 
