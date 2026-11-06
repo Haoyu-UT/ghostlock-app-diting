@@ -54,7 +54,7 @@
 
 - 系统为Android 12 或更高。
 - 内核及安全补丁尚未修补 CVE-2026-43499 漏洞。
-- 提前安装下列 root 管理器之一： KernelSU、BakaSU（曾是ReSukiSU）或 KowSU。每个管理器支持临时 root 的首个版本各不相同，尽可能下载新版。
+- 提前安装下列 root 管理器之一：KernelSU、KernelSU-Next、BakaSU（曾是ReSukiSU）或 KowSU。每个管理器支持临时 root 的首个版本各不相同，尽可能下载新版。
 
 ## 支持的设备
 

@@ -2,7 +2,9 @@ package com.ghostlock.app.shizuku
 
 import android.content.Context
 import android.os.Process
+import android.system.Os
 import androidx.annotation.Keep
+import com.ghostlock.app.data.ManagerScanner
 import com.ghostlock.app.data.NativeProfileDocument
 import java.io.File
 import java.io.RandomAccessFile
@@ -26,6 +28,7 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
         anchorTrusted: Boolean,
         profileBlob: ByteArray,
         debugDir: String?,
+        managerPackage: String?,
         callback: IGhostlockCallback,
         statusCallback: IGhostlockStatusCallback,
     ) {
@@ -58,6 +61,18 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
                 val workDir = File("/data/local/tmp/ghostlock-app").apply {
                     require(isDirectory || mkdirs()) { "cannot create $absolutePath" }
                 }
+                val candidates = ManagerScanner.scan(context)
+                val suitable = candidates.count { it.suitable }
+                val chosen = ManagerScanner.resolve(candidates, managerPackage)
+                    ?: error("no suitable ksud found; refusing to start the exploit")
+                val ksud = File(workDir, "ksud")
+                ksud.delete()
+                File(chosen.path).inputStream().use { input ->
+                    ksud.outputStream().use { input.copyTo(it) }
+                }
+                runCatching { Os.chmod(ksud.absolutePath, 448) }
+                callback.onLog("<s> ksud scan: ${candidates.size} candidate(s), $suitable suitable")
+                callback.onLog("<s> ksud selected: ${chosen.packageName} ${chosen.path} [${chosen.verdict}]")
                 callback.onLog("<s> Shizuku ready: uid=${Process.myUid()} Seccomp=0")
                 callback.onLog("<s> kernel: $release")
                 val nativeLog = File(workDir, ".ghostlock_native.log")

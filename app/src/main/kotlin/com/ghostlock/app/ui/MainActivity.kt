@@ -171,6 +171,7 @@ private fun GhostlockRoute(
                 viewModel.setVrKoSelinuxBlock(mode)
 
             override fun onShizukuChanged(enabled: Boolean) = viewModel.toggleShizuku(enabled)
+            override fun onOpenManagerPicker() = viewModel.onOpenManagerPicker()
             override fun onDialogItemSelected(index: Int) = viewModel.onDialogItemSelected(index)
             override fun onDialogInputChange(value: String) = viewModel.onDialogInputChange(value)
             override fun onDialogConfirm(value: String) = viewModel.onDialogConfirm(value)

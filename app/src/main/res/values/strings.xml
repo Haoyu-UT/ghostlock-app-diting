@@ -392,4 +392,8 @@
     <string name="fallback_label">Fallback route</string>
     <string name="fallback_none">None</string>
     <string name="field_fallback_to">fallback_to</string>
+    <string name="manager_label">Root manager</string>
+    <string name="manager_summary_auto">Auto (recommended)</string>
+    <string name="manager_picker_title">Root manager</string>
+    <string name="manager_picker_empty">No usable ksud found. Install a KernelSU-family root manager.</string>
 </resources>

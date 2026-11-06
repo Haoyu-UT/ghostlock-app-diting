@@ -13,6 +13,7 @@ import com.ghostlock.app.domain.model.ParseResult
 import com.ghostlock.app.domain.model.ProfileConfig
 import com.ghostlock.app.domain.model.ProfileDiffRow
 import com.ghostlock.app.domain.model.RunLogEntry
+import com.ghostlock.app.domain.model.RootManagerCandidate
 import com.ghostlock.app.domain.model.StrideProbe
 import com.ghostlock.app.domain.model.UserProfileFile
 import com.ghostlock.app.domain.model.VrKoMode
@@ -45,6 +46,18 @@ interface GhostlockRepository {
     fun acknowledgeLayerNotice(build: String)
 
     fun setShizukuEnabled(enabled: Boolean)
+
+    /**
+     * KernelSU-family managers found by the shared ksud scanner (executable-
+     * shaped ELFs, late-load tokens, and the `late-load --help` interface
+     * probe). Blocking: call from IO.
+     */
+    suspend fun managerCandidates(): List<RootManagerCandidate>
+
+    /** The user's root-manager choice (package name); null means Auto. */
+    fun selectedManagerPackage(): String?
+
+    fun setSelectedManagerPackage(packageName: String?)
 
     suspend fun parseSource(
         input: String,

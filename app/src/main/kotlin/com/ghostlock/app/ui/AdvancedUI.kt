@@ -198,6 +198,16 @@ internal fun AdvancedScreen(
                     )
                 }
             }
+            item(key = "rootManager") {
+                Card {
+                    ArrowPreference(
+                        title = stringResource(R.string.manager_label),
+                        summary = state.selectedManagerPackage
+                            ?: stringResource(R.string.manager_summary_auto),
+                        onClick = actions::onOpenManagerPicker,
+                    )
+                }
+            }
             item(key = "override") {
                 Card {
                     ArrowPreference(

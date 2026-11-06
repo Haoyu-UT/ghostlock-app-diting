@@ -26,6 +26,7 @@ import com.ghostlock.app.domain.model.ParseResult
 import com.ghostlock.app.domain.model.PhysImage
 import com.ghostlock.app.domain.model.PhysPromptState
 import com.ghostlock.app.domain.model.ProfileConfig
+import com.ghostlock.app.domain.model.RootManagerCandidate
 import com.ghostlock.app.domain.model.nextPhysImage
 import com.ghostlock.app.domain.model.sourceSuppliesLoad
 import com.ghostlock.app.domain.model.ProfileDiffRow
@@ -136,6 +137,10 @@ class GhostlockViewModel(
     private var pendingStrideDocument: String? = null
     private var pendingStrideName: String? = null
     private var pendingStrideRelease: String? = null
+
+    /** Root-manager picker: open flag and the scanned candidates. */
+    private var managerPickerOpen = false
+    private var managerChoices: List<RootManagerCandidate> = emptyList()
 
     /** The document text and behaviour waiting for the user's export destination. */
     private data class PendingProfileWrite(
@@ -1192,7 +1197,71 @@ class GhostlockViewModel(
         }
     }
 
+    /**
+     * Root-manager picker: scan now (no cache), then list the candidates with
+     * their verdict plus Auto. Selecting one only records a preference; the
+     * run re-scans and refuses to start if nothing suitable is found.
+     */
+    fun onOpenManagerPicker() {
+        viewModelScope.launch {
+            /* Only suitable candidates are offered; a scan that found a
+             * mis-shaped or non-late-load binary is not a choice the user can
+             * act on. The run log still records every scanned candidate. */
+            val candidates = runCatching { repository.managerCandidates() }
+                .getOrDefault(emptyList())
+                .filter { it.suitable }
+            val selected = repository.selectedManagerPackage()
+            managerChoices = candidates
+            if (candidates.isEmpty()) {
+                mutableState.update {
+                    it.copy(
+                        dialogVisible = true,
+                        dialogType = DialogType.NOTICE,
+                        dialogTitleRes = R.string.manager_picker_title,
+                        dialogMessageRes = R.string.manager_picker_empty,
+                        dialogMessage = "",
+                        dialogLayerNotice = null,
+                        dialogExportLog = false,
+                        dialogDocUrl = null,
+                        dialogItems = emptyList(),
+                        dialogItemResIds = emptyList(),
+                        dialogLeadingResId = null,
+                        dialogCurrentItemIndex = -1,
+                    )
+                }
+                return@launch
+            }
+            val selectedIndex = candidates.indexOfFirst { it.packageName == selected }
+            managerPickerOpen = true
+            mutableState.update {
+                it.copy(
+                    dialogVisible = true,
+                    dialogType = DialogType.LIST,
+                    dialogTitleRes = R.string.manager_picker_title,
+                    dialogItems = candidates.map { candidate ->
+                        "${candidate.label} (${candidate.packageName})"
+                    },
+                    dialogItemResIds = emptyList(),
+                    dialogItemGrades = emptyList(),
+                    dialogLeadingResId = R.string.manager_summary_auto,
+                    dialogCurrentItemIndex = if (selectedIndex >= 0) selectedIndex else -1,
+                    dialogLayerNotice = null,
+                    dialogExportLog = false,
+                    dialogDocUrl = null,
+                )
+            }
+        }
+    }
+
     fun onDialogItemSelected(index: Int) {
+        if (managerPickerOpen) {
+            managerPickerOpen = false
+            val packageName = if (index == 0) null else managerChoices.getOrNull(index - 1)?.packageName
+            repository.setSelectedManagerPackage(packageName)
+            mutableState.update { it.copy(selectedManagerPackage = packageName) }
+            dismissDialog()
+            return
+        }
         dismissDialog()
         when (parseDialogStage) {
             ParseDialogStage.Mode -> when (index) {
@@ -1483,6 +1552,7 @@ class GhostlockViewModel(
                 externalProfile = profileController.activeExternalProfile(),
                 activeUserProfile = loaded?.layers?.takeIf { it.externalApplied }?.external,
                 customCpuPair = loaded?.let(::customCpuPairOf),
+                selectedManagerPackage = repository.selectedManagerPackage(),
             )
         }
         /* At start-up, and from the resolution the run button was just judged
@@ -2098,6 +2168,7 @@ class GhostlockViewModel(
     }
 
     private fun dismissDialog(clearConfirmation: Boolean = true) {
+        managerPickerOpen = false
         if (clearConfirmation) pendingConfirmation = null
         /* Shown is as good as read: acknowledging on the way out keeps the
          * notice to once per build however it was dismissed. */

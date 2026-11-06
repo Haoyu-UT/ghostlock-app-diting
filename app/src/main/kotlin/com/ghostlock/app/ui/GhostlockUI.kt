@@ -116,6 +116,8 @@ data class GhostlockUiState(
     val kernelSupported: Boolean = false,
     val shizukuEnabled: Boolean = false,
     val shizukuStatus: ShizukuStatus = ShizukuStatus.NOT_REQUIRED,
+    /** Root-manager choice (package name); null means Auto. */
+    val selectedManagerPackage: String? = null,
     val running: Boolean = false,
     val cpuPairLabels: List<String> = emptyList(),
     val cpuPairIndex: Int = 0,
@@ -264,6 +266,7 @@ interface GhostlockActions {
     fun onVrKoTagClearChanged(mode: VrKoMode)
     fun onVrKoSelinuxBlockChanged(mode: VrKoMode)
     fun onShizukuChanged(enabled: Boolean)
+    fun onOpenManagerPicker()
     fun onDialogItemSelected(index: Int)
     fun onDialogInputChange(value: String)
     fun onDialogConfirm(value: String)

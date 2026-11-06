@@ -65,9 +65,9 @@ the same phone, kernel and route appear twice, the two rows are two page-depende
 
 - Android 12 or newer.
 - The kernel and its security patch level are not yet patched for CVE-2026-43499.
-- A KernelSU-family root manager is installed first: KernelSU, BakaSU (formerly ReSukiSU), or
-  KowSU. Each manager gained temporary-root support in a different version; use the newest one you
-  can.
+- A KernelSU-family root manager is installed first: KernelSU, KernelSU-Next, BakaSU (formerly
+  ReSukiSU), or KowSU. Each manager gained temporary-root support in a different version; use the
+  newest one you can.
 
 ## Supported devices
 

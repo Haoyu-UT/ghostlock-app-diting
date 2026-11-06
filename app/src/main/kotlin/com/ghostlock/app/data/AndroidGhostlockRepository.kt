@@ -29,6 +29,7 @@ import com.ghostlock.app.domain.model.ParseResult
 import com.ghostlock.app.domain.model.ProfileConfig
 import com.ghostlock.app.domain.model.ProfileDiffRow
 import com.ghostlock.app.domain.model.RunLogEntry
+import com.ghostlock.app.domain.model.RootManagerCandidate
 import com.ghostlock.app.domain.model.RunLogState
 import com.ghostlock.app.domain.model.StrideCandidateOption
 import com.ghostlock.app.domain.model.StrideProbe
@@ -79,6 +80,8 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         const val PrefLayerNoticeAck = "profile_layer_notice_ack"
         const val PrefDebugKernelLogEnabled = "debug_kernel_log_enabled"
         const val PrefDebugProfileOverrides = "debug_profile_overrides"
+        /** Root-manager choice (package name); absent means Auto. */
+        const val PrefManagerPackage = "manager_package"
 
         /* U01-S14: per-run KernelSU log name; the resolved path travels to
          * the native process via GHOSTLOCK_KSU_LOG. */
@@ -272,6 +275,29 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 putBoolean("shizuku_explicit", true)
             }
         if (enabled) shizukuRunner.requestPermission()
+    }
+
+    override suspend fun managerCandidates(): List<RootManagerCandidate> = withContext(Dispatchers.IO) {
+        ManagerScanner.scan(appContext).map {
+            RootManagerCandidate(
+                packageName = it.packageName,
+                label = it.label,
+                path = it.path,
+                builtin = it.builtin,
+                suitable = it.suitable,
+                verdict = it.verdict,
+            )
+        }
+    }
+
+    override fun selectedManagerPackage(): String? =
+        preferences.getString(PrefManagerPackage, null)?.takeIf { it.isNotBlank() }
+
+    override fun setSelectedManagerPackage(packageName: String?) {
+        preferences.edit {
+            if (packageName.isNullOrBlank()) remove(PrefManagerPackage)
+            else putString(PrefManagerPackage, packageName)
+        }
     }
 
     override fun profileController(): ProfileConfigController = profileController
@@ -758,7 +784,8 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     archivedLog("<b> starting UserService")
                     resetRunState()
                     shizukuRunner.run(
-                        pair, safeModeEnabled, forceAttackTest, profileBlob, debugDir, archivedLog,
+                        pair, safeModeEnabled, forceAttackTest, profileBlob, debugDir,
+                        selectedManagerPackage(), archivedLog,
                     ) { step, status ->
                         if (status == "disabled") clearRunState() else applyRunStatus(step, status)
                     }
@@ -1008,7 +1035,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         return try {
             val binary = File(appContext.applicationInfo.nativeLibraryDir, binaryName)
             require(binary.isFile) { "missing native binary: ${binary.absolutePath}" }
-            if (prepareKsud(workDir, onLog) != null) onLog("<k> ksud ready") else onLog("<k> warning: ksud not found")
+            if (!stageKsud(workDir, onLog)) return 1
             // U01-S14: a per-run KernelSU log path so a previous run's markers
             // can never satisfy the handoff probe; passed to the native process.
             val ksuLog = File(workDir, ksuLogName(System.currentTimeMillis()))
@@ -1571,23 +1598,46 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
 
     private fun firstValidProperty(vararg keys: String): String? = keys.asSequence().firstNotNullOfOrNull { validDeviceName(systemProperty(it)) }
 
-    private fun prepareKsud(workDir: File, onLog: (String) -> Unit): File? {
-        val packages = listOf("me.weishu.kernelsu.pr", "me.weishu.kernelsu", "com.resukisu.resukisu", "com.kowx712.supermanager")
-        var installed = false
-        for (packageName in packages) {
-            val appInfo = runCatching { appContext.packageManager.getApplicationInfo(packageName, 0) }.getOrNull() ?: continue
-            installed = true
-            val source = File(appInfo.nativeLibraryDir, "libksud.so")
-            if (!source.isFile) continue
-            val output = File(workDir, "ksud")
-            runCatching {
-                source.inputStream().use { input -> output.outputStream().use { input.copyTo(it) } }
-                runCatching { Os.chmod(output.absolutePath, 448) }
-                return output
-            }.onFailure { onLog("<k> copy ksud failed: ${it.message}") }
+    /**
+     * Find a late-load-capable ksud and stage it into [workDir]/ksud.
+     *
+     * Returns false when no suitable manager exists; the caller must then
+     * refuse to start the exploit (and say why in the run log).
+     */
+    private suspend fun stageKsud(workDir: File, onLog: (String) -> Unit): Boolean = withContext(Dispatchers.IO) {
+        val candidates = runCatching { ManagerScanner.scan(appContext) }.getOrElse {
+            onLog("<k> error: ksud scan failed: ${it.message}")
+            return@withContext false
         }
-        if (!installed) onLog("<k> KernelSU/ReSukiSU/KowSU app not installed")
-        return null
+        val suitable = candidates.filter { it.suitable }
+        onLog("<k> ksud scan: ${candidates.size} candidate(s), ${suitable.size} suitable")
+        candidates.forEach {
+            onLog("<k>   ${it.packageName}: ${it.path} [${it.verdict}]")
+        }
+        val chosen = ManagerScanner.resolve(candidates, selectedManagerPackage())
+        if (chosen == null) {
+            onLog("<k> error: no suitable ksud found; refusing to start the exploit")
+            return@withContext false
+        }
+        if (suitable.size > 1) {
+            onLog(
+                "<k> ksud: ${suitable.size} suitable; using ${chosen.packageName} " +
+                    "(Advanced -> Root manager to change)",
+            )
+        }
+        val output = File(workDir, "ksud")
+        runCatching {
+            output.delete()
+            File(chosen.path).inputStream().use { input ->
+                output.outputStream().use { input.copyTo(it) }
+            }
+            Os.chmod(output.absolutePath, 448)
+        }.onFailure {
+            onLog("<k> error: cannot stage ksud from ${chosen.path}: ${it.message}")
+            return@withContext false
+        }
+        onLog("<k> ksud selected: ${chosen.packageName} ${chosen.path} [${chosen.verdict}]")
+        true
     }
 
     private suspend fun runProcess(

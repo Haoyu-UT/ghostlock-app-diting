@@ -392,4 +392,8 @@
     <string name="fallback_label">回退路由</string>
     <string name="fallback_none">无</string>
     <string name="field_fallback_to">回退目标</string>
+    <string name="manager_label">root管理器</string>
+    <string name="manager_summary_auto">自动（推荐）</string>
+    <string name="manager_picker_title">root管理器</string>
+    <string name="manager_picker_empty">未找到可用的 ksud。请安装 KernelSU 系 root 管理器。</string>
 </resources>
