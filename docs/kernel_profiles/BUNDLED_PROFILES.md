@@ -2,12 +2,12 @@
 
 > 中文版本：[BUNDLED_PROFILES_ZH.md](BUNDLED_PROFILES_ZH.md)
 
-The APK ships **62 kernel profiles** plus four family templates. A profile is matched by the exact
+The APK ships **65 kernel profiles** plus four family templates. A profile is matched by the exact
 `uname -r` and nothing else; a kernel that is not on this list can still generate its own profile
 (see the README's *Generating a profile*). The authoritative list is
 `app/src/main/assets/kernel_profiles/index.conf`; this page is its readable form.
 
-Current mix: 53 page-free, 2 half-page, 7 page-based.
+Current mix: 56 page-free, 2 half-page, 7 page-based.
 
 - **Route** — what the bundled profile runs.
 - **Page-free** — *page-free*: the lock and the W1 value both come from anchor areas; *half*: the
@@ -19,18 +19,21 @@ Current mix: 53 page-free, 2 half-page, 7 page-based.
 | Kernel (`uname -r`) | Route | Page-free | Verified | Devices |
 |---|---|---|---|---|
 | `5.10.43-android12-9-gb8e472053352-ab8059253` | select_stack (compat) | page-free | QEMU | Xiaomi 12 Pro |
+| `5.10.66-android12-9-00001-g41ff3fa8fff9-ab8171928` | sigreturn | page-free | QEMU | Redmi Note 11T Pro / POCO X4 GT — MIUI 13 |
 | `5.10.81-android12-9-00001-g6cd504626bae-ab8485363` | select_stack | page-free | device | Redmi K50 Ultra — Global `V13.0.3.0` / `V13.0.4.0` (the launch ROM, Android 12) |
-| `5.10.81-android12-9-00001-geba40aecb3b7-ab8534902` | select_stack (compat) | page-free | QEMU | Xiaomi 12 Pro Dimensity |
+| `5.10.81-android12-9-00001-geba40aecb3b7-ab8534902` | select_stack (compat) | page-free | QEMU | Xiaomi 12 Pro Dimensity, Redmi Note 11T Pro / POCO X4 GT |
 | `5.10.101-android12-9-00001-gf4c0e37dbcde-ab8596533` | select_stack | page-free | QEMU | Redmi Pad, Redmi K50 Pro |
 | `5.10.101-android12-9-00005-ga829d48e78bd-ab9206161` | select_stack | page-free | QEMU (candidate) | Redmi K50 Ultra — Global `V14.0.1.0` |
-| `5.10.101-android12-9-00027-g1292f517889e-ab8602202` | select_stack | page-free | QEMU | Xiaomi 12T, Redmi K50 Pro |
-| `5.10.136-android12-9-00020-gc9f59ef34367-ab9585114` | select_stack | page-free | QEMU | Xiaomi Civi 3, Redmi K50 Pro |
+| `5.10.101-android12-9-00027-g1292f517889e-ab8602202` | select_stack | page-free | QEMU | Xiaomi 12T, Redmi K50 Pro, Redmi Note 11T Pro / POCO X4 GT |
+| `5.10.136-android12-9-00020-gc9f59ef34367-ab9585114` | select_stack | page-free | QEMU | Xiaomi Civi 3, Redmi K50 Pro, Redmi Note 11T Pro / POCO X4 GT |
 | `5.10.136-android12-9-00021-g821df8f5bd36-ab9585204` | select_stack | page-free | QEMU (candidate) | Redmi K50 Ultra — Global `V14.0.3.0` |
-| `5.10.168-android12-9-00001-g81e7418c6466-ab10486262` | select_stack | page-free | QEMU | Redmi K50, Redmi K50 Pro |
+| `5.10.168-android12-9-00001-g81e7418c6466-ab10486262` | select_stack | page-free | QEMU | Redmi K50, Redmi K50 Pro, Redmi Note 11T Pro / POCO X4 GT |
+| `5.10.168-android12-9-00002-gf3c080171fd5-ab10346004` | select_stack | page-free | QEMU | Redmi Note 11T Pro / POCO X4 GT |
 | `5.10.177-android12-9-00001-g219d8dfbba07-ab10551810` | select_stack | page-free | QEMU (candidate) | Redmi K50 Ultra — Global `V14.0.5.0` |
-| `5.10.198-android12-9-00085-g226a9632f13d-ab11136126` | select_stack | page-free | QEMU (candidate) | Redmi K50 Ultra — Global `OS1.0.5.0` |
-| `5.10.209-android12-9-00019-g4ea09a298bb4-ab12292661` | select_stack | page-free | device | Redmi K50 Ultra — Global `OS1.0.11.0`, `OS1.0.12.0`, `OS2.0.1.0`, `OS2.0.2.0` |
+| `5.10.198-android12-9-00085-g226a9632f13d-ab11136126` | select_stack | page-free | QEMU (candidate) | Redmi K50 Ultra — Global `OS1.0.5.0`; Redmi Note 11T Pro / POCO X4 GT |
+| `5.10.209-android12-9-00019-g4ea09a298bb4-ab12292661` | select_stack | page-free | device | Redmi K50 Ultra — Global `OS1.0.11.0`, `OS1.0.12.0`, `OS2.0.1.0`, `OS2.0.2.0`; Redmi Note 11T Pro / POCO X4 GT |
 | `5.10.226-android12-9-00064-gea4a6f067d3f-ab12969919` | select_stack | page-free | device | Redmi K50 Ultra — Global `OS2.0.3.0`–`OS2.0.205.0` |
+| `5.10.226-android12-9-00047-g4968e29b7f92-ab12786767` | select_stack | page-free | QEMU | Redmi Note 11T Pro / POCO X4 GT — HyperOS `OS2.0.7.0` / `OS2.0.12.0` |
 | `5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284` | select_stack | page-free | device + QEMU control | Redmi K50 Ultra — Global `OS2.0.206.0`–`OS3.0.6.0` |
 | `5.15.194-android13-8-00019-gf4321180a397-ab15212794` | multicast_waiter | page-free | QEMU | Xiaomi 13 |
 | `6.1.25-android14-11-g8744d1c0cf31-ab10888519` | select_stack | page-free | QEMU | Xiaomi 14 |

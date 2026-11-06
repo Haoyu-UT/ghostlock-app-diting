@@ -41,6 +41,11 @@ class NativeDocumentEquivalenceTest {
             val controllers = mutableMapOf<String?, AndroidProfileConfigController>()
             fun controllerFor(release: String): AndroidProfileConfigController {
                 val device = when {
+                    release in setOf(
+                        "5.10.66-android12-9-00001-g41ff3fa8fff9-ab8171928",
+                        "5.10.168-android12-9-00002-gf3c080171fd5-ab10346004",
+                        "5.10.226-android12-9-00047-g4968e29b7f92-ab12786767",
+                    ) -> "xaga"
                     release == "5.10.101-android12-9-00001-gf4c0e37dbcde-ab8596533" -> "yunluo"
                     release == "5.10.168-android12-9-00001-g81e7418c6466-ab10486262" -> "rubens"
                     release.startsWith("5.10.") -> "diting"

@@ -123,6 +123,7 @@ image running under QEMU.
 | Kernel (`uname -r`) | Route(s) | Verified |
 |---|---|---|
 | `5.10.43-android12-9-gb8e472053352-ab8059253` | sigreturn | QEMU |
+| `5.10.66-android12-9-00001-g41ff3fa8fff9-ab8171928` | sigreturn | QEMU |
 | `5.10.81-android12-9-00001-geba40aecb3b7-ab8534902` | sigreturn | QEMU |
 | `5.10.81-android12-9-00001-g6cd504626bae-ab8485363` | sigreturn, select_stack (32-bit compat) | device |
 | `5.10.101-android12-9-00001-gf4c0e37dbcde-ab8596533` | sigreturn | QEMU |
@@ -130,10 +131,12 @@ image running under QEMU.
 | `5.10.101-android12-9-00005-ga829d48e78bd-ab9206161` | sigreturn | QEMU |
 | `5.10.136-android12-9-00020-gc9f59ef34367-ab9585114` | select_stack | QEMU |
 | `5.10.136-android12-9-00021-g821df8f5bd36-ab9585204` | select_stack | QEMU |
+| `5.10.168-android12-9-00002-gf3c080171fd5-ab10346004` | select_stack | QEMU |
 | `5.10.177-android12-9-00001-g219d8dfbba07-ab10551810` | select_stack | QEMU |
 | `5.10.198-android12-9-00085-g226a9632f13d-ab11136126` | select_stack | QEMU (candidate profile) |
 | `5.10.209-android12-9-00019-g4ea09a298bb4-ab12292661` | select_stack | device |
 | `5.10.226-android12-9-00064-gea4a6f067d3f-ab12969919` | select_stack | device |
+| `5.10.226-android12-9-00047-g4968e29b7f92-ab12786767` | select_stack | QEMU |
 | `5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284` | select_stack, sigreturn | device + QEMU control |
 | `5.10.236-android12-9-00003-gfb24cf99ad97-full-osize` | multicast_waiter | QEMU |
 | `5.10.236-android12-9-00003-gfb24cf99ad97-full-none-os` | none feasible | QEMU |

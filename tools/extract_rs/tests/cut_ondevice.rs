@@ -100,6 +100,7 @@ fn every_sidecar_device_cut_matches_the_cli() {
                 "yunluo".to_string(),
                 "rubens".to_string(),
                 "matisse".to_string(),
+                "xaga".to_string(),
             ],
             "{release}: device sidecar sets"
         );
