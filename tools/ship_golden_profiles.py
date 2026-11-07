@@ -10,11 +10,14 @@ non-null physical pairs (a single HOCON map cannot carry both) are exempt.
 The bundle asset is the CLI's default anchored cut (``--format conf --route
 <best> --anchor --device <primary>``) rendered from the store Image with that
 device's sidecars; the physical maps are then written from the superset's
-``devices[]`` entries so every device in the set resolves. For the
-sigreturn-only 5.10.43/5.10.81 kernels the route block is replaced with the
-AArch32 compat select carrier (G1 QEMU on every store image, G4 device 10/10 on
-the era 5.10.81); 5.10.101 stays sigreturn until it has a device gate. New
-assets carry a SHIPPED GOLDEN header and are never overwritten by a later run.
+``devices[]`` entries so every device in the set resolves. A kernel whose
+64-bit ``select_stack`` is infeasible (the superset's own verdict) is
+``sigreturn``-only; for those the route block is replaced with the AArch32
+compat select carrier (docs/analysis/compat-select-carrier-plan.md; G1 QEMU on
+the six store images, G4 device 10/10 on the era 5.10.81). The carrier needs a
+``dump_skip`` anchor candidate; when the superset has none, the profile keeps
+``sigreturn``. New assets carry a SHIPPED GOLDEN header and are never
+overwritten by a later run.
 
 Usage:
     tools/ship_golden_profiles.py --check    # report unbundled goldens, exit 1
@@ -39,12 +42,11 @@ DEFAULT_EXTRACT = os.path.join(APP, "build", "extract", "release", "ghostlock-ex
 
 SKIP_CORPUS = {"btf-only", "codegen", "excluded"}
 ROUTE_PRIORITY = ["select_stack", "sigreturn", "tcp_zerocopy", "multicast_waiter"]
-# The sigreturn-only 5.10 kernels (5.10.43/81/101) also have the AArch32 compat
-# select carrier (docs/analysis/compat-select-carrier-plan.md). For 5.10.43 and
-# 5.10.81 the G1 QEMU gate (all six store images) and G4 (era 5.10.81 device,
-# 10/10) back it, so a newly rendered profile uses it instead of sigreturn.
-# 5.10.101 stays sigreturn: it is QEMU-gated only (no device gate).
-COMPAT_PREFIXES = ("5.10.43-", "5.10.81-")
+# The AArch32 compat select carrier (docs/analysis/compat-select-carrier-plan.md)
+# is the substitute for a kernel whose 64-bit select_stack is infeasible -- the
+# sigreturn-only set, determined from the superset's own route verdicts rather
+# than a version prefix. Its geometry is the measured 5.10 pre-136 family:
+# futex_time32 strip 0x1b0 / futex_time64 0x1c0, _newselect buffer 0x1e0.
 COMPAT_WAITER_HOME = 0x1B0
 COMPAT_SELECT_DST_DEPTH = 0x1E0
 # Same order as the Rust store harness (tests/common/mod.rs sidecar_args).
@@ -142,6 +144,19 @@ def choose_route(options):
     return feasible[0]
 
 
+def sigreturn_only(options):
+    """The 64-bit select_stack is infeasible and sigreturn is feasible.
+
+    That is the set the AArch32 compat select carrier exists for. Derived from
+    the superset's own verdicts, not from a kernel-version prefix.
+    """
+    verdicts = {r.get("route"): r.get("verdict") for r in options.get("routes", [])}
+    return (
+        verdicts.get("select_stack") == "infeasible"
+        and verdicts.get("sigreturn") == "feasible"
+    )
+
+
 def phys_map_lines(options):
     """The two lines that make every device in the superset's devices[] resolve."""
     devices = options.get("devices") or []
@@ -184,6 +199,38 @@ def compat_anchor(options):
             aligned = (image + 7) & ~7
             return aligned, int(anchor.get("bytes", 4096)), int(anchor.get("stride", 32))
     raise NotShippable("compat carrier: no dump_skip anchor candidate")
+
+
+def mm_struct_stride(directory):
+    """The QEMU runtime dump's /proc/slabinfo mm_struct objsize, or None.
+
+    The extractor deliberately emits no stride (a generated profile should
+    measure it, not seed it); the store's runtime dump is the measurement.
+    """
+    for path in sorted(glob.glob(os.path.join(directory, "runtime-*.txt"))):
+        for line in open(path, encoding="utf-8", errors="replace"):
+            parts = line.split()
+            if len(parts) >= 5 and parts[0] == "SLAB" and parts[1] == "mm_struct":
+                try:
+                    return int(parts[4])
+                except ValueError:
+                    return None
+    return None
+
+
+def set_mm_struct_stride(text, stride):
+    """Write the measured slab stride into the kernelsnitch block."""
+    line = (
+        f"  # measured /proc/slabinfo mm_struct objsize {stride} (QEMU).\n"
+        f"  mm_struct_sz = {stride}\n"
+    )
+    existing = re.compile(r"^  mm_struct_sz\s*=\s*\d+\s*$", re.MULTILINE)
+    if existing.search(text):
+        return existing.sub(f"  mm_struct_sz = {stride}", text, count=1)
+    block = re.search(r"^kernelsnitch\s*\{\s*\n", text, re.MULTILINE)
+    if block:
+        return text[: block.end()] + line + text[block.end():]
+    return text + f"\nkernelsnitch {{\n{line}}}\n"
 
 
 def replace_route_block(text, block):
@@ -245,7 +292,13 @@ def validate(entry):
     devices = entry_devices(entry["meta"], entry["directory"])
     if not devices:
         raise NotShippable("no device sidecar set")
-    compat = compat_anchor(options) if entry["release"].startswith(COMPAT_PREFIXES) else None
+    compat = None
+    if sigreturn_only(options):
+        try:
+            compat = compat_anchor(options)
+        except NotShippable:
+            # No dump_skip candidate: the profile still ships, on sigreturn.
+            compat = None
     entry.update(
         options=options,
         image=entry_image(entry["meta"], entry["directory"]),
@@ -253,6 +306,7 @@ def validate(entry):
         primary=devices[0],
         route=choose_route(options),
         maps=phys_map_lines(options),
+        stride=mm_struct_stride(entry["directory"]),
         compat=compat,
     )
     return entry
@@ -308,6 +362,8 @@ def asset_text(entry, rendered):
     if entry["maps"]:
         text = replace_line(text, "kernel_phys_load", entry["maps"][0])
         text = replace_line(text, "kernel_phys_offset", entry["maps"][1])
+    if entry.get("stride"):
+        text = set_mm_struct_stride(text, entry["stride"])
     if entry.get("compat"):
         image, anchor_bytes, anchor_stride = entry["compat"]
         text = replace_route_block(

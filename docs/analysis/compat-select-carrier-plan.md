@@ -277,6 +277,15 @@ to 236 and, if a 101 ROM package appears, the 101 series; evidence:
 **G5 — 5.10.101 series outcome.** Same series as G4 if the ROM flash was used; promotes
 or rejects the candidate. 5.10.43 has no device — QEMU evidence only.
 
+**2026-11-07 — the ship-time version gate is removed.** `ship_golden_profiles.py` now
+chooses the carrier from the store superset's own verdict (`select_stack` infeasible and
+`sigreturn` feasible), not from a 5.10.43/5.10.81 prefix, and writes the measured
+`mm_struct_sz` from each entry's runtime dump (the re-renders had been losing it since
+r8). All seven sigreturn-only bundled assets — 5.10.43, 5.10.66, 5.10.81 ×2, 5.10.101 ×3 —
+now carry `select_stack` with `compat_carrier = 1`. 5.10.66 joined the store after the G1
+sweep and rides the class rule; its own G1 re-run and the 5.10.101 device gate (G5)
+remain open.
+
 **G6 — evidence.** `external/port/compat-carrier-<date>/` with the QEMU logs, run stores
 and excerpts; plan-doc result; PORT-PLAN.
 
