@@ -19,12 +19,12 @@ Current mix: 56 page-free, 2 half-page, 7 page-based.
 | Kernel (`uname -r`) | Route | Page-free | Verified | Devices |
 |---|---|---|---|---|
 | `5.10.43-android12-9-gb8e472053352-ab8059253` | select_stack (compat) | page-free | QEMU | Xiaomi 12 Pro |
-| `5.10.66-android12-9-00001-g41ff3fa8fff9-ab8171928` | sigreturn | page-free | QEMU | Redmi Note 11T Pro / POCO X4 GT — MIUI 13 |
-| `5.10.81-android12-9-00001-g6cd504626bae-ab8485363` | select_stack | page-free | device | Redmi K50 Ultra — Global `V13.0.3.0` / `V13.0.4.0` (the launch ROM, Android 12) |
+| `5.10.66-android12-9-00001-g41ff3fa8fff9-ab8171928` | select_stack (compat) | page-free | QEMU | Redmi Note 11T Pro / POCO X4 GT — MIUI 13 |
+| `5.10.81-android12-9-00001-g6cd504626bae-ab8485363` | select_stack (compat) | page-free | device | Redmi K50 Ultra — Global `V13.0.3.0` / `V13.0.4.0` (the launch ROM, Android 12) |
 | `5.10.81-android12-9-00001-geba40aecb3b7-ab8534902` | select_stack (compat) | page-free | QEMU | Xiaomi 12 Pro Dimensity, Redmi Note 11T Pro / POCO X4 GT |
-| `5.10.101-android12-9-00001-gf4c0e37dbcde-ab8596533` | select_stack | page-free | QEMU | Redmi Pad, Redmi K50 Pro |
-| `5.10.101-android12-9-00005-ga829d48e78bd-ab9206161` | select_stack | page-free | QEMU (candidate) | Redmi K50 Ultra — Global `V14.0.1.0` |
-| `5.10.101-android12-9-00027-g1292f517889e-ab8602202` | select_stack | page-free | QEMU | Xiaomi 12T, Redmi K50 Pro, Redmi Note 11T Pro / POCO X4 GT |
+| `5.10.101-android12-9-00001-gf4c0e37dbcde-ab8596533` | select_stack (compat) | page-free | QEMU | Redmi Pad, Redmi K50 Pro |
+| `5.10.101-android12-9-00005-ga829d48e78bd-ab9206161` | select_stack (compat) | page-free | QEMU (candidate) | Redmi K50 Ultra — Global `V14.0.1.0` |
+| `5.10.101-android12-9-00027-g1292f517889e-ab8602202` | select_stack (compat) | page-free | QEMU | Xiaomi 12T, Redmi K50 Pro, Redmi Note 11T Pro / POCO X4 GT |
 | `5.10.136-android12-9-00020-gc9f59ef34367-ab9585114` | select_stack | page-free | QEMU | Xiaomi Civi 3, Redmi K50 Pro, Redmi Note 11T Pro / POCO X4 GT |
 | `5.10.136-android12-9-00021-g821df8f5bd36-ab9585204` | select_stack | page-free | QEMU (candidate) | Redmi K50 Ultra — Global `V14.0.3.0` |
 | `5.10.168-android12-9-00001-g81e7418c6466-ab10486262` | select_stack | page-free | QEMU | Redmi K50, Redmi K50 Pro, Redmi Note 11T Pro / POCO X4 GT |
@@ -90,8 +90,7 @@ Notes:
   `offset.*` values can be checked, and all nine match.
 - The seven `tcp_zerocopy` rows marked *unverified* were kept from upstream unchanged; this branch
   has no runtime witness for them.
-- The 5.10 rows are this fork's own. Upstream has no 5.10 family — no bundled profile and no 5.10
-  entry in the extractor.
+- The **5.10** profiles are provided by this fork; upstream does not cover the 5.10 family.
 - The four templates (`5.15-template`, `6.1-template`, `6.6-template`, `6.12-template`) are
   reference documents for profile generation; they never match a device.
 - A MediaTek device that cannot get past W1 (`W1: target 0x0`)? See [MEDIATEK.md](MEDIATEK.md) for
