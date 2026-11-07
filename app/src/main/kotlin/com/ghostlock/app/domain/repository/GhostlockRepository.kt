@@ -10,6 +10,7 @@ import com.ghostlock.app.domain.model.MeasurementMergeRow
 import com.ghostlock.app.domain.model.OffsetCandidate
 import com.ghostlock.app.domain.model.OffsetImportResult
 import com.ghostlock.app.domain.model.ParseResult
+import com.ghostlock.app.domain.model.PreflightResult
 import com.ghostlock.app.domain.model.ProfileConfig
 import com.ghostlock.app.domain.model.ProfileDiffRow
 import com.ghostlock.app.domain.model.RunLogEntry
@@ -207,6 +208,14 @@ interface GhostlockRepository {
     suspend fun runExploit(pair: CpuPair, onLog: (String) -> Unit): Int
 
     suspend fun runExploitWithShizuku(pair: CpuPair, onLog: (String) -> Unit): Int
+
+    /**
+     * Run-start pre-flight (class 1 of the 2026-11-07 exit audit): anchor slot
+     * state, CPU-pair affinity, and the root-manager scan. Returns the first
+     * blocking failure, or [PreflightResult.Passed]. App-side only; the native
+     * keeps its own refusals as the authority.
+     */
+    suspend fun preflight(pair: CpuPair, useShizuku: Boolean): PreflightResult
 
     /**
      * The step left `in_progress` by the previous run (usually a kernel panic),

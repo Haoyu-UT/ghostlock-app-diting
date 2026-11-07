@@ -25,6 +25,8 @@ import com.ghostlock.app.domain.model.MeasurementMergeRow
 import com.ghostlock.app.domain.model.ParseResult
 import com.ghostlock.app.domain.model.PhysImage
 import com.ghostlock.app.domain.model.PhysPromptState
+import com.ghostlock.app.domain.model.PreflightFailure
+import com.ghostlock.app.domain.model.PreflightResult
 import com.ghostlock.app.domain.model.ProfileConfig
 import com.ghostlock.app.domain.model.RootManagerCandidate
 import com.ghostlock.app.domain.model.nextPhysImage
@@ -1092,20 +1094,86 @@ class GhostlockViewModel(
             return
         }
         val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) ?: return
-        if (!beginOperation()) return
-        send(GhostlockEffect.KeepScreenAwake(true))
-        appendLog("==== start ${if (useShizuku) "Shizuku/V20" else "base"} ====")
-        appendLog("cpu pair: ${snapshot.cpuPairLabels.getOrElse(snapshot.selectedCpuPair) { pair.toString() }}")
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val code = runExploitUseCase(pair, useShizuku, ::appendLog)
-                appendLog(if (code == 0) "result: exploit completed" else "result: exploit failed (exit code=$code)")
-                appendLog("exit code=$code")
-            } finally {
-                endOperation()
-                send(GhostlockEffect.KeepScreenAwake(false))
+        val pairLabel = snapshot.cpuPairLabels.getOrElse(snapshot.selectedCpuPair) { pair.toString() }
+        viewModelScope.launch {
+            /* Run-start pre-flight: class-1 checks stop the run before the log
+             * sheet opens, so no run-store entry and no native are created. */
+            when (val preflight = withContext(Dispatchers.IO) { repository.preflight(pair, useShizuku) }) {
+                is PreflightResult.Blocked -> {
+                    showPreflightNotice(preflight.failure)
+                    return@launch
+                }
+                PreflightResult.Passed -> Unit
+            }
+            if (!beginOperation()) return@launch
+            send(GhostlockEffect.KeepScreenAwake(true))
+            appendLog("==== start ${if (useShizuku) "Shizuku/V20" else "base"} ====")
+            appendLog("cpu pair: $pairLabel")
+            withContext(Dispatchers.IO) {
+                try {
+                    val code = runExploitUseCase(pair, useShizuku, ::appendLog)
+                    appendLog(if (code == 0) "result: exploit completed" else "result: exploit failed (exit code=$code)")
+                    appendLog("exit code=$code")
+                } finally {
+                    endOperation()
+                    send(GhostlockEffect.KeepScreenAwake(false))
+                }
             }
         }
+    }
+
+    /**
+     * One NOTICE dialog: title + message, one dismiss, no confirm, no export.
+     * Shared by the root-manager warning, the run-start pre-flight and the
+     * next-launch notices so their layout and dismissal cannot drift.
+     */
+    private fun showNotice(titleRes: Int, messageRes: Int) {
+        mutableState.update {
+            it.copy(
+                dialogVisible = true,
+                dialogType = DialogType.NOTICE,
+                dialogTitleRes = titleRes,
+                dialogMessageRes = messageRes,
+                dialogMessage = "",
+                dialogLayerNotice = null,
+                dialogExportLog = false,
+                dialogDocUrl = null,
+                dialogItems = emptyList(),
+                dialogItemResIds = emptyList(),
+                dialogLeadingResId = null,
+                dialogCurrentItemIndex = -1,
+            )
+        }
+    }
+
+    private fun showPreflightNotice(failure: PreflightFailure) {
+        val title: Int
+        val message: Int
+        when (failure) {
+            PreflightFailure.ANCHOR_STATE_UNCONFIRMED -> {
+                title = R.string.preflight_anchor_title
+                message = R.string.preflight_anchor_boot
+            }
+            PreflightFailure.ANCHOR_BUDGET_SPENT -> {
+                title = R.string.preflight_anchor_title
+                message = R.string.preflight_anchor_spent
+            }
+            PreflightFailure.ANCHOR_GRID_MISMATCH -> {
+                title = R.string.preflight_anchor_title
+                message = R.string.preflight_anchor_grid
+            }
+            PreflightFailure.CPU_PAIR_UNAVAILABLE -> {
+                title = R.string.preflight_cpu_title
+                message = R.string.preflight_cpu_message
+            }
+            PreflightFailure.NO_ROOT_MANAGER -> {
+                /* The same warning the picker used to show; the picker keeps
+                 * listing/selection, the run attempt is what blocks. */
+                title = R.string.manager_picker_title
+                message = R.string.manager_picker_empty
+            }
+        }
+        showNotice(title, message)
     }
 
     fun onCloseExecutionSheet() {
@@ -1213,22 +1281,10 @@ class GhostlockViewModel(
             val selected = repository.selectedManagerPackage()
             managerChoices = candidates
             if (candidates.isEmpty()) {
-                mutableState.update {
-                    it.copy(
-                        dialogVisible = true,
-                        dialogType = DialogType.NOTICE,
-                        dialogTitleRes = R.string.manager_picker_title,
-                        dialogMessageRes = R.string.manager_picker_empty,
-                        dialogMessage = "",
-                        dialogLayerNotice = null,
-                        dialogExportLog = false,
-                        dialogDocUrl = null,
-                        dialogItems = emptyList(),
-                        dialogItemResIds = emptyList(),
-                        dialogLeadingResId = null,
-                        dialogCurrentItemIndex = -1,
-                    )
-                }
+                /* The blocking warning belongs to the run attempt (runExploit's
+                 * pre-flight); opening the picker with nothing to list says so
+                 * briefly instead of raising the same dialog out of context. */
+                send(GhostlockEffect.Toast(R.string.manager_picker_empty))
                 return@launch
             }
             val selectedIndex = candidates.indexOfFirst { it.packageName == selected }

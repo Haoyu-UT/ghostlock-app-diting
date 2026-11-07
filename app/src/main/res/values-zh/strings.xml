@@ -396,4 +396,10 @@
     <string name="manager_summary_auto">自动（推荐）</string>
     <string name="manager_picker_title">root管理器</string>
     <string name="manager_picker_empty">未找到可用的 ksud。请安装 KernelSU 系 root 管理器。</string>
+    <string name="preflight_anchor_title">锚点状态不可用</string>
+    <string name="preflight_anchor_boot">本应用是在本次开机后安装或更新的，无法确认本次开机已用过的锚点槽位。请重启手机后再运行。</string>
+    <string name="preflight_anchor_spent">本次开机的锚点槽位已用尽，继续运行可能破坏内核数据。请重启手机后再运行。</string>
+    <string name="preflight_anchor_grid">锚点状态文件与当前配置的槽位网格不一致。请重启手机后再运行。</string>
+    <string name="preflight_cpu_title">CPU 组合不可用</string>
+    <string name="preflight_cpu_message">所选 CPU 组合当前不可用（系统可能暂停了该核心）。请换一组 CPU，或重启手机后再试。</string>
 </resources>

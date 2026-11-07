@@ -319,6 +319,17 @@ data class ProfileDiffRow(
 )
 
 /** Resolved execution view for the advanced editor (controller-owned). */
+/**
+ * The active route's lock-anchor trio, as the resolved profile states it.
+ * [bytes]/[stride] are null when the profile leaves them to the native
+ * defaults (0x1000 / 0x20); [image] is the image-relative offset.
+ */
+data class AnchorGeometry(
+    val image: Long,
+    val bytes: Long? = null,
+    val stride: Long? = null,
+)
+
 data class ProfileConfig(
     val release: String,
     val hasProfile: Boolean,
@@ -330,6 +341,8 @@ data class ProfileConfig(
     /** Resolved physical pair; null when the profile carries none for this device. */
     val physLoad: Long? = null,
     val physOffset: Long? = null,
+    /** Active route's anchor, when the profile states one (page-free routes). */
+    val anchor: AnchorGeometry? = null,
     /** Layer state of this resolution; null when nothing resolved. */
     val layers: ProfileLayers? = null,
     /** Hierarchical view of every numeric leaf, override flags included. */

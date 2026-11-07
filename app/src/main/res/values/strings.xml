@@ -396,4 +396,10 @@
     <string name="manager_summary_auto">Auto (recommended)</string>
     <string name="manager_picker_title">Root manager</string>
     <string name="manager_picker_empty">No usable ksud found. Install a KernelSU-family root manager.</string>
+    <string name="preflight_anchor_title">Anchor state unavailable</string>
+    <string name="preflight_anchor_boot">This app was installed or updated after this boot, so the anchor slots already used cannot be confirmed. Reboot the phone, then run.</string>
+    <string name="preflight_anchor_spent">This boot\'s anchor slot budget is spent; continuing could corrupt kernel data. Reboot the phone, then run.</string>
+    <string name="preflight_anchor_grid">The anchor state file does not match this profile\'s slot grid. Reboot the phone, then run.</string>
+    <string name="preflight_cpu_title">CPU pair unavailable</string>
+    <string name="preflight_cpu_message">The selected CPU pair is currently unavailable (the system may have paused one of its cores). Choose another pair, or reboot and try again.</string>
 </resources>

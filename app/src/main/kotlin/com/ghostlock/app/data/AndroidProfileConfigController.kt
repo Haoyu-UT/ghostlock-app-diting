@@ -10,6 +10,7 @@ import com.ghostlock.app.data.profile.PerDevicePhys
 import com.ghostlock.app.data.profile.ProfileMerger
 import com.ghostlock.app.data.profile.ProfileResolver
 import com.ghostlock.app.data.route.RouteKind
+import com.ghostlock.app.domain.model.AnchorGeometry
 import com.ghostlock.app.domain.model.CpuPair
 import com.ghostlock.app.domain.model.ExecutionFieldValue
 import com.ghostlock.app.domain.model.ExternalProfileInfo
@@ -93,12 +94,25 @@ internal class AndroidProfileConfigController(
             resolve(release, pair, null).profile ?: full
         }
         val roots = buildTree(complete, "", baseline, overrides ?: valueMapOf())
+        /* The anchor trio lives in the active route's own branch; the native
+         * writes only that section to the wire (NativeProfile: "only the
+         * active route's route.* section is written"). */
+        val anchor = route?.let { name ->
+            full.getLongAt("route.$name.lock_anchor_image")?.let { image ->
+                AnchorGeometry(
+                    image = image,
+                    bytes = full.getLongAt("route.$name.lock_anchor_bytes"),
+                    stride = full.getLongAt("route.$name.lock_anchor_stride"),
+                )
+            }
+        }
         return ProfileConfig(
             release = release,
             hasProfile = true,
             pair = pair,
             physLoad = full.getLongAt("kernel_phys_load"),
             physOffset = full.getLongAt("kernel_phys_offset"),
+            anchor = anchor,
             layers = resolution.layers.copy(
                 uncarriedKeys = uncarriedRouteKeys(full, route),
             ),

@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.content.ContentValues
 import android.content.Context
 import android.os.Build
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.system.Os
 import android.util.Log
@@ -26,6 +27,8 @@ import com.ghostlock.app.data.ota.OtaPayloadExtractor
 import com.ghostlock.app.data.profile.PerDevicePhys
 import com.ghostlock.app.domain.model.OffsetImportResult
 import com.ghostlock.app.domain.model.ParseResult
+import com.ghostlock.app.domain.model.PreflightFailure
+import com.ghostlock.app.domain.model.PreflightResult
 import com.ghostlock.app.domain.model.ProfileConfig
 import com.ghostlock.app.domain.model.ProfileDiffRow
 import com.ghostlock.app.domain.model.RunLogEntry
@@ -99,6 +102,15 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         const val StatusMarker = "\u001eGLK_STATUS"
         const val StatusAck = "\u001eGLK_STATUS_ACK\n"
         const val StatusDisabled = "\u001eGLK_STATUS_DISABLED"
+
+        /* Native `config::anchor_state_file`: home_dir + "/.ghostlock_anchor".
+         * The direct path's home is filesDir; the Shizuku service's is
+         * /data/local/tmp/ghostlock-app, outside the app sandbox. */
+        const val AnchorStateFileName = ".ghostlock_anchor"
+
+        /* A pre-flight manager choice is reused only this soon, and only while
+         * the chosen binary still exists. */
+        const val PreflightManagerMaxAgeMs = 15_000L
     }
 
     private val appContext = context.applicationContext
@@ -737,6 +749,70 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         }
         digest.digest().joinToString("") { "%02x".format(it) }
     }.getOrNull()
+
+    /* --- run-start pre-flight (class 1 of the 2026-11-07 exit audit) ------ */
+
+    /** Candidate the pre-flight selected; consumed once by [stageKsud]. */
+    @Volatile
+    private var preflightManager: Pair<Long, ManagerScanner.Candidate>? = null
+
+    override suspend fun preflight(pair: CpuPair, useShizuku: Boolean): PreflightResult =
+        withContext(Dispatchers.IO) {
+            /* The anchor state file lives under GHOSTLOCK_HOME, and the CPU pin
+             * runs in the native's process: for the Shizuku path that home is
+             * /data/local/tmp/ghostlock-app and the process is the shell's, so
+             * neither judgement is ours to make here. Both are deferred to the
+             * service (or to the class-2 pattern). */
+            if (!useShizuku) {
+                anchorFailure(pair)?.let { return@withContext PreflightResult.Blocked(it) }
+                if (!CpuPairProbe.usable(pair)) {
+                    return@withContext PreflightResult.Blocked(
+                        PreflightFailure.CPU_PAIR_UNAVAILABLE,
+                    )
+                }
+            }
+            /* A scan that throws is not proof of "no manager": fail open and
+             * let stageKsud report it (the class-2 pattern covers that). */
+            val candidates = runCatching { ManagerScanner.scan(appContext) }.getOrNull()
+            if (candidates != null) {
+                val chosen = ManagerScanner.resolve(candidates, selectedManagerPackage())
+                    ?: return@withContext PreflightResult.Blocked(
+                        PreflightFailure.NO_ROOT_MANAGER,
+                    )
+                preflightManager = SystemClock.elapsedRealtime() to chosen
+            }
+            PreflightResult.Passed
+        }
+
+    /**
+     * Mirror of `lock_anchor.cpp`'s boot-scoped decision. Returns the blocking
+     * failure, or null when a slot can be handed out (or there is no anchor to
+     * check here).
+     */
+    private suspend fun anchorFailure(pair: CpuPair): PreflightFailure? {
+        val config = runCatching { profileController.load(deviceRelease(), pair) }.getOrNull()
+            ?: return null
+        val anchor = config.anchor ?: return null
+        val bytes = anchor.bytes ?: AnchorSlotState.DefaultBytes
+        val stride = anchor.stride ?: AnchorSlotState.DefaultStride
+        /* A contradictory geometry is the validator's job (class 1 P2); do not
+         * guess a grid here. */
+        if (bytes <= 0L || stride < AnchorSlotState.MinStride || bytes % stride != 0L) return null
+        val slots = bytes / stride
+        /* read_boot_id() falls back to "unknown-boot" natively; mirror it so the
+         * gate and the native cannot disagree. */
+        val bootId = runCatching {
+            File("/proc/sys/kernel/random/boot_id").readText().trim()
+        }.getOrNull().orEmpty().ifEmpty { "unknown-boot" }
+        val state = runCatching { File(filesDir, AnchorStateFileName).readText() }.getOrNull()
+        val trusted = InstallClock.installPredatesBoot(appContext)
+        return when (AnchorSlotState.evaluate(bootId, state, slots, trusted)) {
+            AnchorSlotState.Verdict.OK -> null
+            AnchorSlotState.Verdict.MISSING_UNTRUSTED -> PreflightFailure.ANCHOR_STATE_UNCONFIRMED
+            AnchorSlotState.Verdict.BUDGET_SPENT -> PreflightFailure.ANCHOR_BUDGET_SPENT
+            AnchorSlotState.Verdict.GRID_MISMATCH -> PreflightFailure.ANCHOR_GRID_MISMATCH
+        }
+    }
 
     override suspend fun runExploit(pair: CpuPair, onLog: (String) -> Unit): Int =
         withDebugAttackLog("direct", onLog, measure = true) { archivedLog, debugDir, runDir, writeSidecar ->
@@ -1605,25 +1681,41 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
      * refuse to start the exploit (and say why in the run log).
      */
     private suspend fun stageKsud(workDir: File, onLog: (String) -> Unit): Boolean = withContext(Dispatchers.IO) {
-        val candidates = runCatching { ManagerScanner.scan(appContext) }.getOrElse {
-            onLog("<k> error: ksud scan failed: ${it.message}")
-            return@withContext false
-        }
-        val suitable = candidates.filter { it.suitable }
-        onLog("<k> ksud scan: ${candidates.size} candidate(s), ${suitable.size} suitable")
-        candidates.forEach {
-            onLog("<k>   ${it.packageName}: ${it.path} [${it.verdict}]")
-        }
-        val chosen = ManagerScanner.resolve(candidates, selectedManagerPackage())
-        if (chosen == null) {
-            onLog("<k> error: no suitable ksud found; refusing to start the exploit")
-            return@withContext false
-        }
-        if (suitable.size > 1) {
+        val preflight = preflightManager.also { preflightManager = null }
+        val chosen = if (preflight != null &&
+            SystemClock.elapsedRealtime() - preflight.first <= PreflightManagerMaxAgeMs &&
+            File(preflight.second.path).isFile
+        ) {
+            /* The pre-flight just ran the same scan; reuse its choice instead of
+             * paying the package/ELF scan twice per run. The freshness and
+             * existence checks above fall back to a fresh scan. */
             onLog(
-                "<k> ksud: ${suitable.size} suitable; using ${chosen.packageName} " +
-                    "(Advanced -> Root manager to change)",
+                "<k> ksud: using pre-flight selection ${preflight.second.packageName} " +
+                    "${preflight.second.path} [${preflight.second.verdict}]",
             )
+            preflight.second
+        } else {
+            val candidates = runCatching { ManagerScanner.scan(appContext) }.getOrElse {
+                onLog("<k> error: ksud scan failed: ${it.message}")
+                return@withContext false
+            }
+            val suitable = candidates.filter { it.suitable }
+            onLog("<k> ksud scan: ${candidates.size} candidate(s), ${suitable.size} suitable")
+            candidates.forEach {
+                onLog("<k>   ${it.packageName}: ${it.path} [${it.verdict}]")
+            }
+            val resolved = ManagerScanner.resolve(candidates, selectedManagerPackage())
+            if (resolved == null) {
+                onLog("<k> error: no suitable ksud found; refusing to start the exploit")
+                return@withContext false
+            }
+            if (suitable.size > 1) {
+                onLog(
+                    "<k> ksud: ${suitable.size} suitable; using ${resolved.packageName} " +
+                        "(Advanced -> Root manager to change)",
+                )
+            }
+            resolved
         }
         val output = File(workDir, "ksud")
         runCatching {
