@@ -1023,6 +1023,11 @@ class GhostlockViewModel(
         mutableState.update { it.copy(forceAttackTestEnabled = enabled) }
     }
 
+    fun toggleSecondWay(enabled: Boolean) {
+        repository.setSecondWay(enabled)
+        mutableState.update { it.copy(secondWayEnabled = enabled) }
+    }
+
     fun setVrKoTagClear(mode: VrKoMode) {
         repository.setVrKoTagClear(mode)
         mutableState.update { it.copy(vrKoTagClear = mode) }
@@ -1598,6 +1603,7 @@ class GhostlockViewModel(
                 cpuPairIndex = snapshot.selectedCpuPair,
                 safeModeEnabled = snapshot.safeModeEnabled,
                 forceAttackTestEnabled = snapshot.forceAttackTest,
+                secondWayEnabled = snapshot.secondWay,
                 vrKoTagClear = snapshot.vrKoTagClear,
                 vrKoSelinuxBlock = snapshot.vrKoSelinuxBlock,
                 shizukuEnabled = snapshot.shizukuEnabled,

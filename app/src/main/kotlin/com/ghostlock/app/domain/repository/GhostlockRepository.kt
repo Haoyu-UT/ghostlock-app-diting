@@ -29,6 +29,9 @@ interface GhostlockRepository {
     /** Skip the pre-attack KernelSU check and run the exploit as a test. */
     fun setForceAttackTest(enabled: Boolean)
 
+    /** Second way: a W1-only run followed by the DirtyFrag page-cache stage. */
+    fun setSecondWay(enabled: Boolean)
+
     /** The user's vr.ko task-tag-clear choice (Auto recommends; On/Off are final). */
     fun setVrKoTagClear(mode: VrKoMode)
 

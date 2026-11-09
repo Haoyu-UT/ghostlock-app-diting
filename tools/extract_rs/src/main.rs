@@ -26,6 +26,7 @@ use ghostlock_extract::kallsyms_finder;
 use ghostlock_extract::layout;
 use ghostlock_extract::options;
 use ghostlock_extract::payload;
+use ghostlock_extract::pipeline;
 use ghostlock_extract::report;
 use ghostlock_extract::structs;
 use ghostlock_extract::symbols::{
@@ -80,6 +81,10 @@ struct Cli {
     /// route written to --format conf; defaults to the analysis suggestion
     #[arg(long, value_parser = ["tcp_zerocopy", "select_stack", "multicast_waiter", "sigreturn"])]
     route: Option<String>,
+    /// pipeline written to --format conf; required when both are feasible.
+    /// The extractor only reports feasibility; it never prefers one.
+    #[arg(long, value_parser = ["ghostlock", "dirtyfrag"])]
+    pipeline: Option<String>,
     /// write the per-route feasibility verdicts as JSON (route, verdict,
     /// numbers, chosen route); exit 7 signals ambiguity
     #[arg(long)]
@@ -860,6 +865,24 @@ fn run(cli: &Cli) -> Result<i32> {
         }
     }
 
+    let pipeline_facts = pipeline::measure(
+        &boot.kernel,
+        &symbols,
+        &rel_symbols,
+        &sorted_offsets,
+        kernel_config.as_ref(),
+        !cli.no_disasm,
+    );
+    let pipeline_verdicts = pipeline::verdicts(&pipeline_facts, &route_verdicts);
+    if cli.format == "conf" {
+        for verdict in &pipeline_verdicts {
+            eprintln!(
+                "info: pipeline {} {}: {}",
+                verdict.pipeline, verdict.verdict, verdict.reason
+            );
+        }
+    }
+
     let missing: Vec<String> = symbol_offsets
         .iter()
         .filter(|(_, value)| value.is_none())
@@ -1037,6 +1060,67 @@ fn run(cli: &Cli) -> Result<i32> {
                 analysis::RouteSelection::None { reason } => {
                     eprintln!("warning: {reason}");
                     None
+                }
+            }
+        };
+        let pipeline = if let Some(forced) = cli.pipeline.as_deref() {
+            match pipeline_verdicts.iter().find(|entry| entry.pipeline == forced) {
+                Some(entry) if entry.verdict == "infeasible" => {
+                    eprintln!(
+                        "error: forced pipeline {forced} is infeasible on this kernel: {}",
+                        entry.reason
+                    );
+                    return Ok(3);
+                }
+                Some(entry) if entry.verdict == "unknown" => {
+                    eprintln!(
+                        "warning: forced pipeline {forced} is unverified (unknown): {}",
+                        entry.reason
+                    );
+                    Some(forced.to_string())
+                }
+                Some(_) => Some(forced.to_string()),
+                None => {
+                    eprintln!("error: unknown pipeline {forced}");
+                    return Ok(3);
+                }
+            }
+        } else if cli.no_disasm {
+            /* The --no-disasm control is a diagnostic pass: the pipeline
+             * cannot be measured, and the route/anchor check must still run. */
+            eprintln!("warning: --no-disasm: pipeline not measured; the profile omits it");
+            None
+        } else {
+            let feasible: Vec<&str> = pipeline_verdicts
+                .iter()
+                .filter(|entry| entry.verdict == "feasible")
+                .map(|entry| entry.pipeline.as_str())
+                .collect();
+            match feasible.as_slice() {
+                [one] => Some((*one).to_string()),
+                [] => {
+                    eprintln!(
+                        "error: no feasible pipeline on this kernel; the profile cannot \
+                         select one"
+                    );
+                    if cli.options_out.is_some() {
+                        ambiguous = true;
+                        None
+                    } else {
+                        return Ok(7);
+                    }
+                }
+                _ => {
+                    eprintln!(
+                        "error: more than one feasible pipeline ({}); pass --pipeline",
+                        feasible.join(", ")
+                    );
+                    if cli.options_out.is_some() {
+                        ambiguous = true;
+                        None
+                    } else {
+                        return Ok(7);
+                    }
                 }
             }
         };
@@ -1540,6 +1624,7 @@ fn run(cli: &Cli) -> Result<i32> {
             phys_source,
             symbols: &symbol_offsets,
             structs: &struct_offsets,
+            pipeline: pipeline.as_deref(),
             route: route.as_deref(),
             route_geometry: &geometry,
             cred: &cred,
@@ -1607,6 +1692,7 @@ fn run(cli: &Cli) -> Result<i32> {
                 phys_source,
                 symbols: &symbol_offsets,
                 structs: &struct_offsets,
+                pipeline: None,
                 route: None,
                 route_geometry: &[],
                 cred: &cred,
@@ -1626,6 +1712,8 @@ fn run(cli: &Cli) -> Result<i32> {
                 phys_source,
                 device: cli.device.as_deref(),
                 verdicts: &route_verdicts,
+                pipeline_facts: &pipeline_facts,
+                pipelines: &pipeline_verdicts,
                 geometry: &all_geometry,
                 initialized,
                 kernel: &boot.kernel,

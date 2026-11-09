@@ -125,6 +125,7 @@ data class GhostlockUiState(
     val customCpuPair: CpuPair? = null,
     val safeModeEnabled: Boolean = false,
     val forceAttackTestEnabled: Boolean = false,
+    val secondWayEnabled: Boolean = false,
     val vrKoTagClear: VrKoMode = VrKoMode.AUTO,
     val vrKoSelinuxBlock: VrKoMode = VrKoMode.AUTO,
     val tcpRouteEnabled: Boolean = true,
@@ -263,6 +264,7 @@ interface GhostlockActions {
     fun onCpuPairSelected(index: Int)
     fun onSafeModeChanged(enabled: Boolean)
     fun onForceAttackTestChanged(enabled: Boolean)
+    fun onSecondWayChanged(enabled: Boolean)
     fun onVrKoTagClearChanged(mode: VrKoMode)
     fun onVrKoSelinuxBlockChanged(mode: VrKoMode)
     fun onShizukuChanged(enabled: Boolean)

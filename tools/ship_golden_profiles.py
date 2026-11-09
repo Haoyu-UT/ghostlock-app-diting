@@ -144,6 +144,69 @@ def choose_route(options):
     return feasible[0]
 
 
+PIPELINES = ["ghostlock", "dirtyfrag"]
+
+
+class PipelineChoiceRequired(Exception):
+    """Both pipelines are feasible and the entry records no choice."""
+
+
+def feasible_pipelines(options):
+    return [
+        entry.get("pipeline")
+        for entry in options.get("pipelines", [])
+        if entry.get("verdict") == "feasible"
+        and entry.get("pipeline") in PIPELINES
+    ]
+
+
+def pipeline_reason(options, name):
+    for entry in options.get("pipelines", []):
+        if entry.get("pipeline") == name:
+            return entry.get("reason", "")
+    return ""
+
+
+def choose_pipeline(options, meta):
+    """The entry's explicit choice, or the only feasible pipeline.
+
+    The extractor never ranks the two; when both are feasible the entry must
+    record `pipeline = ...` in meta.txt. This is the author's choice, not a
+    tool default.
+    """
+    feasible = feasible_pipelines(options)
+    if not feasible:
+        reasons = "; ".join(
+            f"{entry.get('pipeline')}: {entry.get('reason', '')}"
+            for entry in options.get("pipelines", [])
+        )
+        raise NotShippable(f"no feasible pipeline ({reasons})")
+    choice = (meta.get("pipeline") or "").strip().strip('"').lower()
+    if choice:
+        if choice not in feasible:
+            raise PipelineChoiceRequired(
+                f"pipeline {choice} is not feasible: {pipeline_reason(options, choice)}"
+            )
+        return choice
+    if len(feasible) == 1:
+        return feasible[0]
+    raise PipelineChoiceRequired(
+        f"pipeline choice required ({', '.join(feasible)})"
+    )
+
+
+def asset_pipeline(path):
+    """The `pipeline = "..."` line of a rendered asset, if present."""
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError:
+        return None
+    match = re.search(r'(?m)^\s*pipeline\s*=\s*"([^"]+)"', text) or re.search(
+        r'(?m)^\s*pipeline\s*=\s*([A-Za-z0-9_-]+)', text
+    )
+    return match.group(1).strip().lower() if match else None
+
+
 def sigreturn_only(options):
     """The 64-bit select_stack is infeasible and sigreturn is feasible.
 
@@ -309,6 +372,7 @@ def validate(entry):
         stride=mm_struct_stride(entry["directory"]),
         compat=compat,
     )
+    entry["feasible_pipelines"] = feasible_pipelines(options)
     return entry
 
 
@@ -346,6 +410,7 @@ def render(extract, entry, out_path):
         "--route", entry["route"],
         "--anchor",
         "--device", entry["primary"],
+        "--pipeline", entry["choice_pipeline"],
         "--out", out_path,
     ]
     result = subprocess.run(command, capture_output=True, text=True)
@@ -386,8 +451,9 @@ def asset_text(entry, rendered):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true", help="report only, exit 1 on a missing golden")
+    parser.add_argument("--check", action="store_true", help="report only, exit 1 on a missing or mismatched golden")
     parser.add_argument("--apply", action="store_true", help="render and index the missing goldens")
+    parser.add_argument("--refresh", action="store_true", help="rewrite existing SHIPPED GOLDEN assets whose pipeline line is missing or infeasible")
     parser.add_argument("--store", default=DEFAULT_STORE)
     parser.add_argument("--assets", default=DEFAULT_ASSETS)
     parser.add_argument("--extract", default=DEFAULT_EXTRACT)
@@ -396,9 +462,10 @@ def main():
         help="limit to releases matching any given substring (debugging)",
     )
     args = parser.parse_args()
-    if args.check and args.apply:
-        parser.error("--check and --apply are mutually exclusive")
-    apply = not args.check
+    if args.check and (args.apply or args.refresh):
+        parser.error("--check is mutually exclusive with --apply/--refresh")
+    if args.apply and args.refresh:
+        parser.error("--apply and --refresh are mutually exclusive")
 
     found, exempt = candidates(args.store)
     index = index_releases(args.assets)
@@ -413,20 +480,67 @@ def main():
         release = entry["release"]
         if args.only and not any(needle in release for needle in args.only):
             continue
-        if release in index and release in assets:
+        asset_path = os.path.join(args.assets, release + ".conf")
+        has_asset = os.path.isfile(asset_path)
+        try:
+            validate(entry)
+        except NotShippable as error:
+            reason = str(error)
+            # A hand-finished asset is the documented exception when the store
+            # entry has no superset / no sidecar set / mixed physical pairs.
+            # A stale asset on a kernel with no feasible route or pipeline is
+            # a real content failure.
+            hand_finished = has_asset and not any(
+                phrase in reason
+                for phrase in ("no feasible route", "no feasible pipeline")
+            )
+            if hand_finished:
+                bundled += 1
+            elif has_asset:
+                entry["reasons"] = [f"asset present but entry is not shippable: {reason}"]
+                missing.append(entry)
+            else:
+                exempt.append((release, reason))
+            continue
+        feasible = entry["feasible_pipelines"]
+        if has_asset:
+            chosen = asset_pipeline(asset_path)
+            if not feasible:
+                entry["reasons"] = ["asset present but no feasible pipeline"]
+                missing.append(entry)
+                continue
+            if chosen is None:
+                entry["reasons"] = [
+                    f"asset has no pipeline line (feasible: {', '.join(feasible)})"
+                ]
+                missing.append(entry)
+                continue
+            if chosen not in feasible:
+                entry["reasons"] = [
+                    f"asset pipeline {chosen} is infeasible: "
+                    f"{pipeline_reason(entry['options'], chosen)}"
+                ]
+                missing.append(entry)
+                continue
+            if release not in index:
+                entry["reasons"] = ["asset present but not in index.conf"]
+                missing.append(entry)
+                continue
             bundled += 1
             continue
-        if release not in assets:
-            try:
-                validate(entry)
-            except NotShippable as error:
-                exempt.append((release, str(error)))
-                continue
+        try:
+            entry["choice_pipeline"] = choose_pipeline(entry["options"], entry["meta"])
+        except PipelineChoiceRequired as error:
+            entry["reasons"] = [str(error)]
+            missing.append(entry)
+            continue
+        except NotShippable as error:
+            exempt.append((release, str(error)))
+            continue
         entry["reasons"] = []
         if release not in index:
             entry["reasons"].append("not in index.conf")
-        if release not in assets:
-            entry["reasons"].append("no asset file")
+        entry["reasons"].append("no asset file")
         missing.append(entry)
 
     if args.check:
@@ -445,30 +559,47 @@ def main():
         parser.error(f"extractor not found: {args.extract} (build tools/extract_rs)")
 
     shipped = []
-    index_only = []
+    refreshed = []
     failures = []
     index_path = os.path.join(args.assets, "index.conf")
     for entry in missing:
         asset_path = os.path.join(args.assets, entry["release"] + ".conf")
-        if not os.path.isfile(asset_path):
-            with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as handle:
-                temp_path = handle.name
-            try:
-                render(args.extract, entry, temp_path)
-                rendered = open(temp_path, encoding="utf-8").read()
-            except Exception as error:  # noqa: BLE001 - report each entry, keep going
-                failures.append((entry["release"], str(error)))
+        exists = os.path.isfile(asset_path)
+        if exists and not args.refresh:
+            failures.append((entry["release"], "asset exists; use --refresh to rewrite it"))
+            continue
+        if exists:
+            first = open(asset_path, encoding="utf-8").readline()
+            if not first.startswith("# SHIPPED GOLDEN"):
+                failures.append((entry["release"], "asset is hand-finished; not overwritten"))
                 continue
-            finally:
-                if os.path.exists(temp_path):
-                    os.unlink(temp_path)
-            with open(asset_path, "w", encoding="utf-8") as handle:
-                handle.write(asset_text(entry, rendered))
-            shipped.append(entry["release"])
+            if "choice_pipeline" not in entry:
+                try:
+                    entry["choice_pipeline"] = choose_pipeline(
+                        entry["options"], entry["meta"]
+                    )
+                except (PipelineChoiceRequired, NotShippable) as error:
+                    failures.append((entry["release"], str(error)))
+                    continue
+        with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as handle:
+            temp_path = handle.name
+        try:
+            render(args.extract, entry, temp_path)
+            rendered = open(temp_path, encoding="utf-8").read()
+        except Exception as error:  # noqa: BLE001 - report each entry, keep going
+            failures.append((entry["release"], str(error)))
+            continue
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+        with open(asset_path, "w", encoding="utf-8") as handle:
+            handle.write(asset_text(entry, rendered))
+        if exists:
+            refreshed.append(entry["release"])
         else:
-            index_only.append(entry["release"])
+            shipped.append(entry["release"])
 
-    new_index = [release for release in sorted(shipped + index_only) if release not in index]
+    new_index = [release for release in sorted(shipped) if release not in index]
     if new_index:
         text = open(index_path, encoding="utf-8").read()
         text = add_index_entries(text, new_index)
@@ -477,14 +608,14 @@ def main():
 
     for release in shipped:
         print(f"shipped {release}")
-    for release in index_only:
-        print(f"indexed {release} (asset already present)")
+    for release in refreshed:
+        print(f"refreshed {release}")
     for release, reason in exempt:
         print(f"exempt  {release}: {reason}")
     for release, error in failures:
         print(f"FAILED  {release}: {error}", file=sys.stderr)
     print(
-        f"shipped {len(shipped)}, indexed {len(index_only)}, exempt {len(exempt)}, "
+        f"shipped {len(shipped)}, refreshed {len(refreshed)}, exempt {len(exempt)}, "
         f"failed {len(failures)}, already bundled {bundled}"
     )
     return 1 if failures else 0

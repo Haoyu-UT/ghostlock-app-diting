@@ -78,9 +78,21 @@ internal class AndroidProfileConfigController(
         }
         val route = routeNameOf(full)
         val fallbackTo = fallbackTargetOf(full)
+        val pipeline = (full["pipeline"] as? String)
+            ?.trim()
+            ?.lowercase()
+            ?.takeIf { it.isNotEmpty() }
         val invalidPaths = validateProfileFields(full, route, fallbackTo) +
             ProfileResolver.validateMerged(full, route, fallbackTo)
-                .mapTo(mutableSetOf()) { it.fieldPath }
+                .mapTo(mutableSetOf()) { it.fieldPath } +
+            /* A profile that carries the KDP fact but omits the selector is
+             * from the transition window; the legacy ghostlock default must
+             * not run the known-fatal chain there. */
+            if (pipeline == null && (full["kdp"] as? Number)?.toLong() == 1L) {
+                setOf("pipeline")
+            } else {
+                emptySet()
+            }
         /* Invalid fields missing from the resolved document still get a row,
          * otherwise the run stays blocked with no red field to fix. */
         materializeInvalidPaths(full, invalidPaths)
@@ -120,6 +132,7 @@ internal class AndroidProfileConfigController(
             general = generalFields(full, baseline, route, fallbackTo),
             route = route,
             fallbackTo = fallbackTo,
+            pipeline = pipeline,
             invalidPaths = invalidPaths,
         )
     }

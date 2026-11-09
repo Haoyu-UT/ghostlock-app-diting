@@ -42,6 +42,7 @@ CXX_SRCS := \
   core/support/util.cpp \
   core/session/exploit_session.cpp \
   core/session/root_child_frontend.cpp \
+  core/session/dirtyfrag_stage.cpp \
   core/session/backend/cve_2026_43499_backend.cpp \
   core/session/handoff_probe.cpp \
   core/session/victim_process.cpp \
@@ -177,6 +178,7 @@ HOST_ATTACK_DATAFLOW_SOURCES := \
   core/tests/host/glue_stub.cpp \
   core/session/backend/cve_2026_43499_backend.cpp \
   core/session/root_child_frontend.cpp \
+  core/session/dirtyfrag_stage.cpp \
   core/session/exploit_session.cpp \
   core/session/runtime_config.cpp \
   core/memory/heap_context.cpp \

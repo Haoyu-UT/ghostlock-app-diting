@@ -19,8 +19,9 @@ import java.io.File
 /**
  * Covers the platform-facing scan(): package enumeration, the self/system
  * filters, the executable-shape prefilter, the token scan, and the fallback
- * when the `--version` probe cannot run (the fake binary is not executable,
- * so the probe is "unavailable" and suitability falls back to the tokens).
+ * when the `late-load --help` probe cannot run (the fake binary is not
+ * executable, so the probe is "unavailable" and suitability falls back to the
+ * tokens).
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -100,9 +101,8 @@ class ManagerScannerScanTest {
         val candidate = result.single()
         assertTrue(candidate.lateLoadToken)
         assertTrue(candidate.allowShellToken)
-        // The fake file is not executable, so the probe is unavailable and the
-        // static tokens carry suitability.
-        assertEquals(null, candidate.identity)
+        // The fake file is not executable, so the late-load probe is
+        // unavailable and the static tokens carry suitability.
         assertEquals(null, candidate.interfaceOk)
         assertTrue(candidate.suitable)
     }

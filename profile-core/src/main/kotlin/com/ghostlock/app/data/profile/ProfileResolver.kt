@@ -11,6 +11,9 @@ import com.ghostlock.app.data.route.RouteKind
 object ProfileResolver {
     private val KnownTopLevel = setOf(
         "release", "schema_version", "kernel_major", "recommend_shizuku",
+        /* The execution chain this profile selects. The extractor measures the
+         * feasible set; the author records the choice. */
+        "pipeline",
         "route", "fallback", "kernelsnitch", "task_struct", "cred", "offset",
         "kernel_phys_load", "kernel_phys_offset", "execution",
         /* Stage 3: optional per-image waiter layout, carried by the wire. */
@@ -18,6 +21,10 @@ object ProfileResolver {
         /* Page-free Stage 1: selinux_state field offsets and W1's scratch
          * region. Optional; absence keeps the release layout / the page path. */
         "selinux", "w1_scratch",
+        /* The extractor's CONFIG_KDP fact. The second way does not forge
+         * credentials, so this branch carries it as an informational value
+         * only (the Samsung run needs the DirtyFrag stage, not a cred write). */
+        "kdp",
     )
     private val RequiredTopLevel = setOf(
         "release", "schema_version", "kernel_major", "route", "task_struct", "cred", "offset",

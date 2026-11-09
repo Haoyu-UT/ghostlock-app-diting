@@ -9,12 +9,11 @@ import org.junit.Test
 class ManagerScannerTest {
     private fun candidate(
         pkg: String,
-        identity: Boolean? = true,
         iface: Boolean? = null,
         late: Boolean = true,
         allow: Boolean = true,
         builtin: Boolean = false,
-    ) = ManagerScanner.Candidate(pkg, pkg, "/x/$pkg", builtin, late, allow, identity, iface)
+    ) = ManagerScanner.Candidate(pkg, pkg, "/x/$pkg", builtin, late, allow, iface)
 
     @Test
     fun `confirmed interface is suitable`() {
@@ -27,15 +26,10 @@ class ManagerScannerTest {
     }
 
     @Test
-    fun `identity failure is not suitable`() {
-        assertFalse(candidate("a", identity = false).suitable)
-    }
-
-    @Test
     fun `unavailable probe falls back to static tokens`() {
-        assertTrue(candidate("a", identity = null, iface = null).suitable)
-        assertFalse(candidate("a", identity = null, iface = null, allow = false).suitable)
-        assertFalse(candidate("a", identity = null, iface = null, late = false).suitable)
+        assertTrue(candidate("a", iface = null).suitable)
+        assertFalse(candidate("a", iface = null, allow = false).suitable)
+        assertFalse(candidate("a", iface = null, late = false).suitable)
     }
 
     @Test

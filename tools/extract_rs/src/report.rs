@@ -381,6 +381,9 @@ pub struct ConfInputs<'a> {
     pub phys_source: &'a str,
     pub symbols: &'a BTreeMap<String, Option<u64>>,
     pub structs: &'a BTreeMap<String, Option<u32>>,
+    /// The profile's pipeline selection. Omitted for the route-less common
+    /// profile: the superset carries the measured verdicts instead.
+    pub pipeline: Option<&'a str>,
     pub route: Option<&'a str>,
     pub route_geometry: &'a [(&'static str, i64)],
     pub cred: &'a [(String, String)],
@@ -509,6 +512,9 @@ pub fn render_conf_with_device(input: &ConfInputs<'_>, device: Option<&str>) -> 
         fact_sources.insert(0, format!("device={name}"));
     }
     lines.insert(1, format!("# fact_sources: {}", fact_sources.join("; ")));
+    if let Some(pipeline) = input.pipeline {
+        lines.push(format!("pipeline = \"{pipeline}\""));
+    }
     /* Decimal only: HOCON has no `0x` literal, and the Kotlin reader
      * (`getLongAt`) accepts a Number only, so a hex spelling would be silently
      * dropped on import. An unknown phys is an explicit `null`. */
@@ -758,6 +764,7 @@ mod tests {
         let (symbols, structs) = conf_fixture();
         let geometry: Vec<(&'static str, i64)> = vec![("waiter_shift", -2)];
         let inputs = ConfInputs {
+            pipeline: None,
             release: "5.10.198-android12-9-00085-g226a9632f13d-ab11136126",
             phys: Some(0x4000_0000),
             phys_offset: Some(0x4000_0000),
@@ -787,6 +794,7 @@ mod tests {
         let (symbols, structs) = conf_fixture();
         let geometry: Vec<(&'static str, i64)> = vec![("waiter_shift", -2)];
         let out = render_conf(&ConfInputs {
+            pipeline: None,
             release: "6.6.89-android15-8-g0889fe95bb10-ab14402178-4k",
             phys: Some(0x4000_0000),
             phys_offset: None,
@@ -828,6 +836,7 @@ mod tests {
         let (symbols, structs) = conf_fixture();
         let geometry: Vec<(&'static str, i64)> = vec![("compact_waiter", 1)];
         let out = render_conf(&ConfInputs {
+            pipeline: None,
             release: "6.1.118-android14-11-gca0ef6d17716-ab13624819",
             phys: None,
             phys_offset: None,
@@ -910,6 +919,7 @@ mod tests {
             ),
         };
         let out = render_conf(&ConfInputs {
+            pipeline: None,
             release: "6.6.89-android15-8-g0889fe95bb10-ab14402178-4k",
             phys: None,
             phys_offset: None,
@@ -1001,6 +1011,7 @@ mod tests {
             ),
         };
         let out = render_conf(&ConfInputs {
+            pipeline: None,
             release: "6.1.25-android14-11-g8744d1c0cf31-ab10888519",
             phys: None,
             phys_offset: None,
@@ -1054,6 +1065,7 @@ mod tests {
             refs: vec![(0x80, 0xffffffc00ab23a80)],
         };
         let out = render_conf(&ConfInputs {
+            pipeline: None,
             release: "5.15.189-android13-8-00016-g51bba4309aac-ab14546557",
             phys: None,
             phys_offset: None,
@@ -1082,6 +1094,7 @@ mod tests {
     fn operator_physical_override_is_in_the_fact_sources_header() {
         let (symbols, structs) = conf_fixture();
         let out = render_conf(&ConfInputs {
+            pipeline: None,
             release: "6.6.89-android15-8-g0889fe95bb10-ab14402178-4k",
             phys: Some(0xa800_0000),
             phys_offset: None,
@@ -1122,6 +1135,7 @@ mod tests {
             &structs,
         );
         let out = render_conf(&ConfInputs {
+            pipeline: None,
             release: "5.15.189-android13-8-00016-g51bba4309aac-ab14546557",
             phys: None,
             phys_offset: None,
@@ -1303,6 +1317,7 @@ mod tests {
         let symbols: BTreeMap<String, Option<u64>> = BTreeMap::new();
         let structs: BTreeMap<String, Option<u32>> = BTreeMap::new();
         let out = render_conf(&ConfInputs {
+            pipeline: None,
             release: "5.15.178-g3575c47dc7ce-dirty",
             phys: None,
             phys_offset: None,
@@ -1329,6 +1344,7 @@ mod tests {
     fn unverified_release_omits_kernelsnitch_defaults() {
         let (symbols, structs) = conf_fixture();
         let out = render_conf(&ConfInputs {
+            pipeline: None,
             release: "6.7.1-generic",
             phys: None,
             phys_offset: None,
@@ -1359,6 +1375,7 @@ mod tests {
             &structs,
         );
         let out = render_conf(&ConfInputs {
+            pipeline: None,
             release: "5.15.178-g3575c47dc7ce-dirty",
             phys: None,
             phys_offset: None,
@@ -1525,6 +1542,7 @@ mod tests {
         let (release, symbols, structs, cred, extra) = a301so_inputs();
         let geometry = conf_route_geometry("multicast_waiter", &release, None, &structs);
         let generated = render_conf(&ConfInputs {
+            pipeline: None,
             release: &release,
             phys: None,
             phys_offset: None,

@@ -15,6 +15,7 @@ pub mod kallsyms_finder;
 pub mod layout;
 pub mod options;
 pub mod payload;
+pub mod pipeline;
 pub mod report;
 pub mod structs;
 pub mod symbols;

@@ -147,6 +147,8 @@
     <string name="safe_mode_summary">Disable all modules</string>
     <string name="force_attack_test_label">Force attack test</string>
     <string name="force_attack_test_summary">Ignore an existing KernelSU root and run the exploit anyway; the rooted child is discarded at the end</string>
+    <string name="second_way_label">DirtyFrag second way (experimental)</string>
+    <string name="second_way_summary">Stop after SELinux permissive and deliver root through the libc++ page-cache stub; the init shell runs the root script</string>
     <string name="vr_ko_entry_label">vr.ko anti-root countermeasures</string>
     <string name="vr_ko_entry_summary">tags %1$s · SELinux %2$s</string>
     <string name="vr_ko_scope">These options only clear the module\'s per-task tags and block its /proc/vrp SELinux 0/1 enforce write. The module itself stays active; its other hooks, mounts and checks continue to run.</string>

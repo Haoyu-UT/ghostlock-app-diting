@@ -21,6 +21,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.ghostlock.app.GhostlockApplication
+import com.ghostlock.app.BuildConfig
 import com.ghostlock.app.R
 import com.ghostlock.app.domain.model.VrKoMode
 
@@ -61,6 +62,11 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         viewModel.initialize()
+        /* Debug-only test hook: `am start --ez second_way true` turns the second
+         * way on and persists it, so a harness restart keeps the setting. */
+        if (BuildConfig.DEBUG && intent?.hasExtra("second_way") == true) {
+            viewModel.toggleSecondWay(intent.getBooleanExtra("second_way", false))
+        }
         setContent {
             GhostlockRoute(viewModel, ::handleEffect)
         }
@@ -163,6 +169,9 @@ private fun GhostlockRoute(
             override fun onSafeModeChanged(enabled: Boolean) = viewModel.toggleSafeMode(enabled)
             override fun onForceAttackTestChanged(enabled: Boolean) =
                 viewModel.toggleForceAttackTest(enabled)
+
+            override fun onSecondWayChanged(enabled: Boolean) =
+                viewModel.toggleSecondWay(enabled)
 
             override fun onVrKoTagClearChanged(mode: VrKoMode) =
                 viewModel.setVrKoTagClear(mode)

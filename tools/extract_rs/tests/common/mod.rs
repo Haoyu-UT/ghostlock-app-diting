@@ -265,7 +265,13 @@ pub fn run_options(bin: &str, meta: &Meta, out: &Path) -> Run {
         match &base {
             None => base = Some(value),
             Some(base_value) => {
-                for key in ["release", "kernel_major", "routes"] {
+                for key in [
+                    "release",
+                    "kernel_major",
+                    "routes",
+                    "pipeline_facts",
+                    "pipelines",
+                ] {
                     assert_eq!(
                         base_value.get(key),
                         value.get(key),
