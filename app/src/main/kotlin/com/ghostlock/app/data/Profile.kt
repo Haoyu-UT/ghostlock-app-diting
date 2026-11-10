@@ -83,12 +83,15 @@ internal data class Profile(
             route: RouteKind?,
             fallbackTo: RouteKind?,
             invalidPaths: Set<String> = emptySet(),
+            /** The resolved pipeline, carried to the native's cross-check. */
+            pipeline: String? = null,
             value: (String) -> Long?,
         ): Profile? = fromNativeDocument(
             document = NativeProfileDocument.from(
                 release = release,
                 route = route?.token,
                 fallbackTo = fallbackTo?.token,
+                pipeline = pipeline,
                 value = value,
             ),
             invalidPaths = invalidPaths,

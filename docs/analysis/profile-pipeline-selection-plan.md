@@ -19,7 +19,8 @@ before W1 with the ROM preflight/probe/DB callbacks, and the generation picker i
 resolver's diting device gates are complete: the GhostLock order, the debug DirtyFrag order, and
 the forced pre-W1 fallback (a one-shot debug fault injection at the resolver; the run took the
 full GhostLock chain with no DirtyFrag step and no `--w1-only`). The native resolved-scalar
-cross-check (§3.4) and the OnePlus/A16 lists remain.
+cross-check is implemented and device-gated (§3.4). The OnePlus/A16 lists and the bundle order
+flip remain.
 
 ## 1. Problem
 
@@ -155,14 +156,22 @@ Implementation of the probe, the ROM preflight, the resolver and their gates:
 
 ### 3.4 Native / wire
 
-- The app resolves the list to one pipeline and passes the **resolved scalar** to the native.
-  `pipeline` stays a scalar in the wire profile; the native cross-checks it against the invocation
-  (full chain vs `--w1-only`; the DirtyFrag stage's `--dirtyfrag`) and hard-errors on a mismatch.
-- The list itself stays app-side (the profile document); putting it in the binary schema is not
-  needed for the cross-check. If that ever changes, the digest/golden move with it.
+- The app resolves the list to one pipeline and passes the **resolved scalar** to the native as
+  the wire's `meta.pipeline` (`1` GhostLock, `2` DirtyFrag). Only a run writes it: the direct
+  path passes the resolver's entry, the Shizuku path passes `ghostlock`; parse, preview and
+  stride documents omit it and keep the legacy behaviour (no check).
+- The native verifies it before any stage (`profile/pipeline_check.h`, host-tested): a resolved
+  DirtyFrag run must be the `--w1-only` invocation (the DirtyFrag stage follows as its own
+  process), a resolved GhostLock run must be the full chain, and an unknown value is refused.
+  The stage invocation (`--dirtyfrag`) loads no profile; the W1-only invocation that precedes it
+  is what carries the scalar. **Implemented and device-gated 2026-11-10** (diting build 723:
+  both paths log `pipeline=… verified against the invocation`, and the transmitted digest equals
+  the native's recomputation with the key present).
+- The list itself stays app-side (the profile document); the wire carries only the resolved
+  scalar.
 - `kdp` is not added to the new wire; legacy documents are handled app-side.
-- Re-freeze the wire schema digest and the native-document golden only if the scalar's presence
-  changes; update the round-trip and migration tests.
+- The wire schema digest moved to `0x6d7228fbbf71e00c` in both implementations, and the
+  native-document golden was re-frozen (those documents carry no pipeline, so no value changed).
 
 ### 3.5 Bundles and the store
 
@@ -226,7 +235,9 @@ logs it (`pipeline=ghostlock (legacy default)`); it never silently picks `dirtyf
 **Native**
 
 - Wire parse and the resolved-scalar cross-check; host build/lint/tests; digest and golden
-  re-freeze. `cmp_disasm` is not required unless the profile plumbing touches the attack path.
+  re-freeze. **Done 2026-11-10:** native build with zero warnings, `lint-tidy`, all host
+  targets (the new `profile_binary_test` cases), both Kotlin suites, and the diting runs below.
+  `cmp_disasm` is not required unless the profile plumbing touches the attack path.
 
 **Device**
 
@@ -250,7 +261,9 @@ logs it (`pipeline=ghostlock (legacy default)`); it never silently picks `dirtyf
    store superset refresh.
 3. Profile list schema and validation; app resolution + ROM preflight + primitive probe; picker
    retirement; tests.
-4. Native resolved-scalar cross-check; digest/golden as needed.
+4. Native resolved-scalar cross-check; digest/golden as needed. **Done 2026-11-10** — the
+   diting ghostlock run `20261110-234338` and debug-dirtyfrag run `20261110-234456` both log
+   `pipeline=… verified against the invocation` with matching transmitted/recomputed digests.
 5. Store/bundle order; interim curation; regenerate; content-aware `--check`.
 6. Host gates.
 7. Device gates (diting, OnePlus fallback, A16 strict).

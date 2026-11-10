@@ -695,20 +695,26 @@ internal class AndroidProfileConfigController(
      * Resolved on demand: the result depends on the selection, the CPU pair and
      * the session's edits, so a cached document would go stale.
      */
-    override fun nativeDocument(config: ProfileConfig): ByteArray? = synchronized(lock) {
+    override fun nativeDocument(config: ProfileConfig, pipeline: String?): ByteArray? = synchronized(lock) {
         val resolved = resolve(config.release, config.pair, activeOverrides(config.release)).profile
             ?: return@synchronized null
-        buildNativeDocument(config.release, resolved)?.toBinary()
+        buildNativeDocument(config.release, resolved, pipeline)?.toBinary()
     }
 
     /** Builds the single resolved authority native consumes at run time. */
-    private fun buildNativeDocument(release: String, profile: ValueMap): Profile? {
+    private fun buildNativeDocument(
+        release: String,
+        profile: ValueMap,
+        /** Only a run has a resolved pipeline; previews and schema checks omit it. */
+        pipeline: String? = null,
+    ): Profile? {
         val route = routeNameOf(profile)
         val fallbackTo = fallbackTargetOf(profile)
         return Profile.fromValueMap(
             release = release,
             route = RouteKind.fromToken(route),
             fallbackTo = RouteKind.fromToken(fallbackTo),
+            pipeline = pipeline,
         ) { path -> ProfileResolver.nativeValue(profile, route, fallbackTo, path) }
     }
 

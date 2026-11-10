@@ -97,9 +97,12 @@ interface ProfileConfigController {
 
     /**
      * Typed binary document handed to the native process for [config]'s
-     * release and pair; null when the source cannot be resolved.
+     * release and pair; null when the source cannot be resolved. [pipeline] is
+     * the app's resolved pipeline ("ghostlock"/"dirtyfrag"); the native refuses
+     * an invocation that does not match it. Null omits the cross-check (the
+     * parse/preview paths).
      */
-    fun nativeDocument(config: ProfileConfig): ByteArray?
+    fun nativeDocument(config: ProfileConfig, pipeline: String? = null): ByteArray?
 
     companion object {
         /** Reference templates ("6.6-template"): manually loadable, never auto-matched. */

@@ -879,7 +879,10 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             archivedLog("<s> resolving profile")
             val release = System.getProperty("os.version", "").orEmpty()
             val config = profileController.load(release, pair)
-            val profileBlob = profileController.nativeDocument(config)
+            /* The Shizuku path runs GhostLock only (the order check below
+             * refuses a list without it); the wire carries that resolution so
+             * the native's cross-check covers this invocation too. */
+            val profileBlob = profileController.nativeDocument(config, "ghostlock")
             archivedLog(
                 "<s> profile resolved hasProfile=${config.hasProfile} " +
                     "blob=${profileBlob?.size ?: 0} invalid=${config.invalidPaths.size}",
@@ -1375,7 +1378,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 onLog("<k> pipeline=$selected (profile order)")
                 selected
             }
-            var profileBlob = profileController.nativeDocument(config)
+            var profileBlob = profileController.nativeDocument(config, pipeline)
                 ?: error("profile is unavailable for $release")
             // v2: safe_mode lives in the meta section; there is no fixed slot
             // offset, so the blob is rescanned and rewritten.

@@ -6,6 +6,7 @@
  * duplicates, truncations) and pins the header bytes. */
 
 #include "profile/binary.h"
+#include "profile/pipeline_check.h"
 
 #include <cassert>
 #include <cstdio>
@@ -21,7 +22,7 @@ namespace {
      * block. Asserted with the same value in the Kotlin test
      * (profile-core `NativeProfileDigestTest`), which is what makes the two
      * implementations a checked contract rather than two hopeful copies. */
-    constexpr uint64_t kGoldenSchemaDigest = 0xe620f6d4022894a3ull;
+    constexpr uint64_t kGoldenSchemaDigest = 0x6d7228fbbf71e00cull;
 
     void put_u16(std::string &out, uint16_t value) {
         out.push_back(static_cast<char>(value & 0xff));
@@ -562,6 +563,41 @@ int32_t main(void) {
         safe[safe_key + std::strlen("safe_mode")] = 1;
         assert(parse_doc(safe, &parsed, release, sizeof(release)) == 0);
         assert(parsed.meta.safe_mode == 1);
+    }
+
+    /* ---- The resolved-pipeline cross-check (wire meta.pipeline).
+     *
+     * The app resolves the profile's ordered list before W1; the native must
+     * be invoked in the matching mode. Absent keeps the legacy behaviour. ---- */
+    {
+        using ghostlock::profile::check_pipeline;
+        using ghostlock::profile::PipelineCheck;
+        using ghostlock::profile::kPipelineDirtyfrag;
+        using ghostlock::profile::kPipelineGhostlock;
+
+        assert(check_pipeline(std::nullopt, false) == PipelineCheck::NotDeclared);
+        assert(check_pipeline(std::nullopt, true) == PipelineCheck::NotDeclared);
+        assert(check_pipeline(kPipelineGhostlock, false) == PipelineCheck::Match);
+        assert(check_pipeline(kPipelineGhostlock, true) == PipelineCheck::Mismatch);
+        assert(check_pipeline(kPipelineDirtyfrag, true) == PipelineCheck::Match);
+        assert(check_pipeline(kPipelineDirtyfrag, false) == PipelineCheck::Mismatch);
+        assert(check_pipeline(uint32_t{0}, false) == PipelineCheck::Unknown);
+        assert(check_pipeline(uint32_t{3}, true) == PipelineCheck::Unknown);
+
+        /* The value survives the wire: a document that declares it parses
+         * into meta.pipeline; one that omits it leaves it absent. */
+        const std::string declared = build_doc(
+            ghostlock::profile::kRouteSelectStack, "pipeline",
+            {{"meta", {{"pipeline", kPipelineDirtyfrag}}}});
+        assert(parse_doc(declared, &parsed, release, sizeof(release)) == 0);
+        assert(parsed.meta.pipeline.has_value());
+        assert(*parsed.meta.pipeline == kPipelineDirtyfrag);
+
+        const std::string absent = build_doc(
+            ghostlock::profile::kRouteSelectStack, "no-pipeline",
+            {{"meta", {{"kernel_major", 5}}}});
+        assert(parse_doc(absent, &parsed, release, sizeof(release)) == 0);
+        assert(!parsed.meta.pipeline.has_value());
     }
 
     puts("profile_binary_test: ok");

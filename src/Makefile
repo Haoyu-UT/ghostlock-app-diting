@@ -290,7 +290,7 @@ $(HOST_BUILD_DIR)/profile_test: core/tests/profile_test.cpp core/profile/model.h
 	@mkdir -p $(HOST_BUILD_DIR)
 	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore $< -o $@
 
-$(HOST_BUILD_DIR)/profile_binary_test: core/tests/profile_binary_test.cpp core/profile/binary.cpp core/profile/binary.h core/profile/model.h
+$(HOST_BUILD_DIR)/profile_binary_test: core/tests/profile_binary_test.cpp core/profile/binary.cpp core/profile/binary.h core/profile/model.h core/profile/pipeline_check.h
 	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore core/tests/profile_binary_test.cpp core/profile/binary.cpp -o $@
 
 $(HOST_BUILD_DIR)/payload_builder_test: core/tests/payload_builder_test.cpp core/memory/payload_builder.cpp core/memory/payload_builder.h

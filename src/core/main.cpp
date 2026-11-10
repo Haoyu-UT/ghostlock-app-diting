@@ -15,6 +15,7 @@
 #include "attack/ops.hpp"
 #include "kernelsnitch/stride_verify.h"
 #include "profile/entry.h"
+#include "profile/pipeline_check.h"
 #include "support/fatal_error.hpp"
 #include "support/run_state.hpp"
 #include "route/orchestrator.hpp"
@@ -136,6 +137,35 @@ int main(int argc, char **argv) {
                     static_cast<unsigned long long>(digests.computed));
         } else {
             pr_info("profile digest: absent (app build predates it)\n");
+        }
+
+        /* The app resolved the profile's ordered pipeline list to one entry and
+         * wrote it into the wire; the invocation must match. A mismatch means
+         * the two sides disagree about the run's shape: a resolved DirtyFrag run
+         * started as the full chain would run the wrong stage, and a GhostLock
+         * run stopped after W1 would leave SELinux permissive with no stage to
+         * continue. Absent (a document that predates the cross-check) keeps the
+         * legacy behaviour. */
+        switch (profile::check_pipeline(decoded.meta.pipeline, w1_only)) {
+            case profile::PipelineCheck::NotDeclared:
+                break;
+            case profile::PipelineCheck::Unknown:
+                pr_error("profile pipeline=%u is unknown; refusing to run\n",
+                         static_cast<unsigned>(decoded.meta.pipeline.value_or(0)));
+                throw FatalError{};
+            case profile::PipelineCheck::Mismatch:
+                pr_error("pipeline mismatch: profile resolved %s, native invoked %s\n",
+                         decoded.meta.pipeline == profile::kPipelineDirtyfrag
+                             ? "dirtyfrag"
+                             : "ghostlock",
+                         w1_only ? "with --w1-only" : "as the full chain");
+                throw FatalError{};
+            case profile::PipelineCheck::Match:
+                pr_info("pipeline=%s verified against the invocation\n",
+                        decoded.meta.pipeline == profile::kPipelineDirtyfrag
+                            ? "dirtyfrag"
+                            : "ghostlock");
+                break;
         }
 
         auto &session = session::g_exploit_session;

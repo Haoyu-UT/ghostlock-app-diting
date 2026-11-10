@@ -90,6 +90,10 @@ namespace ghostlock::profile {
         uint8_t recommend_shizuku = 0;
         uint8_t fallback_route = 0;
         uint8_t safe_mode = 0;
+        /* The app's resolved pipeline (1 = GhostLock, 2 = DirtyFrag). Absent on
+         * a document that predates the cross-check; the native then keeps the
+         * legacy behaviour. */
+        std::optional<uint32_t> pipeline;
     };
 
     struct TaskStructOffsets {

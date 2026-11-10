@@ -65,6 +65,7 @@ namespace ghostlock::binary_profile {
             PLAIN("recommend_shizuku", meta.recommend_shizuku),
             PLAIN("fallback_route", meta.fallback_route),
             PLAIN("safe_mode", meta.safe_mode),
+            OPT("pipeline", meta.pipeline),
         };
 
         constexpr Field kTask[] = {

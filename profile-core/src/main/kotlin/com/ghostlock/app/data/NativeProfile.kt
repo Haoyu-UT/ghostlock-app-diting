@@ -46,6 +46,12 @@ data class NativeProfileDocument(
     val waiterLayout: WaiterLayoutOffsets = WaiterLayoutOffsets(),
     val execution: ExecutionTuning,
     val safeMode: UInt,
+    /**
+     * The app's resolved pipeline, carried so the native can refuse an
+     * invocation that does not match it (`PipelineGhostlock`/`PipelineDirtyfrag`).
+     * Absent = a document that predates the cross-check; no check applies.
+     */
+    val pipeline: UInt? = null,
     /** Route-specific configuration; never part of the shared schema. */
     val routeConfig: RouteConfig,
 ) {
@@ -102,6 +108,7 @@ data class NativeProfileDocument(
                 WireEntry("recommend_shizuku", recommendShizuku.toULong()),
                 WireEntry("fallback_route", fallbackRoute.toULong()),
                 WireEntry("safe_mode", safeMode.toULong()),
+                WireEntry("pipeline", pipeline?.toULong()),
             ),
         )
         add("task_struct" to taskEntries())
@@ -318,6 +325,10 @@ data class NativeProfileDocument(
         /** Wire v2 container version (object sections). */
         const val Version: UShort = 2u
 
+        /** The wire `meta.pipeline` values; the native refuses anything else. */
+        const val PipelineGhostlock: UInt = 1u
+        const val PipelineDirtyfrag: UInt = 2u
+
         /* FNV-1a over the schema stream; native mirrors this byte for byte
          * (`schema_digest` in core/profile/binary.cpp). */
         private const val FnvOffsetBasis = 0xcbf29ce484222325uL
@@ -491,8 +502,15 @@ data class NativeProfileDocument(
             release: String,
             route: String?,
             fallbackTo: String?,
+            pipeline: String? = null,
             value: (String) -> Long?,
         ): NativeProfileDocument {
+            val pipelineWire = when (pipeline) {
+                null -> null
+                "ghostlock" -> PipelineGhostlock
+                "dirtyfrag" -> PipelineDirtyfrag
+                else -> error("unknown pipeline $pipeline")
+            }
             fun vu(path: String): UInt = value(path)?.toUInt() ?: 0u
             fun vul(path: String): ULong = value(path)?.toULong() ?: 0uL
             fun vuOrNull(path: String): UInt? = value(path)?.toUInt()
@@ -608,6 +626,7 @@ data class NativeProfileDocument(
                     consumerBurstCalls = vuConsumer("consumer_burst_calls"),
                 ),
                 safeMode = 0u,
+                pipeline = pipelineWire,
                 routeConfig = routeConfig,
             )
         }
@@ -621,6 +640,7 @@ data class NativeProfileDocument(
             private var metaRecommendShizuku = 0u
             private var metaFallbackRoute = 0u
             private var metaSafeMode = 0u
+            private var metaPipeline: UInt? = null
             private var task = TaskStructOffsets()
             private var credential = CredTemplate()
             private var offsets = KernelOffsetTable()
@@ -648,6 +668,7 @@ data class NativeProfileDocument(
                         "recommend_shizuku" -> metaRecommendShizuku = raw.toUInt()
                         "fallback_route" -> metaFallbackRoute = raw.toUInt()
                         "safe_mode" -> metaSafeMode = raw.toUInt()
+                        "pipeline" -> metaPipeline = raw.toUInt()
                     }
 
                     "task_struct" -> task = when (key) {
@@ -823,6 +844,7 @@ data class NativeProfileDocument(
                 waiterLayout = waiterLayout,
                 execution = execution,
                 safeMode = metaSafeMode,
+                pipeline = metaPipeline,
                 routeConfig = routeConfig,
             )
         }
