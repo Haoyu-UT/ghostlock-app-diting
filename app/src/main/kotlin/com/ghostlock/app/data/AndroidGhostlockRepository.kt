@@ -83,6 +83,8 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         const val PrefForceAttackTest = "force_attack_test"
         /* Second way: W1-only run followed by the DirtyFrag page-cache stage. */
         const val PrefSecondWay = "second_way"
+        /* Debug-only: force a DirtyFrag rejection for one run (fallback gate). */
+        const val PrefFallbackTest = "fallback_test"
         /** Tri-state vr.ko choices, stored as auto/on/off (legacy booleans are migrated). */
         const val PrefVrKoTagClear = "vr_ko_tag_clear"
         const val PrefVrKoSelinuxBlock = "vrko_selinux_block"
@@ -147,6 +149,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     private var safeModeEnabled = false
     private var forceAttackTest = false
     private var secondWay = false
+    /* Debug-only one-shot for the pre-W1 fallback gate; consumed by the run
+     * that reads it. Never consulted in a release build. */
+    private var fallbackTest = false
     private var vrKoTagClear = VrKoMode.AUTO
     private var vrKoSelinuxBlock = VrKoMode.AUTO
     private var shizukuEnabled = false
@@ -161,6 +166,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         restoreShizukuPreference()
         restoreForceAttackTest()
         restoreSecondWay()
+        restoreFallbackTest()
         restoreVrKoTagClear()
         restoreVrKoSelinuxBlock()
         dropLegacyOffsetsCache()
@@ -275,6 +281,11 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     override fun setSecondWay(enabled: Boolean) {
         secondWay = enabled
         preferences.edit { putBoolean(PrefSecondWay, enabled) }
+    }
+
+    override fun setFallbackTest(enabled: Boolean) {
+        fallbackTest = enabled
+        preferences.edit { putBoolean(PrefFallbackTest, enabled) }
     }
 
     override fun setVrKoTagClear(mode: VrKoMode) {
@@ -1280,7 +1291,16 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
              * ROM preflight and the primitive probe (or a matching measured-DB
              * record). No fallback after W1; a failed stage is restore/reboot. */
             val pipeline = run {
+                /* Debug-only one-shot: reject DirtyFrag and resolve the two-entry
+                 * order, proving the fallback decision happens before W1. The
+                 * flag is consumed here so a later run cannot inherit it. */
+                val fallbackFault = BuildConfig.DEBUG && fallbackTest
+                if (fallbackFault) setFallbackTest(false)
                 val order = when {
+                    fallbackFault -> {
+                        onLog("<k> pipeline order=dirtyfrag,ghostlock (debug fallback test)")
+                        listOf("dirtyfrag", "ghostlock")
+                    }
                     BuildConfig.DEBUG && secondWay -> {
                         onLog("<k> pipeline order=dirtyfrag (debug override)")
                         listOf("dirtyfrag")
@@ -1298,42 +1318,46 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     order,
                     ghostlock = { null },
                     dirtyfrag = {
-                        val rom = DirtyfragPlan.preflight(
-                            appContext,
-                            File("/system/lib64/libc++.so"),
-                        )
-                        if (!rom.feasible) {
-                            "ROM preflight: " + rom.reasons.joinToString("; ")
+                        if (fallbackFault) {
+                            "forced failure (debug fault injection)"
                         } else {
-                            when (val reuse = measuredProfiles.probeReuse(release, Build.FINGERPRINT)) {
-                                ProbeReuse.Pass -> {
-                                    onLog(
-                                        "<k> probe=db pass (protocol " +
-                                            DirtyfragProbe.ProtocolVersion + ")",
-                                    )
-                                    null
-                                }
-                                ProbeReuse.PrimitiveFailed ->
-                                    "measured DB says the primitive does not land"
-                                ProbeReuse.None -> {
-                                    val result = DirtyfragProbe.run(appContext, filesDir)
-                                    val clear =
-                                        result.outcome == DirtyfragProbe.Outcome.Pass ||
-                                            result.outcome == DirtyfragProbe.Outcome.PrimitiveFailed
-                                    if (clear) {
-                                        measuredProfiles.recordDirtyfragProbe(
-                                            release,
-                                            result.outcome,
-                                            Build.FINGERPRINT,
-                                            result.evidence,
+                            val rom = DirtyfragPlan.preflight(
+                                appContext,
+                                File("/system/lib64/libc++.so"),
+                            )
+                            if (!rom.feasible) {
+                                "ROM preflight: " + rom.reasons.joinToString("; ")
+                            } else {
+                                when (val reuse = measuredProfiles.probeReuse(release, Build.FINGERPRINT)) {
+                                    ProbeReuse.Pass -> {
+                                        onLog(
+                                            "<k> probe=db pass (protocol " +
+                                                DirtyfragProbe.ProtocolVersion + ")",
                                         )
+                                        null
                                     }
-                                    when (result.outcome) {
-                                        DirtyfragProbe.Outcome.Pass -> {
-                                            onLog("<k> probe=pass ${result.evidence}")
-                                            null
+                                    ProbeReuse.PrimitiveFailed ->
+                                        "measured DB says the primitive does not land"
+                                    ProbeReuse.None -> {
+                                        val result = DirtyfragProbe.run(appContext, filesDir)
+                                        val clear =
+                                            result.outcome == DirtyfragProbe.Outcome.Pass ||
+                                                result.outcome == DirtyfragProbe.Outcome.PrimitiveFailed
+                                        if (clear) {
+                                            measuredProfiles.recordDirtyfragProbe(
+                                                release,
+                                                result.outcome,
+                                                Build.FINGERPRINT,
+                                                result.evidence,
+                                            )
                                         }
-                                        else -> "probe ${result.outcome}: ${result.reason}"
+                                        when (result.outcome) {
+                                            DirtyfragProbe.Outcome.Pass -> {
+                                                onLog("<k> probe=pass ${result.evidence}")
+                                                null
+                                            }
+                                            else -> "probe ${result.outcome}: ${result.reason}"
+                                        }
                                     }
                                 }
                             }
@@ -1823,6 +1847,10 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
 
     private fun restoreSecondWay() {
         secondWay = preferences.getBoolean(PrefSecondWay, false)
+    }
+
+    private fun restoreFallbackTest() {
+        fallbackTest = preferences.getBoolean(PrefFallbackTest, false)
     }
 
     private fun restoreVrKoTagClear() {

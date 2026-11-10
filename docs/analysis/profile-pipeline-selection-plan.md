@@ -16,7 +16,10 @@ permissive for a stage it could not verify**.
 the extractor derives/writes `pipeline_order` and the profile's `pipeline = [ ... ]`, the app
 parses the list (legacy scalar/missing migrate), the cut writes it, `PipelineResolver` walks it
 before W1 with the ROM preflight/probe/DB callbacks, and the generation picker is retired. The
-native resolved-scalar cross-check (§3.4) and the resolver's device gates remain.
+resolver's diting device gates are complete: the GhostLock order, the debug DirtyFrag order, and
+the forced pre-W1 fallback (a one-shot debug fault injection at the resolver; the run took the
+full GhostLock chain with no DirtyFrag step and no `--w1-only`). The native resolved-scalar
+cross-check (§3.4) and the OnePlus/A16 lists remain.
 
 ## 1. Problem
 
@@ -228,9 +231,13 @@ logs it (`pipeline=ghostlock (legacy default)`); it never silently picks `dirtyf
 **Device**
 
 - Diting, GhostLock control: one fresh-boot run of the proven profile.
-- Diting/OnePlus, best-effort list: the resolved pipeline is `dirtyfrag`; force the probe to fail
-  (a synthetic/setup failure) and confirm the app takes `ghostlock` **without W1** (the device
-  stays enforcing).
+- Diting/OnePlus, best-effort list: the resolved pipeline is `dirtyfrag`; force the check to fail
+  and confirm the app takes `ghostlock` **without the DirtyFrag W1-only step**. **Done on the
+  diting (2026-11-10, build 722):** a one-shot debug fault injection at the resolver (order
+  `["dirtyfrag", "ghostlock"]`, a forced rejection before the preflight/probe) — the log reads
+  `pipeline fallback: dirtyfrag: forced failure`, `pipeline=ghostlock`, then the full GhostLock
+  chain; `native exited code=0`, `enforce=1`, run store `completed`, and no DirtyFrag stage line
+  and no `--w1-only` in either log. OnePlus remains.
 - A16, strict list: the bundled profile alone selects `dirtyfrag` (no toggle); the run should
   reach W1 → DirtyFrag → init shell → ksud; a stage failure prompts the reboot path.
 - A16, a hand-edited `["dirtyfrag", "ghostlock"]`: refused before the native (KDP).

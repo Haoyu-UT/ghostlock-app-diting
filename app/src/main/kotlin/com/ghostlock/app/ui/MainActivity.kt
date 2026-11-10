@@ -91,6 +91,11 @@ class MainActivity : ComponentActivity() {
         if (BuildConfig.DEBUG && intent?.hasExtra("preflight_check") == true) {
             viewModel.runDirtyfragPreflightCheck()
         }
+        /* Debug-only: `am start --ez fallback_test true` arms the one-shot
+         * pre-W1 fallback gate (two-entry order + a forced DirtyFrag failure). */
+        if (BuildConfig.DEBUG && intent?.hasExtra("fallback_test") == true) {
+            viewModel.setFallbackTest(intent.getBooleanExtra("fallback_test", false))
+        }
         setContent {
             GhostlockRoute(viewModel, ::handleEffect)
         }

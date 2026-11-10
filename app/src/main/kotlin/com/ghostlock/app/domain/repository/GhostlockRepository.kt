@@ -32,6 +32,14 @@ interface GhostlockRepository {
     /** Second way: a W1-only run followed by the DirtyFrag page-cache stage. */
     fun setSecondWay(enabled: Boolean)
 
+    /**
+     * Debug-only pre-W1 fallback gate: resolve the two-entry
+     * `["dirtyfrag", "ghostlock"]` order and force the DirtyFrag check to fail
+     * once, proving the resolver takes GhostLock without the DirtyFrag W1-only
+     * step. Consumed by the next run; ignored in release builds.
+     */
+    fun setFallbackTest(enabled: Boolean)
+
     /** Debug/test: run the DirtyFrag viability probe and return a one-line report. */
     suspend fun probeDirtyfrag(): String = "probe=NotRun (unsupported)"
 
