@@ -7,6 +7,13 @@ ordered pipeline list, resolved before W1) and
 §2.4. This plan covers the probe, the ROM preflight and the resolver; the extractor's
 `pipeline_order` (§7) is a prerequisite, not a separate design.
 
+**Status 2026-11-10 — steps 1–2 done on the diting.** The positive-control spike passed
+(`external/port/dirtyfrag-probe-spike-2026-11-10/`); the product probe (`libdfprobe.so` +
+`DirtyfragProbe` + `ProbeCrypto`) is implemented and device-gated: build 717 passes with the
+measured-DB record, and a seeded crash marker yields `Crashed`, no DB write, marker cleared
+(`external/port/dirtyfrag-probe-product-2026-11-10/`). Next: the ROM preflight, then the resolver
+with the ordered-list/profile schema (the extractor `pipeline_order` prerequisite).
+
 **Goal.** Before W1, decide whether DirtyFrag is viable on **this running ROM**, and feed the
 ordered-list resolver. A pass is a licence to try DirtyFrag; a fail or an unverifiable result
 falls to the next listed pipeline **before** the device becomes permissive. After W1 there is no
@@ -192,8 +199,10 @@ round-trip and mismatch tests. The list itself stays app-side.
 1. ~~Spike the positive control on the diting~~ — **done 2026-11-10**: the inner UDP sentinel was
    received through the same SA and the file test PASSed. Evidence:
    `external/port/dirtyfrag-probe-spike-2026-11-10/`.
-2. `libdfprobe.so` + `DirtyfragProbe` (own file only); unit-test the IV vector and the result
-   classification on the host; device: diting Pass.
+2. ~~`libdfprobe.so` + `DirtyfragProbe` (own file only); unit-test the IV vector and the result
+   classification on the host; device: diting Pass~~ — **done 2026-11-10**: build 717 passes on
+   the diting and records the DB facts; the crash marker yields `Crashed` with no write. Evidence:
+   `external/port/dirtyfrag-probe-product-2026-11-10/`.
 3. `DirtyfragPreflight` from `DirtyfragPlan`; unit tests with synthetic ELF/plan cases; device:
    diting accepted, a synthetic cave-too-small case rejected.
 4. `PipelineResolver` + run-store/UI; app tests for the matrix (both feasible with probe pass /
