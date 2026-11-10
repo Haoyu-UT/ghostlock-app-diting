@@ -10,9 +10,8 @@ use ghostlock_extract::anchor;
 use ghostlock_extract::boot::{BootImage, MTK_DEFAULT_PHYS_LOAD, MTK_VADDR_BASE};
 use ghostlock_extract::btf::Btf;
 use ghostlock_extract::derive::{
-    MULTICAST_5X_BUFFER_SIZE, PSELECT_ROUTE_NFDS, WaiterLayout, derive_cred_5x,
-    derive_nf_logger_registration, derive_pselect_layout, ensure_rtmutex_43499_unpatched,
-    multicast_waiter_off, relative_symbols,
+    PSELECT_ROUTE_NFDS, derive_cred_5x, derive_nf_logger_registration, derive_pselect_layout,
+    ensure_rtmutex_43499_unpatched, relative_symbols,
 };
 use ghostlock_extract::error::{ExtractError, Result};
 use ghostlock_extract::fact;
@@ -852,7 +851,7 @@ fn run(cli: &Cli) -> Result<i32> {
         btf.as_ref(),
         &pselect_outcome,
         !cli.no_disasm,
-        release_major,
+        release.as_deref(),
     );
     if cli.format == "conf" {
         for verdict in &route_verdicts {
@@ -1005,32 +1004,24 @@ fn run(cli: &Cli) -> Result<i32> {
                 }
             }
         } else {
-            /* The fallback nomination: the 5.10 frame rule, or the family
-             * heuristic for the other families. The verdict set decides first;
-             * the nomination only breaks a zero-feasible tie. */
-            let fallback = if release_major == Some(5) {
-                family::route_hint(
-                    &boot.kernel,
-                    &rel_symbols,
-                    &sorted_offsets,
-                    release_text,
-                )
-            } else {
-                let paths = analysis::probe_paths(
-                    &symbols,
-                    &boot.kernel,
-                    &rel_symbols,
-                    &sorted_offsets,
-                );
-                let pselect_derived =
-                    matches!(pselect_outcome, analysis::PselectOutcome::Derived(_));
-                let (suggested, _, reasons) = analysis::suggest_route(
-                    pselect_derived,
-                    &paths,
-                    release.as_deref(),
-                );
-                suggested.map(|route| {
-                    (route, reasons.first().cloned().unwrap_or_default())
+            /* The zero-feasible fallback: the image's own do_futex frame rule
+             * first, then the path probes. Neither reads a version family. */
+            let fallback = {
+                let hint = if !cli.no_disasm {
+                    family::route_hint(&boot.kernel, &rel_symbols, &sorted_offsets)
+                } else {
+                    None
+                };
+                hint.or_else(|| {
+                    let paths = analysis::probe_paths(
+                        &symbols,
+                        &boot.kernel,
+                        &rel_symbols,
+                        &sorted_offsets,
+                    );
+                    let (suggested, _, reasons) = analysis::suggest_route(&paths);
+                    suggested
+                        .map(|route| (route, reasons.first().cloned().unwrap_or_default()))
                 })
             };
             match analysis::select_route(&route_verdicts, fallback) {
@@ -1140,7 +1131,25 @@ fn run(cli: &Cli) -> Result<i32> {
                 return Ok(3);
             }
         }
-        let route_shift = if route.as_deref() == Some("select_stack") {
+        /* The compat select variant has no 64-bit `waiter_shift`; it is placed
+         * from the compat strip home. Keying the geometry on the verdict's own
+         * marker keeps the render and the superset consistent. */
+        let compat_geometry_for = |verdict: &analysis::RouteVerdict| -> Option<Vec<(&'static str, i64)>> {
+            if !verdict.is_compat_carrier() {
+                return None;
+            }
+            let home = *verdict.numbers.get("waiter_home")?;
+            let dst = *verdict.numbers.get("select_dst_depth")?;
+            Some(report::conf_compat_route_geometry(home, dst))
+        };
+        let chosen_compat = route
+            .as_deref()
+            .and_then(|name| route_verdicts.iter().find(|verdict| verdict.route == name))
+            .and_then(compat_geometry_for);
+        let compat_select = chosen_compat.is_some();
+        let route_shift = if compat_select {
+            None
+        } else if route.as_deref() == Some("select_stack") {
             pselect_shift.or_else(|| {
                 if release_major == Some(5) {
                     eprintln!(
@@ -1174,69 +1183,34 @@ fn run(cli: &Cli) -> Result<i32> {
                  patch-range constants as a heuristic"
             );
         }
-        let mut geometry = route
+        /* The multicast block has no release-keyed branch: it is built from the
+         * route verdict's own numbers (the setsockopt copy window and the strip
+         * home this image's code produced). A route without a feasible verdict
+         * has no image derivation -- its block is omitted and the built-in
+         * profile supplies it, never a family constant. */
+        let multicast_numbers = route
             .as_deref()
-            .map(|route| {
-                report::conf_route_geometry_with_sigreturn(
-                    route,
-                    release_text,
-                    route_shift,
-                    sigreturn_offsets,
-                    &struct_offsets,
-                )
+            .filter(|name| *name == "multicast_waiter")
+            .and_then(|name| {
+                route_verdicts.iter().find(|verdict| {
+                    verdict.route == name && verdict.verdict == analysis::Feasibility::Feasible
+                })
             })
-            .unwrap_or_default();
-        // 5.x multicast: replace the proven-constant waiter_off with the value
-        // statically derived from this image's setsockopt/futex stack frames.
-        // No device or root is involved; the A301SO image reproduces its
-        // hardware-probed 0x60. The copy-window rule inside the derivation is
-        // the same one the verdict applied.
-        if route.as_deref() == Some("multicast_waiter") && !cli.no_disasm {
-            let layout = if release_major == Some(5) {
-                match btf.as_ref() {
-                    Some(btf) => WaiterLayout::from_btf(btf).ok(),
-                    None => Some(family::waiter_layout_5_10()),
-                }
-            } else {
-                btf.as_ref().and_then(|btf| WaiterLayout::from_btf(btf).ok())
-            };
-            match layout.and_then(|layout| layout.lock.map(|lock| (layout, lock))) {
-                Some((layout, lock)) => match multicast_waiter_off(
-                    &boot.kernel,
-                    &rel_symbols,
-                    &sorted_offsets,
-                    MULTICAST_5X_BUFFER_SIZE as u64,
-                    layout.pi_tree_entry,
-                    lock,
-                ) {
-                    Ok(geom) => {
-                        eprintln!(
-                            "info: multicast waiter_off derived = 0x{:x} \
-                             (setsockopt depth 0x{:x} - futex depth 0x{:x})",
-                            geom.waiter_off, geom.setsockopt_depth, geom.waiter_depth
-                        );
-                        for entry in geometry.iter_mut() {
-                            if entry.0 == "waiter_off" {
-                                entry.1 = geom.waiter_off as i64;
-                            }
-                        }
-                    }
-                    Err(err) => eprintln!(
-                        "warning: static multicast waiter_off derivation failed: {err}; \
-                         keeping the proven 5.x constant as a heuristic"
-                    ),
-                },
-                None => eprintln!(
-                    "warning: multicast waiter layout unavailable; keeping the proven 5.x \
-                     constant as a heuristic"
-                ),
-            }
-        } else if route.as_deref() == Some("multicast_waiter") {
-            eprintln!(
-                "warning: --no-disasm; keeping the proven 5.x multicast constants as a \
-                 heuristic"
-            );
-        }
+            .map(|verdict| &verdict.numbers);
+        let mut geometry = if let Some(compat) = chosen_compat.clone() {
+            compat
+        } else if let Some(numbers) = multicast_numbers {
+            report::conf_multicast_route_geometry(numbers, &struct_offsets)
+        } else if let Some(route) = route.as_deref() {
+            report::conf_route_geometry_with_sigreturn(
+                route,
+                release_text,
+                route_shift,
+                sigreturn_offsets,
+            )
+        } else {
+            Vec::new()
+        };
         // On-device derivation: the fake rt_mutex lives in a zeroed .bss
         // region; the anchor triple is per image (offset, safe length, slot
         // pitch). The pitch is the family's sizeof(rt_mutex): the anchor scan
@@ -1625,6 +1599,7 @@ fn run(cli: &Cli) -> Result<i32> {
             symbols: &symbol_offsets,
             structs: &struct_offsets,
             pipeline: pipeline.as_deref(),
+            kdp: pipeline_facts.kdp,
             route: route.as_deref(),
             route_geometry: &geometry,
             cred: &cred,
@@ -1643,46 +1618,37 @@ fn run(cli: &Cli) -> Result<i32> {
                 }
                 let shift = if verdict.route == "select_stack" {
                     pselect_shift.or_else(|| {
-                        (release_major == Some(5)).then_some(family::SELECT_WAITER_SHIFT)
+                        // The compat variant carries its own geometry; the
+                        // family shift belongs to the 64-bit branch only.
+                        (!verdict.is_compat_carrier() && release_major == Some(5))
+                            .then_some(family::SELECT_WAITER_SHIFT)
                     })
                 } else {
                     pselect_shift
                 };
-                let mut geometry: BTreeMap<String, i64> =
+                let geometry: BTreeMap<String, i64> = if verdict.route == "multicast_waiter" {
+                    // The multicast block is the route's own image-derived
+                    // numbers; there is no release-keyed branch.
+                    report::conf_multicast_route_geometry(&verdict.numbers, &struct_offsets)
+                        .into_iter()
+                        .map(|(key, value)| (key.to_string(), value))
+                        .collect()
+                } else if let Some(compat) = compat_geometry_for(verdict) {
+                    compat
+                        .into_iter()
+                        .map(|(key, value)| (key.to_string(), value))
+                        .collect()
+                } else {
                     report::conf_route_geometry_with_sigreturn(
                         verdict.route,
                         release_text,
                         shift,
                         sigreturn_offsets,
-                        &struct_offsets,
                     )
                     .into_iter()
                     .map(|(key, value)| (key.to_string(), value))
-                    .collect();
-                if verdict.route == "multicast_waiter" && !cli.no_disasm {
-                    let layout = if release_major == Some(5) {
-                        match btf.as_ref() {
-                            Some(btf) => WaiterLayout::from_btf(btf).ok(),
-                            None => Some(family::waiter_layout_5_10()),
-                        }
-                    } else {
-                        btf.as_ref().and_then(|btf| WaiterLayout::from_btf(btf).ok())
-                    };
-                    if let Some((layout, lock)) =
-                        layout.and_then(|layout| layout.lock.map(|lock| (layout, lock)))
-                    {
-                        if let Ok(geom) = multicast_waiter_off(
-                            &boot.kernel,
-                            &rel_symbols,
-                            &sorted_offsets,
-                            MULTICAST_5X_BUFFER_SIZE as u64,
-                            layout.pi_tree_entry,
-                            lock,
-                        ) {
-                            geometry.insert("waiter_off".to_string(), geom.waiter_off as i64);
-                        }
-                    }
-                }
+                    .collect()
+                };
                 all_geometry.insert(verdict.route.to_string(), geometry);
             }
             let common_text = report::render_conf(&report::ConfInputs {
@@ -1693,6 +1659,7 @@ fn run(cli: &Cli) -> Result<i32> {
                 symbols: &symbol_offsets,
                 structs: &struct_offsets,
                 pipeline: None,
+                kdp: pipeline_facts.kdp,
                 route: None,
                 route_geometry: &[],
                 cred: &cred,

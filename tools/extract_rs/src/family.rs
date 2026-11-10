@@ -184,15 +184,13 @@ pub fn function_frame(
 
 /// Route discriminator: `do_futex`'s frame is 0x20 on 5.10.81/101 — shallow
 /// enough to put the select_stack waiter out of band — and 0x70 from 5.10.136.
+/// It is a per-image heuristic used only for the zero-feasible fallback; no
+/// version family gates it.
 pub fn route_hint(
     kernel: &[u8],
     rel: &RelSymbols,
     sorted_offsets: &[u64],
-    release: &str,
 ) -> Option<(&'static str, String)> {
-    if !is_5_10(release) {
-        return None;
-    }
     let frame = function_frame(kernel, rel, sorted_offsets, "do_futex")?;
     if frame <= 0x20 {
         Some((

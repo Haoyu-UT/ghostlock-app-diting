@@ -9,7 +9,10 @@
 //!   hook), unknown when the KDP fact cannot be read.
 //! - `dirtyfrag`: W1 only, then the libc++ page-cache stub into init. It is
 //!   feasible only when the ESP shared-frag fix is absent, the UDP splice send
-//!   path attaches pages, and `select_stack` is feasible for W1.
+//!   path attaches pages, and a route is feasible for W1. W1 is delivered by
+//!   the profile's own route, so `select_stack` is not required: `sigreturn`,
+//!   `multicast_waiter` and `tcp_zerocopy` have all carried W1 on device. The
+//!   page-free routes are a quality flag, not a dependency.
 //!
 //! The facts are recorded in the option superset and the generation log. The
 //! profile carries only the chosen `pipeline`.
@@ -54,8 +57,27 @@ pub enum SendPath {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PipelineFacts {
     pub kdp: Option<bool>,
+    /// The effective ESP fix verdict: the guard and the send marking together.
     pub esp_fix: EspFix,
+    /// The `!skb_has_shared_frag()` guard in `esp_input`/`esp6_input`.
+    #[serde(default)]
+    pub esp_guard: EspFix,
+    /// The `SKBFL_SHARED_FRAG` marking in `__ip_append_data`/
+    /// `__ip6_append_data` (upstream `f4c50a4034e6`).
+    #[serde(default)]
+    pub send_marking: SendMarking,
     pub send_path: SendPath,
+}
+
+/// The send half of the ESP shared-frag fix. A guard without this marking
+/// never fires for a spliced page, so the in-place decrypt still happens.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SendMarking {
+    Present,
+    Absent,
+    #[default]
+    Unknown,
 }
 
 /// One pipeline's feasibility verdict, in the same shape as `routes[]`.
@@ -86,10 +108,13 @@ pub fn measure(
     config: Option<&KernelConfig>,
     allow_disasm: bool,
 ) -> PipelineFacts {
-    let esp_fix = if allow_disasm {
-        esp_fix(kernel, rel_symbols, sorted_offsets)
+    let (esp_guard, send_marking) = if allow_disasm {
+        (
+            esp_guard(kernel, rel_symbols, sorted_offsets),
+            send_marking(kernel, rel_symbols, sorted_offsets),
+        )
     } else {
-        EspFix::Unknown
+        (EspFix::Unknown, SendMarking::Unknown)
     };
     let send_path = if allow_disasm {
         send_path(kernel, rel_symbols, sorted_offsets)
@@ -98,7 +123,9 @@ pub fn measure(
     };
     PipelineFacts {
         kdp: kdp(config, symbols),
-        esp_fix,
+        esp_fix: effective_esp_fix(esp_guard, send_marking),
+        esp_guard,
+        send_marking,
         send_path,
     }
 }
@@ -123,7 +150,14 @@ pub fn verdicts(facts: &PipelineFacts, routes: &[RouteVerdict]) -> Vec<PipelineO
             "KDP fact unavailable (no IKCONFIG and no security_integrity_current symbol)",
         ),
     };
-    let select_stack = routes.iter().find(|route| route.route == "select_stack");
+    /* W1 is a zero write delivered by whichever middleware route the profile
+     * names; the DirtyFrag stage itself never touches the futex route. Naming
+     * a single route here suppressed the pipeline on the sigreturn-only and
+     * multicast-only images, where W1 has been delivered on device. */
+    let w1_routes: Vec<&RouteVerdict> = routes
+        .iter()
+        .filter(|route| route.verdict == Feasibility::Feasible)
+        .collect();
     let dirtyfrag = if facts.esp_fix != EspFix::Absent {
         PipelineOption::of(
             "dirtyfrag",
@@ -145,26 +179,29 @@ pub fn verdicts(facts: &PipelineFacts, routes: &[RouteVerdict]) -> Vec<PipelineO
                 _ => "the UDP send path could not be measured".to_string(),
             },
         )
-    } else if !matches!(
-        select_stack,
-        Some(route) if route.verdict == Feasibility::Feasible
-    ) {
+    } else if w1_routes.is_empty() {
         PipelineOption::of(
             "dirtyfrag",
             Feasibility::Infeasible,
-            "select_stack is not feasible, so there is no page-free W1",
+            "no route is feasible for W1",
         )
     } else {
         PipelineOption::of(
             "dirtyfrag",
             Feasibility::Feasible,
             format!(
-                "ESP fix absent; send path {}; select_stack feasible",
+                "{}; send path {}; W1 via {}",
+                esp_gap(facts),
                 match facts.send_path {
                     SendPath::SkbSpliceFromIter => "skb_splice_from_iter",
                     SendPath::IpAppendPage => "ip_append_page",
                     _ => "unknown",
-                }
+                },
+                w1_routes
+                    .iter()
+                    .map(|route| route.route)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         )
     };
@@ -186,7 +223,7 @@ fn kdp(config: Option<&KernelConfig>, symbols: &BTreeMap<String, BTreeSet<u64>>)
 /// fix to be present. A function that is absent (the corresponding ESP family
 /// is not built) is skipped; a function that is present but whose
 /// `skb_cow_data` call cannot be found makes the answer unknown.
-fn esp_fix(kernel: &[u8], rel_symbols: &RelSymbols, sorted_offsets: &[u64]) -> EspFix {
+fn esp_guard(kernel: &[u8], rel_symbols: &RelSymbols, sorted_offsets: &[u64]) -> EspFix {
     let Some(cow) = unique_offset_optional(rel_symbols, "skb_cow_data") else {
         return EspFix::Unknown;
     };
@@ -210,6 +247,61 @@ fn esp_fix(kernel: &[u8], rel_symbols: &RelSymbols, sorted_offsets: &[u64]) -> E
     } else {
         EspFix::Unknown
     }
+}
+
+/// The effective fix: a guard without the send marking never fires, so the
+/// pair is required. This is the verdict the DirtyFrag option consumes.
+fn effective_esp_fix(guard: EspFix, marking: SendMarking) -> EspFix {
+    match guard {
+        EspFix::Absent => EspFix::Absent,
+        EspFix::Unknown => EspFix::Unknown,
+        EspFix::Present => match marking {
+            SendMarking::Present => EspFix::Present,
+            SendMarking::Absent => EspFix::Absent,
+            SendMarking::Unknown => EspFix::Unknown,
+        },
+    }
+}
+
+/// Why the effective fix does not block DirtyFrag: names the missing half.
+fn esp_gap(facts: &PipelineFacts) -> &'static str {
+    match (facts.esp_guard, facts.send_marking) {
+        (EspFix::Present, SendMarking::Absent) => {
+            "the ESP guard is present but the send path does not mark shared frags"
+        }
+        (EspFix::Absent, _) => "the ESP shared-frag fix is absent",
+        _ => "the ESP fix is not effective",
+    }
+}
+
+/// The send half of `f4c50a4034e6`: `__ip_append_data`/`__ip6_append_data`
+/// set `SKBFL_SHARED_FRAG` (bit 5 of `skb_shared_info.flags`) on a spliced
+/// datagram frag. Instruction-level, like the guard: an `orr ..., #0x20`.
+fn send_marking(kernel: &[u8], rel_symbols: &RelSymbols, sorted_offsets: &[u64]) -> SendMarking {
+    let mut marked = 0u32;
+    let mut unmarked = 0u32;
+    for name in ["__ip_append_data", "__ip6_append_data"] {
+        let Ok(dis) = disassemble_symbol(kernel, rel_symbols, sorted_offsets, name, 0x4000) else {
+            continue;
+        };
+        if dis.iter().any(|line| send_mark_line(line)) {
+            marked += 1;
+        } else {
+            unmarked += 1;
+        }
+    }
+    if unmarked > 0 {
+        SendMarking::Absent
+    } else if marked > 0 {
+        SendMarking::Present
+    } else {
+        SendMarking::Unknown
+    }
+}
+
+fn send_mark_line(line: &str) -> bool {
+    let mark = Regex::new(r"(?i)\borr\s+w\d+,\s*w\d+,\s*#0x20\b").unwrap();
+    mark.is_match(line)
 }
 
 /// `Some(true)`: the bit-5 `tx_flags` test is in the window before the
@@ -287,9 +379,16 @@ mod tests {
     }
 
     fn facts(kdp: Option<bool>, esp_fix: EspFix, send_path: SendPath) -> PipelineFacts {
+        let (esp_guard, send_marking) = match esp_fix {
+            EspFix::Present => (EspFix::Present, SendMarking::Present),
+            EspFix::Absent => (EspFix::Absent, SendMarking::Unknown),
+            EspFix::Unknown => (EspFix::Unknown, SendMarking::Unknown),
+        };
         PipelineFacts {
             kdp,
             esp_fix,
+            esp_guard,
+            send_marking,
             send_path,
         }
     }
@@ -335,6 +434,50 @@ mod tests {
     }
 
     #[test]
+    fn send_mark_line_shapes() {
+        assert!(send_mark_line("orr w8, w8, #0x20"));
+        assert!(!send_mark_line("orr w8, w8, #0x21"));
+        assert!(!send_mark_line("and w8, w9, #0x20"));
+        assert!(!send_mark_line("tst w8, #0x20"));
+    }
+
+    #[test]
+    fn effective_fix_requires_both_halves() {
+        assert_eq!(
+            effective_esp_fix(EspFix::Present, SendMarking::Present),
+            EspFix::Present
+        );
+        assert_eq!(
+            effective_esp_fix(EspFix::Present, SendMarking::Absent),
+            EspFix::Absent
+        );
+        assert_eq!(
+            effective_esp_fix(EspFix::Absent, SendMarking::Present),
+            EspFix::Absent
+        );
+        assert_eq!(
+            effective_esp_fix(EspFix::Unknown, SendMarking::Present),
+            EspFix::Unknown
+        );
+    }
+
+    #[test]
+    fn a_guard_without_the_send_marking_is_ineffective() {
+        /* The guard is present but __ip_append_data never sets the flag, so
+         * the guard never fires and the in-place decrypt still happens: the
+         * DirtyFrag option stays feasible and names the missing half. */
+        let mut f = facts(Some(false), EspFix::Absent, SendPath::IpAppendPage);
+        f.esp_guard = EspFix::Present;
+        f.send_marking = SendMarking::Absent;
+        f.esp_fix = effective_esp_fix(f.esp_guard, f.send_marking);
+        let routes = vec![route("select_stack", Feasibility::Feasible)];
+        let verdicts = verdicts(&f, &routes);
+        assert_eq!(verdicts[1].pipeline, "dirtyfrag");
+        assert_eq!(verdicts[1].verdict, "feasible");
+        assert!(verdicts[1].reason.contains("does not mark"));
+    }
+
+    #[test]
     fn copy_send_path_blocks_dirtyfrag() {
         let routes = vec![route("select_stack", Feasibility::Feasible)];
         let verdicts = verdicts(&facts(Some(false), EspFix::Absent, SendPath::Copy), &routes);
@@ -343,11 +486,40 @@ mod tests {
     }
 
     #[test]
-    fn dirtyfrag_requires_select_stack() {
-        let routes = vec![route("select_stack", Feasibility::Infeasible)];
-        let verdicts = verdicts(&facts(Some(false), EspFix::Absent, SendPath::IpAppendPage), &routes);
+    fn a_feasible_w1_route_is_enough() {
+        /* The 5.10.81 shape that exposed the false dependency: select_stack,
+         * multicast and tcp out of band, sigreturn feasible, the ESP fix
+         * absent, ip_append_page. The profile's sigreturn route delivers W1
+         * (it carried the whole chain on the era rig), so DirtyFrag is
+         * feasible and the reason names the route. */
+        let routes = vec![
+            route("select_stack", Feasibility::Infeasible),
+            route("multicast_waiter", Feasibility::Infeasible),
+            route("sigreturn", Feasibility::Feasible),
+            route("tcp_zerocopy", Feasibility::Infeasible),
+        ];
+        let verdicts = verdicts(
+            &facts(Some(false), EspFix::Absent, SendPath::IpAppendPage),
+            &routes,
+        );
+        assert_eq!(verdicts[1].pipeline, "dirtyfrag");
+        assert_eq!(verdicts[1].verdict, "feasible");
+        assert!(verdicts[1].reason.contains("sigreturn"));
+        assert!(!verdicts[1].reason.contains("select_stack"));
+    }
+
+    #[test]
+    fn no_w1_route_blocks_dirtyfrag() {
+        let routes = vec![
+            route("select_stack", Feasibility::Infeasible),
+            route("sigreturn", Feasibility::Infeasible),
+        ];
+        let verdicts = verdicts(
+            &facts(Some(false), EspFix::Absent, SendPath::IpAppendPage),
+            &routes,
+        );
         assert_eq!(verdicts[1].verdict, "infeasible");
-        assert!(verdicts[1].reason.contains("select_stack"));
+        assert!(verdicts[1].reason.contains("no route"));
     }
 
     #[test]

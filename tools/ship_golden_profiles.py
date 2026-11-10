@@ -42,13 +42,11 @@ DEFAULT_EXTRACT = os.path.join(APP, "build", "extract", "release", "ghostlock-ex
 
 SKIP_CORPUS = {"btf-only", "codegen", "excluded"}
 ROUTE_PRIORITY = ["select_stack", "sigreturn", "tcp_zerocopy", "multicast_waiter"]
-# The AArch32 compat select carrier (docs/analysis/compat-select-carrier-plan.md)
-# is the substitute for a kernel whose 64-bit select_stack is infeasible -- the
-# sigreturn-only set, determined from the superset's own route verdicts rather
-# than a version prefix. Its geometry is the measured 5.10 pre-136 family:
-# futex_time32 strip 0x1b0 / futex_time64 0x1c0, _newselect buffer 0x1e0.
-COMPAT_WAITER_HOME = 0x1B0
-COMPAT_SELECT_DST_DEPTH = 0x1E0
+# The AArch32 compat select carrier's route block and geometry are the
+# extractor's own now (analysis::apply_compat_select + report::
+# conf_compat_route_geometry): a 5.10 pre-136 image whose 64-bit select is
+# infeasible reports select_stack feasible with the measured family geometry,
+# and the tool just renders the chosen route.
 # Same order as the Rust store harness (tests/common/mod.rs sidecar_args).
 SIDECARS = [
     ("vendor_boot.img", "--vendor-boot"),
@@ -207,17 +205,28 @@ def asset_pipeline(path):
     return match.group(1).strip().lower() if match else None
 
 
-def sigreturn_only(options):
-    """The 64-bit select_stack is infeasible and sigreturn is feasible.
+def asset_has_stride(path):
+    """Whether the rendered asset carries a `kernelsnitch.mm_struct_sz` value.
 
-    That is the set the AArch32 compat select carrier exists for. Derived from
-    the superset's own verdicts, not from a kernel-version prefix.
+    Hand-finished assets are HOCON with `include "kernelsnitch-6x.conf"`, whose
+    block carries the 1280 stride; follow one level of include so the check
+    tests the effective document, not just the asset's own text.
     """
-    verdicts = {r.get("route"): r.get("verdict") for r in options.get("routes", [])}
-    return (
-        verdicts.get("select_stack") == "infeasible"
-        and verdicts.get("sigreturn") == "feasible"
-    )
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError:
+        return False
+    if "mm_struct_sz" in text:
+        return True
+    base = os.path.dirname(path)
+    for name in re.findall(r'(?m)^\s*include\s+"([^"]+)"', text):
+        try:
+            included = open(os.path.join(base, name), encoding="utf-8").read()
+        except OSError:
+            continue
+        if "mm_struct_sz" in included:
+            return True
+    return False
 
 
 def phys_map_lines(options):
@@ -252,23 +261,14 @@ def phys_map_lines(options):
     )
 
 
-def compat_anchor(options):
-    """The dump_skip.zeroes anchor triple, 8-byte aligned (the 5.10.43 fix)."""
-    for candidate in options.get("candidates", []):
-        name = candidate.get("name") or ""
-        anchor = candidate.get("anchor")
-        if anchor and "dump_skip" in name:
-            image = int(anchor["image"])
-            aligned = (image + 7) & ~7
-            return aligned, int(anchor.get("bytes", 4096)), int(anchor.get("stride", 32))
-    raise NotShippable("compat carrier: no dump_skip anchor candidate")
 
 
-def mm_struct_stride(directory):
-    """The QEMU runtime dump's /proc/slabinfo mm_struct objsize, or None.
+def mm_struct_stride(directory, meta=None):
+    """The measured /proc/slabinfo mm_struct objsize, or None.
 
     The extractor deliberately emits no stride (a generated profile should
-    measure it, not seed it); the store's runtime dump is the measurement.
+    measure it, not seed it); the store's QEMU runtime dump is the usual
+    measurement, and a device-only entry records it in meta.txt (`stride`).
     """
     for path in sorted(glob.glob(os.path.join(directory, "runtime-*.txt"))):
         for line in open(path, encoding="utf-8", errors="replace"):
@@ -278,13 +278,17 @@ def mm_struct_stride(directory):
                     return int(parts[4])
                 except ValueError:
                     return None
+    if meta:
+        value = (meta.get("stride") or "").strip()
+        if value.isdigit():
+            return int(value)
     return None
 
 
 def set_mm_struct_stride(text, stride):
     """Write the measured slab stride into the kernelsnitch block."""
     line = (
-        f"  # measured /proc/slabinfo mm_struct objsize {stride} (QEMU).\n"
+        f"  # measured /proc/slabinfo mm_struct objsize {stride}.\n"
         f"  mm_struct_sz = {stride}\n"
     )
     existing = re.compile(r"^  mm_struct_sz\s*=\s*\d+\s*$", re.MULTILINE)
@@ -294,36 +298,6 @@ def set_mm_struct_stride(text, stride):
     if block:
         return text[: block.end()] + line + text[block.end():]
     return text + f"\nkernelsnitch {{\n{line}}}\n"
-
-
-def replace_route_block(text, block):
-    lines = text.splitlines()
-    start = next(
-        index for index, line in enumerate(lines) if line.strip() == "route {"
-    )
-    end = next(
-        index for index in range(start + 1, len(lines)) if lines[index].rstrip() == "}"
-    )
-    lines[start:end + 1] = block.splitlines()
-    return "\n".join(lines) + "\n"
-
-
-def compat_route_block(image, anchor_bytes, anchor_stride):
-    return "\n".join(
-        [
-            "route {",
-            "  select_stack {",
-            "    compact_waiter = 1",
-            "    compat_carrier = 1",
-            f"    waiter_home = {COMPAT_WAITER_HOME}",
-            f"    select_dst_depth = {COMPAT_SELECT_DST_DEPTH}",
-            f"    lock_anchor_image = {image}",
-            f"    lock_anchor_bytes = {anchor_bytes}",
-            f"    lock_anchor_stride = {anchor_stride}",
-            "  }",
-            "}",
-        ]
-    )
 
 
 def replace_line(text, key, line):
@@ -355,13 +329,6 @@ def validate(entry):
     devices = entry_devices(entry["meta"], entry["directory"])
     if not devices:
         raise NotShippable("no device sidecar set")
-    compat = None
-    if sigreturn_only(options):
-        try:
-            compat = compat_anchor(options)
-        except NotShippable:
-            # No dump_skip candidate: the profile still ships, on sigreturn.
-            compat = None
     entry.update(
         options=options,
         image=entry_image(entry["meta"], entry["directory"]),
@@ -369,8 +336,7 @@ def validate(entry):
         primary=devices[0],
         route=choose_route(options),
         maps=phys_map_lines(options),
-        stride=mm_struct_stride(entry["directory"]),
-        compat=compat,
+        stride=mm_struct_stride(entry["directory"], entry["meta"]),
     )
     entry["feasible_pipelines"] = feasible_pipelines(options)
     return entry
@@ -429,17 +395,7 @@ def asset_text(entry, rendered):
         text = replace_line(text, "kernel_phys_offset", entry["maps"][1])
     if entry.get("stride"):
         text = set_mm_struct_stride(text, entry["stride"])
-    if entry.get("compat"):
-        image, anchor_bytes, anchor_stride = entry["compat"]
-        text = replace_route_block(
-            text, compat_route_block(image, anchor_bytes, anchor_stride)
-        )
-        route_label = (
-            f"select_stack (compat carrier: waiter_home 0x{COMPAT_WAITER_HOME:x}, "
-            f"select_dst_depth 0x{COMPAT_SELECT_DST_DEPTH:x}, anchor {image})"
-        )
-    else:
-        route_label = entry["route"]
+    route_label = entry["route"]
     header = (
         "# SHIPPED GOLDEN -- test-kernels golden (QEMU tier); generated, do not edit.\n"
         f"# store: {entry['release']}; route: {route_label}; "
@@ -453,7 +409,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="report only, exit 1 on a missing or mismatched golden")
     parser.add_argument("--apply", action="store_true", help="render and index the missing goldens")
-    parser.add_argument("--refresh", action="store_true", help="rewrite existing SHIPPED GOLDEN assets whose pipeline line is missing or infeasible")
+    parser.add_argument("--refresh", action="store_true", help="rewrite existing SHIPPED GOLDEN assets whose pipeline line or measured mm_struct_sz is missing/infeasible")
     parser.add_argument("--store", default=DEFAULT_STORE)
     parser.add_argument("--assets", default=DEFAULT_ASSETS)
     parser.add_argument("--extract", default=DEFAULT_EXTRACT)
@@ -526,6 +482,13 @@ def main():
                 entry["reasons"] = ["asset present but not in index.conf"]
                 missing.append(entry)
                 continue
+            if entry.get("stride") and not asset_has_stride(asset_path):
+                entry["reasons"] = [
+                    f"asset has no mm_struct_sz (entry stride {entry['stride']}); "
+                    "use --refresh"
+                ]
+                missing.append(entry)
+                continue
             bundled += 1
             continue
         try:
@@ -574,13 +537,18 @@ def main():
                 failures.append((entry["release"], "asset is hand-finished; not overwritten"))
                 continue
             if "choice_pipeline" not in entry:
-                try:
-                    entry["choice_pipeline"] = choose_pipeline(
-                        entry["options"], entry["meta"]
-                    )
-                except (PipelineChoiceRequired, NotShippable) as error:
-                    failures.append((entry["release"], str(error)))
-                    continue
+                # keep the shipped selection when refreshing an existing asset
+                existing = asset_pipeline(asset_path)
+                if existing in entry.get("feasible_pipelines", []):
+                    entry["choice_pipeline"] = existing
+                else:
+                    try:
+                        entry["choice_pipeline"] = choose_pipeline(
+                            entry["options"], entry["meta"]
+                        )
+                    except (PipelineChoiceRequired, NotShippable) as error:
+                        failures.append((entry["release"], str(error)))
+                        continue
         with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as handle:
             temp_path = handle.name
         try:

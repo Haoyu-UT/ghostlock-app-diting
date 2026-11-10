@@ -242,9 +242,49 @@ pub fn conf_route_geometry(
     route: &str,
     release: &str,
     pselect_shift: Option<i64>,
+) -> Vec<(&'static str, i64)> {
+    conf_route_geometry_with_sigreturn(route, release, pselect_shift, None)
+}
+
+/// The AArch32 compat select carrier's route block, from the image-derived
+/// geometry: the compat strip home and the `_newselect` buffer depth this
+/// image's own chain produced. It replaces the 64-bit route's `waiter_shift`
+/// branch (there is no 64-bit strip to shift).
+pub fn conf_compat_route_geometry(waiter_home: i64, select_dst_depth: i64) -> Vec<(&'static str, i64)> {
+    vec![
+        ("compact_waiter", crate::family::SELECT_COMPACT_WAITER),
+        ("compat_carrier", 1),
+        ("waiter_home", waiter_home),
+        ("select_dst_depth", select_dst_depth),
+    ]
+}
+
+/// The multicast route's profile block from the route verdict's own numbers:
+/// the setsockopt copy window (`buffer_size`), the strip home (`waiter_off`)
+/// and the `rt_mutex_waiter` field offsets this image produced (BTF, or the
+/// labelled 5.10 template on a BTF-less image). A key the verdict could not
+/// produce falls back to the train-corroborated constants — never to the
+/// release string. `compact_waiter` selects the native route
+/// implementation's flat-strip encoder.
+pub fn conf_multicast_route_geometry(
+    numbers: &BTreeMap<String, i64>,
     structs: &BTreeMap<String, Option<u32>>,
 ) -> Vec<(&'static str, i64)> {
-    conf_route_geometry_with_sigreturn(route, release, pselect_shift, None, structs)
+    let fallback = crate::derive::multicast_geometry_corroborated(structs);
+    let mut geometry: Vec<(&'static str, i64)> = Vec::new();
+    for key in ["waiter_off", "buffer_size", "task_offset", "lock_offset"] {
+        let value = numbers.get(key).copied().or_else(|| {
+            fallback
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| *value)
+        });
+        if let Some(value) = value {
+            geometry.push((key, value));
+        }
+    }
+    geometry.push(("compact_waiter", crate::derive::MULTICAST_COMPACT_WAITER));
+    geometry
 }
 
 /// The route's branch geometry, with the sigreturn offsets the extractor
@@ -255,12 +295,7 @@ pub fn conf_route_geometry_with_sigreturn(
     release: &str,
     pselect_shift: Option<i64>,
     sigreturn_offsets: Option<(i64, i64)>,
-    structs: &BTreeMap<String, Option<u32>>,
 ) -> Vec<(&'static str, i64)> {
-    let major = release
-        .split('.')
-        .next()
-        .and_then(|part| part.parse::<u32>().ok());
     // The 5.10 codegen constants apply to any 5.10 build; the route decision
     // itself is made from the image's own geometry (or the family constant only
     // as the labelled zero-feasible fallback, supplied by the caller).
@@ -313,14 +348,8 @@ pub fn conf_route_geometry_with_sigreturn(
         {
             vec![("compact_waiter", 1)]
         }
-        // The 5.x one-shot multicast branch runs entirely from probe-derived
-        // constants (waiter_off / buffer_size), BTF-derived rt_mutex_waiter
-        // task/lock offsets and the fixed 5.x waiter-layout flag. Emit all of
-        // them for every 5.x kernel so the generated profile runs without
-        // manual edits; a kernel without BTF omits only the task/lock keys.
-        "multicast_waiter" if major == Some(5) => {
-            crate::derive::multicast_geometry_corroborated(structs)
-        }
+        // `multicast_waiter` has no release-keyed branch: its block comes from
+        // the route verdict's own numbers (`conf_multicast_route_geometry`).
         _ => Vec::new(),
     }
 }
@@ -384,6 +413,9 @@ pub struct ConfInputs<'a> {
     /// The profile's pipeline selection. Omitted for the route-less common
     /// profile: the superset carries the measured verdicts instead.
     pub pipeline: Option<&'a str>,
+    /// The KDP fact. `Some(true)` emits `kdp = 1`; the app's KDP guard pairs
+    /// it with an explicit pipeline, and a non-KDP profile is unchanged.
+    pub kdp: Option<bool>,
     pub route: Option<&'a str>,
     pub route_geometry: &'a [(&'static str, i64)],
     pub cred: &'a [(String, String)],
@@ -431,6 +463,9 @@ pub fn render_conf_with_device(input: &ConfInputs<'_>, device: Option<&str>) -> 
         format!("kernel_major = {}", major.unwrap_or(0)),
         "recommend_shizuku = 0".to_string(),
     ];
+    if input.kdp == Some(true) {
+        lines.push("kdp = 1".to_string());
+    }
     /* Stage 4: the provenance header. One comment line; no key and no schema
      * change. The app's HOCON parser ignores comments, so this is an audit
      * trail, not machine state. */
@@ -452,6 +487,9 @@ pub fn render_conf_with_device(input: &ConfInputs<'_>, device: Option<&str>) -> 
             input.phys_source
         ),
     ];
+    if input.kdp == Some(true) {
+        fact_sources.push("kdp=1 (pipeline fact)".to_string());
+    }
     /* The 5.x credential block is derived from init_cred and sizeof(cred),
      * not from the 6.x template's prefix fields; the header must describe the
      * values the body actually emits. The caller picks that block for every
@@ -532,7 +570,18 @@ pub fn render_conf_with_device(input: &ConfInputs<'_>, device: Option<&str>) -> 
         lines.push("route {".to_string());
         lines.push(format!("  {route} {{"));
         let mut written: Vec<&str> = Vec::new();
-        if let Some((_, fields)) = CONF_ROUTE_FIELDS.iter().find(|(name, _)| *name == route) {
+        /* The compat select block has no `waiter_shift`: it is placed from
+         * `waiter_home`/`select_dst_depth`. Emitting the 64-bit universe's null
+         * here would surface as an invalid path for a valid profile. */
+        let compat_select = route == "select_stack"
+            && input
+                .route_geometry
+                .iter()
+                .any(|(key, value)| *key == "compat_carrier" && *value == 1);
+        if let Some((_, fields)) = CONF_ROUTE_FIELDS
+            .iter()
+            .find(|(name, _)| *name == route && !compat_select)
+        {
             for field in *fields {
                 let value = input
                     .route_geometry
@@ -735,8 +784,8 @@ pub fn optional_struct_fields() -> BTreeSet<&'static str> {
 mod tests {
     use super::{
         CONF_TASK_FIELDS, ConfExtraOffsets, ConfInputs, build_report, conf_cred_5x, conf_cred_6x,
-        conf_route_geometry, conf_route_geometry_with_sigreturn, pselect_waiter_shift_for,
-        render_conf, render_conf_with_device,
+        conf_multicast_route_geometry, conf_route_geometry, conf_route_geometry_with_sigreturn,
+        pselect_waiter_shift_for, render_conf, render_conf_with_device,
     };
     use crate::derive::Cred5x;
     use crate::fact::{Confidence, Domain, Fact, Source};
@@ -765,6 +814,7 @@ mod tests {
         let geometry: Vec<(&'static str, i64)> = vec![("waiter_shift", -2)];
         let inputs = ConfInputs {
             pipeline: None,
+            kdp: None,
             release: "5.10.198-android12-9-00085-g226a9632f13d-ab11136126",
             phys: Some(0x4000_0000),
             phys_offset: Some(0x4000_0000),
@@ -795,6 +845,7 @@ mod tests {
         let geometry: Vec<(&'static str, i64)> = vec![("waiter_shift", -2)];
         let out = render_conf(&ConfInputs {
             pipeline: None,
+            kdp: None,
             release: "6.6.89-android15-8-g0889fe95bb10-ab14402178-4k",
             phys: Some(0x4000_0000),
             phys_offset: None,
@@ -837,6 +888,7 @@ mod tests {
         let geometry: Vec<(&'static str, i64)> = vec![("compact_waiter", 1)];
         let out = render_conf(&ConfInputs {
             pipeline: None,
+            kdp: None,
             release: "6.1.118-android14-11-gca0ef6d17716-ab13624819",
             phys: None,
             phys_offset: None,
@@ -920,6 +972,7 @@ mod tests {
         };
         let out = render_conf(&ConfInputs {
             pipeline: None,
+            kdp: None,
             release: "6.6.89-android15-8-g0889fe95bb10-ab14402178-4k",
             phys: None,
             phys_offset: None,
@@ -1012,6 +1065,7 @@ mod tests {
         };
         let out = render_conf(&ConfInputs {
             pipeline: None,
+            kdp: None,
             release: "6.1.25-android14-11-g8744d1c0cf31-ab10888519",
             phys: None,
             phys_offset: None,
@@ -1066,6 +1120,7 @@ mod tests {
         };
         let out = render_conf(&ConfInputs {
             pipeline: None,
+            kdp: None,
             release: "5.15.189-android13-8-00016-g51bba4309aac-ab14546557",
             phys: None,
             phys_offset: None,
@@ -1095,6 +1150,7 @@ mod tests {
         let (symbols, structs) = conf_fixture();
         let out = render_conf(&ConfInputs {
             pipeline: None,
+            kdp: None,
             release: "6.6.89-android15-8-g0889fe95bb10-ab14402178-4k",
             phys: Some(0xa800_0000),
             phys_offset: None,
@@ -1128,14 +1184,17 @@ mod tests {
                 (0x98, 0xffffffc00ab23b28),
             ],
         };
-        let geometry = conf_route_geometry(
-            "multicast_waiter",
-            "5.15.189-android13-8-00016-g51bba4309aac-ab14546557",
-            Some(-2),
-            &structs,
-        );
+        let numbers = BTreeMap::from([
+            ("waiter_off".to_string(), 96),
+            ("buffer_size".to_string(), 264),
+            ("task_offset".to_string(), 48),
+            ("lock_offset".to_string(), 56),
+            ("buffer_source".to_string(), 0),
+        ]);
+        let geometry = conf_multicast_route_geometry(&numbers, &structs);
         let out = render_conf(&ConfInputs {
             pipeline: None,
+            kdp: None,
             release: "5.15.189-android13-8-00016-g51bba4309aac-ab14546557",
             phys: None,
             phys_offset: None,
@@ -1175,25 +1234,22 @@ mod tests {
 
     #[test]
     fn conf_route_geometry_follows_the_measured_families() {
-        let (_, structs) = conf_fixture();
         // The 5.10 select_stack geometry follows the image-derived shift, not
         // the family constant: a delta=8 image emits -1, and no shift means the
         // caller (the verdict engine) must supply the labelled fallback.
         assert_eq!(
-            conf_route_geometry("select_stack", "5.10.246-gki", Some(-1), &structs),
+            conf_route_geometry("select_stack", "5.10.246-gki", Some(-1)),
             vec![("waiter_shift", -1), ("compact_waiter", 1)]
         );
-        assert!(
-            conf_route_geometry("select_stack", "5.10.246-gki", None, &structs).is_empty()
-        );
+        assert!(conf_route_geometry("select_stack", "5.10.246-gki", None).is_empty());
         // sigreturn has no BTF derivation dependency; the patch-range fallback
         // differs by the strip home (0x1c0 vs 0x210).
         assert_eq!(
-            conf_route_geometry("sigreturn", "5.10.246-gki", None, &structs),
+            conf_route_geometry("sigreturn", "5.10.246-gki", None),
             vec![("waiter_off_sve", 256), ("waiter_off_plain", 240)]
         );
         assert_eq!(
-            conf_route_geometry("sigreturn", "5.10.81-android12-9", None, &structs),
+            conf_route_geometry("sigreturn", "5.10.81-android12-9", None),
             vec![("waiter_off_sve", 336), ("waiter_off_plain", 320)]
         );
         assert_eq!(
@@ -1201,18 +1257,15 @@ mod tests {
                 "sigreturn",
                 "5.10.236-android12-9",
                 None,
-                Some((256, 240)),
-                &structs
+                Some((256, 240))
             ),
             vec![("waiter_off_sve", 256), ("waiter_off_plain", 240)]
         );
         assert_eq!(
-            conf_route_geometry("select_stack", "6.6.89-android15-8", Some(-2), &structs),
+            conf_route_geometry("select_stack", "6.6.89-android15-8", Some(-2)),
             vec![("waiter_shift", -2)]
         );
-        assert!(
-            conf_route_geometry("select_stack", "6.6.89-android15-8", None, &structs).is_empty()
-        );
+        assert!(conf_route_geometry("select_stack", "6.6.89-android15-8", None).is_empty());
         // 6.1 and 5.15 are the flat compact-waiter families: a select-only
         // profile must carry the flag, or the route takes the rb_node branch
         // and refuses at word 14 -> global 15 (measured on 6.1.138).
@@ -1220,95 +1273,87 @@ mod tests {
             conf_route_geometry(
                 "select_stack",
                 "6.1.138-android14-11-g44bda9e8f6e9-ab13792638",
-                Some(1),
-                &structs
+                Some(1)
             ),
             vec![("waiter_shift", 1), ("compact_waiter", 1)]
         );
         assert_eq!(
-            conf_route_geometry("select_stack", "5.15.194-android13-8", Some(2), &structs),
+            conf_route_geometry("select_stack", "5.15.194-android13-8", Some(2)),
             vec![("waiter_shift", 2), ("compact_waiter", 1)]
         );
         assert_eq!(
-            conf_route_geometry("tcp_zerocopy", "6.1.118-android14-11", Some(1), &structs),
+            conf_route_geometry("tcp_zerocopy", "6.1.118-android14-11", Some(1)),
             vec![("compact_waiter", 1)]
         );
+        assert!(conf_route_geometry("tcp_zerocopy", "6.6.89-android15-8", Some(-2)).is_empty());
+        // `multicast_waiter` is not release-keyed: its block comes from the
+        // route verdict's own numbers, so the release string alone yields
+        // nothing -- including on a major-5 release.
         assert!(
-            conf_route_geometry("tcp_zerocopy", "6.6.89-android15-8", Some(-2), &structs)
-                .is_empty()
-        );
-        assert_eq!(
             conf_route_geometry(
                 "multicast_waiter",
                 "5.15.189-android13-8-00016-g51bba4309aac-ab14546557",
-                Some(-2),
-                &structs
-            ),
-            vec![
-                ("waiter_off", 96),
-                ("buffer_size", 264),
-                ("task_offset", 48),
-                ("lock_offset", 56),
-                ("compact_waiter", 1),
-            ]
+                Some(-2)
+            )
+            .is_empty()
         );
-        assert!(
-            conf_route_geometry("multicast_waiter", "6.6.89-android15-8", Some(-2), &structs)
-                .is_empty()
-        );
+        assert!(conf_route_geometry("multicast_waiter", "6.6.89-android15-8", Some(-2)).is_empty());
     }
 
     #[test]
     fn unverified_route_geometry_is_a_partial_candidate() {
-        let (_, structs) = conf_fixture();
         // No image-derived shift: the route branch stays empty rather than
         // borrowing the -2 family default.
-        assert!(conf_route_geometry("select_stack", "6.7.1-generic", None, &structs).is_empty());
+        assert!(conf_route_geometry("select_stack", "6.7.1-generic", None).is_empty());
         // An image-derived shift is kept.
         assert_eq!(
-            conf_route_geometry("select_stack", "6.7.1-generic", Some(-1), &structs),
+            conf_route_geometry("select_stack", "6.7.1-generic", Some(-1)),
             vec![("waiter_shift", -1)]
         );
-        // Every 5.x multicast profile carries the full one-shot geometry so it
-        // runs without manual edits, even when the release string carries no
-        // "-android13-" train tag.
+    }
+
+    #[test]
+    fn multicast_route_geometry_comes_from_the_verdict_numbers() {
+        let (_, structs) = conf_fixture();
+        // The verdict's own values win over the train constants (96/264/48/56):
+        // these are the numbers a hypothetical image's derivation produced.
+        let numbers = BTreeMap::from([
+            ("waiter_off".to_string(), 0x48),
+            ("buffer_size".to_string(), 0x120),
+            ("task_offset".to_string(), 0x28),
+            ("lock_offset".to_string(), 0x30),
+            ("buffer_source".to_string(), 0),
+        ]);
         assert_eq!(
-            conf_route_geometry(
-                "multicast_waiter",
-                "5.15.178-g3575c47dc7ce-dirty",
-                Some(-2),
-                &structs
-            ),
+            conf_multicast_route_geometry(&numbers, &structs),
             vec![
-                ("waiter_off", 96),
+                ("waiter_off", 0x48),
+                ("buffer_size", 0x120),
+                ("task_offset", 0x28),
+                ("lock_offset", 0x30),
+                ("compact_waiter", 1),
+            ]
+        );
+        // A feasible verdict carries all four keys by construction; if one is
+        // ever missing, the labelled train fallback fills it -- the release
+        // string never supplies a value.
+        let partial = BTreeMap::from([("waiter_off".to_string(), 0x48)]);
+        assert_eq!(
+            conf_multicast_route_geometry(&partial, &structs),
+            vec![
+                ("waiter_off", 0x48),
                 ("buffer_size", 264),
                 ("task_offset", 48),
                 ("lock_offset", 56),
                 ("compact_waiter", 1),
             ]
         );
-    }
-
-    #[test]
-    fn verified_5x_train_without_device_evidence_omits_measured_placement() {
-        let (_, structs) = conf_fixture();
-        let geometry = conf_route_geometry(
-            "multicast_waiter",
-            "5.15.208-android13-9-gabcdef",
-            Some(-2),
-            &structs,
-        );
-        assert!(geometry.contains(&("waiter_off", 96)));
-        assert!(geometry.contains(&("buffer_size", 264)));
-        assert!(geometry.contains(&("task_offset", 48)));
-        assert!(geometry.contains(&("lock_offset", 56)));
-        assert!(geometry.contains(&("compact_waiter", 1)));
+        // The block never grows the removed device-placement keys.
+        let geometry = conf_multicast_route_geometry(&numbers, &structs);
         assert!(
-            !geometry.iter().any(|(key, _)| {
-                let key = *key;
-                key.starts_with("fake_") || key.starts_with("lock_slot")
-            }),
-            "device-measured placement must not be inherited by the train"
+            !geometry.iter().any(|(key, _)| key.starts_with("fake_")
+                || key.starts_with("lock_slot")),
+            "device-measured placement must not be inherited"
         );
     }
 
@@ -1318,6 +1363,7 @@ mod tests {
         let structs: BTreeMap<String, Option<u32>> = BTreeMap::new();
         let out = render_conf(&ConfInputs {
             pipeline: None,
+            kdp: None,
             release: "5.15.178-g3575c47dc7ce-dirty",
             phys: None,
             phys_offset: None,
@@ -1345,6 +1391,7 @@ mod tests {
         let (symbols, structs) = conf_fixture();
         let out = render_conf(&ConfInputs {
             pipeline: None,
+            kdp: None,
             release: "6.7.1-generic",
             phys: None,
             phys_offset: None,
@@ -1368,14 +1415,20 @@ mod tests {
     #[test]
     fn unverified_5x_candidate_is_runnable() {
         let (symbols, structs) = conf_fixture();
-        let geometry = conf_route_geometry(
-            "multicast_waiter",
-            "5.15.178-g3575c47dc7ce-dirty",
-            Some(-2),
-            &structs,
-        );
+        // The numbers a BTF-less 5.10 image's verdict produces: the derived
+        // strip home, the UAPI copy size (buffer_source = 1), and the 5.10
+        // waiter template the verdict applied under its own guard.
+        let numbers = BTreeMap::from([
+            ("waiter_off".to_string(), 96),
+            ("buffer_size".to_string(), 264),
+            ("buffer_source".to_string(), 1),
+            ("task_offset".to_string(), 0x30),
+            ("lock_offset".to_string(), 0x38),
+        ]);
+        let geometry = conf_multicast_route_geometry(&numbers, &structs);
         let out = render_conf(&ConfInputs {
             pipeline: None,
+            kdp: None,
             release: "5.15.178-g3575c47dc7ce-dirty",
             phys: None,
             phys_offset: None,
@@ -1540,9 +1593,19 @@ mod tests {
     #[test]
     fn a301so_generated_conf_matches_the_bundled_profile() {
         let (release, symbols, structs, cred, extra) = a301so_inputs();
-        let geometry = conf_route_geometry("multicast_waiter", &release, None, &structs);
+        /* The values the route verdict derives for this image: the probe-matched
+         * strip home, the BTF copy size, and the BTF waiter fields. */
+        let numbers = BTreeMap::from([
+            ("waiter_off".to_string(), 96),
+            ("buffer_size".to_string(), 264),
+            ("buffer_source".to_string(), 0),
+            ("task_offset".to_string(), 48),
+            ("lock_offset".to_string(), 56),
+        ]);
+        let geometry = conf_multicast_route_geometry(&numbers, &structs);
         let generated = render_conf(&ConfInputs {
             pipeline: None,
+            kdp: None,
             release: &release,
             phys: None,
             phys_offset: None,

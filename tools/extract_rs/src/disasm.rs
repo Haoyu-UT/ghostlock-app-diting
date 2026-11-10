@@ -98,6 +98,15 @@ fn is_sp_sub_imm(line: &str) -> bool {
         .is_match(line)
 }
 
+/// A preindex frame-pointer prologue (`stp x29, x30, [sp, #-N]!`). Some
+/// wrappers have no separate `sub sp` (the compat syscall wrappers), so the
+/// preindex form is a frame on its own.
+fn is_preindex_stp(line: &str) -> bool {
+    Regex::new(r"(?i)\bstp\s+x29,\s*x30,\s*\[sp,\s*#-0x[0-9a-f]+\]!")
+        .unwrap()
+        .is_match(line)
+}
+
 fn is_sp_post_index_restore(line: &str) -> bool {
     Regex::new(r"(?i)\[\s*sp\],\s*#0x[0-9a-f]+")
         .unwrap()
@@ -131,26 +140,25 @@ pub fn validate_frame_live_at(lines: &[String], anchor: &Regex, name: &str) -> R
         )));
     }
     let anchor_index = anchor_indices[0];
-    let subs: Vec<usize> = lines[..anchor_index]
+    let frame_start = lines[..anchor_index]
         .iter()
-        .enumerate()
-        .filter(|(_, line)| is_sp_sub_imm(line))
-        .map(|(index, _)| index)
-        .collect();
-    if subs.len() != 1 {
-        return Err(ExtractError::new(format!(
-            "{name} has {} SP frames before anchor",
-            subs.len()
-        )));
-    }
-    for index in subs[0] + 1..anchor_index {
+        .position(|line| is_sp_sub_imm(line) || is_preindex_stp(line))
+        .ok_or_else(|| {
+            ExtractError::new(format!("{name} has 0 SP frames before anchor"))
+        })?;
+    let sub_index = lines[..anchor_index]
+        .iter()
+        .position(|line| is_sp_sub_imm(line));
+    for index in frame_start + 1..anchor_index {
         let line = &lines[index];
         if is_sp_post_index_restore(line) {
             return Err(ExtractError::new(format!(
                 "{name} restores SP post-index before anchor"
             )));
         }
-        if is_sp_add_or_sub(line) {
+        /* The prologue's own `sub sp` (after a preindex `stp`) is the frame
+         * itself, not an adjustment. */
+        if is_sp_add_or_sub(line) && Some(index) != sub_index {
             let rest = &lines[index + 1..anchor_index];
             if !rest.iter().any(|tail| is_ret(tail)) {
                 return Err(ExtractError::new(format!(
@@ -198,6 +206,20 @@ pub fn add_sp_immediates(lines: &[String]) -> Vec<(String, u64)> {
 
 pub fn cmp_immediates(lines: &[String]) -> Vec<u64> {
     let re = Regex::new(r"(?i)\bcmp\s+x\d+,\s*#0x([0-9a-f]+)").unwrap();
+    let mut out = Vec::new();
+    for line in lines {
+        for caps in re.captures_iter(line) {
+            out.push(u64::from_str_radix(&caps[1], 16).unwrap());
+        }
+    }
+    out
+}
+
+/// `cmp` immediates against either width's register. The compat handlers keep
+/// their sizes in 32-bit locals (`cmp w8, #0x2a`), where the 64-bit-verified
+/// derivations see `cmp x8, #…` only.
+pub fn cmp_immediates_any_width(lines: &[String]) -> Vec<u64> {
+    let re = Regex::new(r"(?i)\bcmp\s+[xw]\d+,\s*#0x([0-9a-f]+)").unwrap();
     let mut out = Vec::new();
     for line in lines {
         for caps in re.captures_iter(line) {

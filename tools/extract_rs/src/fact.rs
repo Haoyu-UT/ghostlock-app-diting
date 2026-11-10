@@ -546,6 +546,7 @@ mod tests {
     ) -> ConfInputs<'a> {
         ConfInputs {
             pipeline: None,
+            kdp: None,
             release: "6.1.25",
             phys: Some(0xa800_0000),
             phys_offset: None,
