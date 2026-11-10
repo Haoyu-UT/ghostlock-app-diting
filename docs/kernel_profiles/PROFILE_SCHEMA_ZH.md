@@ -215,6 +215,29 @@ cred
 | `kernelsnitch.collisions` | 需要的 futex 碰撞数量 |
 | `kernelsnitch.mm_struct_sz` | `mm_struct` 的 SLUB 对象跨度。内置配置携带各自内核家族的实测值（5.10：960；5.15/6.1：1024；6.6/6.12：1280，已用 QEMU 确认）；生成的配置只在测量后写入（生成时的选择器或 root 读取 `/proc/slabinfo`），绝不猜测。省略时使用编译默认值 `0x500`。它决定 spray 的每 slab 对象数（`ORDER3_SIZE / stride`），泄漏扫描本身仍与跨度无关。 |
 
+### 4.7 SELinux 状态（`selinux`）
+
+`selinux_state` 内部的字段偏移，供 W1 与 page-free scratch 的取值校验使用；它们不是镜像偏移，因此不在 `offset.*` 下。
+
+| 字段 | 含义 |
+|---|---|
+| `selinux.enforcing` | `enforcing` 字节的偏移；必须为 `0`（W1 向其写入 0） |
+| `selinux.initialized` | 初始化字节的偏移。page-free 写入值必须使该字节非零；提取器据此选择 scratch。无 BTF 时的回退：6.6 之前为 `2`，6.6 起为 `1` |
+
+提取器在 5.15/6.x 上从 BTF 生成，在 5.10 上从版本模板生成；校验 `enforcing == 0` 且不存在 `disabled`，两者都无见证时失败关闭。缺少该块时使用版本回退。解析器校验 `enforcing == 0` 与 `initialized < 8`。
+
+### 4.8 W1 scratch 与 page-free 模式（`w1_scratch`）
+
+`w1_scratch` 指定一个镜像内区域，其直接映射别名作为 W1 的写入值（`alias(image) + 0x100`）：第 0 字节落在 `selinux.enforcing` 上且必须为 0，`selinux.initialized` 处的字节必须非零。提取器通过锁锚扫描选择位置：锚内窗口存在时使用锚内（native 会保留重叠的锁槽），否则使用第二个安全区域。profile 只记录镜像偏移；错误的值会导致内核崩溃。
+
+| 字段 | 含义 |
+|---|---|
+| `w1_scratch.image` | 用于 W1 取值的零值、可写、无引用区域的镜像偏移。缺省 => 回收页路径 |
+
+路由策略支持 page-free（`select_stack`、`sigreturn`、`multicast_waiter`；`tcp_zerocopy` 因假锁是构造的页对象而排除）、profile 带 `w1_scratch.image`、且带该路由的 `lock_anchor_*` 三元组时，本次运行即 page-free。该标志是每次运行的常量，运行存储首行给出：`page_free=1 reason=policy+scratch+anchor`，或 `page_free=0 reason=<第一个缺失条件>`（`route-not-capable` / `no-scratch` / `no-anchor`）。
+
+page-free 路径不调用 `prepare_good_kernel_page()`：无 spray、无 KernelSnitch 泄漏、无回收套接字、无页面接受检查、无 `[spray]` 行、`base=0`。每次写入记录取值来源（W1/W1p 为 scratch，W2 为 `init_cred`，叶子写入为 `target-8`）。基于页的凭据复制/填充与 fops 哨兵仍留在页路径；缺少任一锚的 profile 行为不变。两个键都是可选的，`schema_version` 保持 1；缺省键即页路径。
+
 ## 5. execution 调优参数（advisory）
 
 `execution` 全部为建议值，随 profile 合并后传入 native；数值语义与默认值见 [defaults_ZH.md](defaults_ZH.md)。通用分组来自 `execution-tuning.conf`，路由分组由 resolver 从 `execution-<route>.conf` 加载（主路由 + 回退路由），设备 profile 不再 include 它们：

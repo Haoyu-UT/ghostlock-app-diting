@@ -201,6 +201,13 @@ looks derived but is not is worse than shipping none: the profile's stride
 remains a hand-measured value the route validates. The CLI says so in its output
 rather than omitting the line.
 
+**Second consumer — the W1 scratch (2026-10-30).** The same zero, writable, reference-free facts
+also place the page-free W1 scratch. Each candidate can carry an in-anchor scratch (the native
+reserves the lock slots it overlaps) or a second-region scratch, and the option superset records
+every plan. The profile carries only `w1_scratch.image`; the scan's verdicts are unchanged — the
+scratch is a second placement decision on the same candidates, not a new admissibility rule. See
+`page-free-routes-plan.md` §3.3–§3.5 and `PROFILE_SCHEMA.md` §4.8.
+
 ## Sequencing
 
 Step 1 (the `lock_anchor_bytes` / `lock_anchor_stride` profile keys and the route's

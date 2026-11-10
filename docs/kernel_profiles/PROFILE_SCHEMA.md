@@ -252,6 +252,48 @@ affected by route choice:
 | `kernelsnitch.collisions` | Number of futex collisions needed |
 | `kernelsnitch.mm_struct_sz` | SLUB object stride of `mm_struct`. Bundled profiles carry their kernel family's measured value (5.10: 960; 5.15/6.1: 1024; 6.6/6.12: 1280, QEMU-confirmed); a generated profile writes it only from a measurement (the generation picker or the root slabinfo read), never a heuristic. Omitted = the compiled default `0x500`. It sizes the spray (`ORDER3_SIZE / stride` objects per slab); the leak itself stays stride-agnostic. |
 
+### 4.7 SELinux state (`selinux`)
+
+Field offsets inside `selinux_state`, consumed by W1 and by the page-free scratch admissibility.
+These are not image offsets, so they do not live under `offset.*`.
+
+| Field | Meaning |
+|---|---|
+| `selinux.enforcing` | Offset of the `enforcing` byte; must be `0` (W1 writes 0 there) |
+| `selinux.initialized` | Offset of the initialization byte. The page-free write value must leave this byte non-zero; the extractor places the scratch accordingly. Release fallback: `2` below 6.6, `1` from 6.6 |
+
+The extractor emits the block from BTF on 5.15/6.x and from the release template on 5.10,
+validates `enforcing == 0` and the absence of a `disabled` field, and fails closed when neither
+witness exists. A profile without the block uses the release-derived fallback. The resolver
+validates `enforcing == 0` and `initialized < 8`.
+
+### 4.8 W1 scratch and page-free mode (`w1_scratch`)
+
+`w1_scratch` names an image-relative kernel region whose direct-map alias supplies W1's write
+value (`alias(image) + 0x100`): byte 0 lands on `selinux.enforcing` and must read 0, and the byte
+at `selinux.initialized` must be non-zero. The extractor derives the placement with the
+lock-anchor scan: an in-anchor window when one exists (the native reserves the lock slots it
+overlaps), otherwise a second safe region. The profile carries only the image offset; a wrong
+value is a kernel crash.
+
+| Field | Meaning |
+|---|---|
+| `w1_scratch.image` | Image-relative offset of the zero, writable, reference-free region used for W1's value. Absent => the reclaimed-page path |
+
+A run is page-free when the route policy is page-free capable (`select_stack`, `sigreturn`,
+`multicast_waiter`; `tcp_zerocopy` is excluded because its fake lock is a crafted page object),
+the profile has `w1_scratch.image`, and the profile has the route's `lock_anchor_*` trio. The
+flag is a per-run constant and the store's first lines say which: `page_free=1
+reason=policy+scratch+anchor`, or `page_free=0 reason=<first missing conjunct>`
+(`route-not-capable` / `no-scratch` / `no-anchor`).
+
+On the page-free path the native skips `prepare_good_kernel_page()`: no spray, no KernelSnitch
+leak, no reclaim sockets, no page-acceptance gate, no `[spray]` lines, `base=0`. Each write
+states its value source (`w1_value_source=scratch` for W1/W1p, `init_cred` for W2, `target-8` for
+leaf writes). The page-based credential copy/fill and the fops sentinel remain on the page path; a
+profile without either anchor behaves exactly as before. Both keys are optional and
+`schema_version` stays 1; a missing key means the page path.
+
 ## 5. execution tuning (advisory)
 
 Every `execution` value is advisory. The app merges them into the profile and
