@@ -24,7 +24,9 @@
 namespace ghostlock::compat {
     inline constexpr uint32_t kCommandMagic = 0x31434c47U; /* "GLC1" */
     inline constexpr uint32_t kResultMagic = 0x31524c47U;  /* "GLR1" */
-    inline constexpr uint32_t kProtocolVersion = 1U;
+    /* 2: the smoke result carries nine slots (futex_time64 joined the G2
+     * delivery gate; a stale helper must refuse rather than misread). */
+    inline constexpr uint32_t kProtocolVersion = 2U;
 
     /* nfds is fixed at 320: it keeps the kernel's six bitmaps on the 256-byte
      * stack path (6 * FDS_BYTES(320) = 240 bytes) and gives the measured
@@ -86,9 +88,11 @@ namespace ghostlock::compat {
         uint32_t userspace_clean = 0;
         uint32_t kernel_disarmed = 0;
         /* Smoke mode only: futex, timerfd_create, _newselect, sched_setattr,
-         * dup2_high, pipe2, fcntl_high, prctl. A SIGSYS-killed syscall never
-         * fills its slot; the native sees the helper die instead. */
-        int32_t smoke[8] = {};
+         * dup2_high, pipe2, fcntl_high, prctl, futex_time64. A SIGSYS-killed
+         * syscall never fills its slot; the native sees the helper die
+         * instead. The time64 entry (422) is a separate syscall number in the
+         * arm-app seccomp policy, so it gets its own slot. */
+        int32_t smoke[9] = {};
         uint32_t reserved = 0;
     };
 
@@ -102,7 +106,7 @@ namespace ghostlock::compat {
     static_assert(std::is_standard_layout_v<CarrierResult>);
     static_assert(std::is_trivially_copyable_v<CarrierResult>);
     static_assert(offsetof(CarrierResult, smoke) == sizeof(uint32_t) * 12);
-    static_assert(sizeof(CarrierResult) == sizeof(uint32_t) * 21);
+    static_assert(sizeof(CarrierResult) == sizeof(uint32_t) * 22);
 } // namespace ghostlock::compat
 
 #endif

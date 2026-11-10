@@ -45,6 +45,9 @@
 #ifndef __NR_pipe2
 #define __NR_pipe2 359
 #endif
+#ifndef __NR_futex_time64
+#define __NR_futex_time64 422
+#endif
 
 namespace {
     void say(const char *message) noexcept {
@@ -223,7 +226,20 @@ namespace {
         }
         say_int("smoke: prctl", slot[7]);
 
-        for (int i = 0; i < 8; i++) {
+        /* The time64 futex entry is a distinct syscall number (422), and the
+         * arm-app seccomp policy allowlists it independently of 240. A profile
+         * placed at 0x1c0 runs the whole carrier through this entry. */
+        say("smoke: calling futex_time64");
+        {
+            uint32_t word = 0;
+            errno = 0;
+            const long ret =
+                syscall(__NR_futex_time64, &word, FUTEX_WAKE, 1, nullptr, nullptr, 0);
+            slot[8] = ret == 0 ? 0 : -errno;
+        }
+        say_int("smoke: futex_time64", slot[8]);
+
+        for (int i = 0; i < 9; i++) {
             if (slot[i] != 0) result->status = 1;
         }
         if (pipe_fds[0] >= 0) (void) close(pipe_fds[0]);

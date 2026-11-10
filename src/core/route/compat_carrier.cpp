@@ -173,9 +173,11 @@ namespace {
                 *helper_signal = WTERMSIG(status);
             }
         }
-        if (ok && result->magic != compat::kResultMagic) {
+        if (ok && (result->magic != compat::kResultMagic ||
+                   result->version != compat::kProtocolVersion)) {
             *error = EBADMSG;
-            pr_warning("compat helper: bad result magic=0x%08x\n", result->magic);
+            pr_warning("compat helper: bad result magic=0x%08x version=%u\n",
+                       result->magic, result->version);
             ok = false;
         }
         return ok;
@@ -221,12 +223,13 @@ namespace {
             return false;
         }
         pr_info("compat helper smoke: exit=%d signal=%d futex=%d timerfd=%d "
-                "newselect=%d sched_setattr=%d pipe2=%d fcntl_high=%d dup2_319=%d prctl=%d\n",
+                "newselect=%d sched_setattr=%d pipe2=%d fcntl_high=%d dup2_319=%d prctl=%d "
+                "futex_time64=%d\n",
                 helper_exit, helper_signal, result.smoke[0], result.smoke[1],
                 result.smoke[2], result.smoke[3], result.smoke[5], result.smoke[6],
-                result.smoke[4], result.smoke[7]);
+                result.smoke[4], result.smoke[7], result.smoke[8]);
         bool all_zero = result.status == 0;
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < 9; i++) {
             if (result.smoke[i] != 0) all_zero = false;
         }
         probe_ok = helper_exit == 0 && helper_signal == 0 && all_zero;
