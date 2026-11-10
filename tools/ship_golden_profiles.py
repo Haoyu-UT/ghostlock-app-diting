@@ -10,7 +10,10 @@ non-null physical pairs (a single HOCON map cannot carry both) are exempt.
 The bundle asset is the CLI's default anchored cut (``--format conf --route
 <best> --anchor --device <primary>``) rendered from the store Image with that
 device's sidecars; the physical maps are then written from the superset's
-``devices[]`` entries so every device in the set resolves. A kernel whose
+``devices[]`` entries so every device in the set resolves. The profile's
+``pipeline`` line is the superset's derived ``pipeline_order`` (highest
+precedence first), overridable per entry by ``pipeline = ...`` in ``meta.txt``.
+A kernel whose
 64-bit ``select_stack`` is infeasible (the superset's own verdict) is
 ``sigreturn``-only; for those the route block is replaced with the AArch32
 compat select carrier (docs/analysis/compat-select-carrier-plan.md; G1 QEMU on
@@ -165,12 +168,13 @@ def pipeline_reason(options, name):
     return ""
 
 
-def choose_pipeline(options, meta):
-    """The entry's explicit choice, or the only feasible pipeline.
+def choose_pipeline_order(options, meta):
+    """The entry's curation override, or the superset's derived order.
 
-    The extractor never ranks the two; when both are feasible the entry must
-    record `pipeline = ...` in meta.txt. This is the author's choice, not a
-    tool default.
+    The superset carries the extractor's `pipeline_order` (highest precedence
+    first, only statically feasible entries). `meta.txt` may override it with
+    one name or a comma-separated order; every entry of the result must be
+    feasible on this kernel.
     """
     feasible = feasible_pipelines(options)
     if not feasible:
@@ -179,30 +183,48 @@ def choose_pipeline(options, meta):
             for entry in options.get("pipelines", [])
         )
         raise NotShippable(f"no feasible pipeline ({reasons})")
-    choice = (meta.get("pipeline") or "").strip().strip('"').lower()
-    if choice:
-        if choice not in feasible:
+    raw = (meta.get("pipeline") or "").strip().strip('"').lower()
+    order = [name.strip() for name in raw.split(",") if name.strip()]
+    if not order:
+        order = [
+            str(name).strip().lower()
+            for name in options.get("pipeline_order", [])
+            if str(name).strip()
+        ]
+    if not order:
+        # A superset written before the ordered list carried only verdicts;
+        # use the extractor's default ranking.
+        order = (
+            ["dirtyfrag", "ghostlock"]
+            if "dirtyfrag" in feasible and "ghostlock" in feasible
+            else feasible[:1]
+        )
+    seen = set()
+    for name in order:
+        if name not in PIPELINES:
+            raise PipelineChoiceRequired(f"unknown pipeline {name}")
+        if name not in feasible:
             raise PipelineChoiceRequired(
-                f"pipeline {choice} is not feasible: {pipeline_reason(options, choice)}"
+                f"pipeline {name} is not feasible: {pipeline_reason(options, name)}"
             )
-        return choice
-    if len(feasible) == 1:
-        return feasible[0]
-    raise PipelineChoiceRequired(
-        f"pipeline choice required ({', '.join(feasible)})"
-    )
+        if name in seen:
+            raise PipelineChoiceRequired(f"duplicate pipeline {name}")
+        seen.add(name)
+    return order
 
 
-def asset_pipeline(path):
-    """The first entry of the asset's `pipeline` order, if present."""
+def asset_pipeline_order(path):
+    """The asset's `pipeline` order (list form, or a legacy scalar), or None."""
     try:
         text = open(path, encoding="utf-8").read()
     except OSError:
         return None
-    match = re.search(r'(?m)^\s*pipeline\s*=\s*\[\s*"([^"]+)"', text) or re.search(
-        r'(?m)^\s*pipeline\s*=\s*"([^"]+)"', text
-    ) or re.search(r'(?m)^\s*pipeline\s*=\s*([A-Za-z0-9_-]+)', text)
-    return match.group(1).strip().lower() if match else None
+    match = re.search(r'(?m)^\s*pipeline\s*=\s*\[([^\]]*)\]', text)
+    if match:
+        names = re.findall(r'"([^"]+)"', match.group(1))
+        return [name.strip().lower() for name in names] if names else None
+    match = re.search(r'(?m)^\s*pipeline\s*=\s*"?([A-Za-z0-9_-]+)"?', text)
+    return [match.group(1).strip().lower()] if match else None
 
 
 def asset_has_stride(path):
@@ -376,7 +398,7 @@ def render(extract, entry, out_path):
         "--route", entry["route"],
         "--anchor",
         "--device", entry["primary"],
-        "--pipeline", entry["choice_pipeline"],
+        "--pipeline-order", ",".join(entry["choice_pipeline_order"]),
         "--out", out_path,
     ]
     result = subprocess.run(command, capture_output=True, text=True)
@@ -460,21 +482,26 @@ def main():
             continue
         feasible = entry["feasible_pipelines"]
         if has_asset:
-            chosen = asset_pipeline(asset_path)
             if not feasible:
                 entry["reasons"] = ["asset present but no feasible pipeline"]
                 missing.append(entry)
                 continue
+            try:
+                expected = choose_pipeline_order(entry["options"], entry["meta"])
+            except PipelineChoiceRequired as error:
+                entry["reasons"] = [str(error)]
+                missing.append(entry)
+                continue
+            chosen = asset_pipeline_order(asset_path)
             if chosen is None:
                 entry["reasons"] = [
-                    f"asset has no pipeline line (feasible: {', '.join(feasible)})"
+                    f"asset has no pipeline line (expected {', '.join(expected)})"
                 ]
                 missing.append(entry)
                 continue
-            if chosen not in feasible:
+            if chosen != expected:
                 entry["reasons"] = [
-                    f"asset pipeline {chosen} is infeasible: "
-                    f"{pipeline_reason(entry['options'], chosen)}"
+                    f"asset pipeline {chosen} != derived order {expected}"
                 ]
                 missing.append(entry)
                 continue
@@ -492,7 +519,9 @@ def main():
             bundled += 1
             continue
         try:
-            entry["choice_pipeline"] = choose_pipeline(entry["options"], entry["meta"])
+            entry["choice_pipeline_order"] = choose_pipeline_order(
+                entry["options"], entry["meta"]
+            )
         except PipelineChoiceRequired as error:
             entry["reasons"] = [str(error)]
             missing.append(entry)
@@ -536,19 +565,14 @@ def main():
             if not first.startswith("# SHIPPED GOLDEN"):
                 failures.append((entry["release"], "asset is hand-finished; not overwritten"))
                 continue
-            if "choice_pipeline" not in entry:
-                # keep the shipped selection when refreshing an existing asset
-                existing = asset_pipeline(asset_path)
-                if existing in entry.get("feasible_pipelines", []):
-                    entry["choice_pipeline"] = existing
-                else:
-                    try:
-                        entry["choice_pipeline"] = choose_pipeline(
-                            entry["options"], entry["meta"]
-                        )
-                    except (PipelineChoiceRequired, NotShippable) as error:
-                        failures.append((entry["release"], str(error)))
-                        continue
+        if "choice_pipeline_order" not in entry:
+            try:
+                entry["choice_pipeline_order"] = choose_pipeline_order(
+                    entry["options"], entry["meta"]
+                )
+            except (PipelineChoiceRequired, NotShippable) as error:
+                failures.append((entry["release"], str(error)))
+                continue
         with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as handle:
             temp_path = handle.name
         try:

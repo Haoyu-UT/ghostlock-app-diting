@@ -19,8 +19,8 @@ before W1 with the ROM preflight/probe/DB callbacks, and the generation picker i
 resolver's diting device gates are complete: the GhostLock order, the debug DirtyFrag order, and
 the forced pre-W1 fallback (a one-shot debug fault injection at the resolver; the run took the
 full GhostLock chain with no DirtyFrag step and no `--w1-only`). The native resolved-scalar
-cross-check is implemented and device-gated (§3.4). The OnePlus/A16 lists and the bundle order
-flip remain.
+cross-check is implemented and device-gated (§3.4), and the bundle now carries the derived order
+(§3.5). The OnePlus bundled run remains.
 
 ## 1. Problem
 
@@ -180,12 +180,20 @@ Implementation of the probe, the ROM preflight, the resolver and their gates:
   content-aware `--check` validates every entry of the asset's order against `pipelines[]` and the
   order's derivation (or the recorded override), and `--refresh` rewrites an existing SHIPPED
   GOLDEN asset under the guarded rule.
+- **Implemented 2026-11-10.** The tool renders `--pipeline-order` from the superset's
+  `pipeline_order`; a `meta.txt` `pipeline` may still override it (one name or a comma-separated
+  order), and every entry of the result is validated feasible. `--check` compares the asset's
+  full order (list, or a legacy scalar as a one-element list) with the expected order;
+  `--refresh` rewrites a generated asset, and a hand-finished asset is flipped by editing its
+  `pipeline` line (25 were). The store's conservative `pipeline = ghostlock` overrides were
+  removed, so the derived order is now the default: 41 two-entry assets, 24 `["ghostlock"]`
+  (DirtyFrag infeasible on the image), and the A16's strict `["dirtyfrag"]`; `--check` reads
+  59/0/11.
 - **Sequencing.** Until the app's execution-time resolver ships, a bundle must not put `dirtyfrag`
-  first on a stage without device evidence. The interim curation keeps `["ghostlock"]` for the
-  unverified entries and uses `["dirtyfrag", "ghostlock"]` only where both pipelines are feasible
-  and the ROM is device-verified (diting 5.10.236, OnePlus 6.6.66); the A16 is the strict
-  `["dirtyfrag"]`. Once the resolver lands, the derived order becomes the default for every
-  statically feasible entry.
+  first on a stage without device evidence. The interim curation kept `["ghostlock"]` for the
+  unverified entries and used `["dirtyfrag", "ghostlock"]` only where both pipelines were feasible
+  and the ROM was device-verified. With the resolver implemented and device-gated, the derived
+  order is the default for every statically feasible entry (above).
 - The final audit (section 7) reconciles every asset's order against its own measured image; the
   device tier marks a first entry that has not been device-measured as experimental.
 
@@ -249,6 +257,10 @@ logs it (`pipeline=ghostlock (legacy default)`); it never silently picks `dirtyf
   `pipeline fallback: dirtyfrag: forced failure`, `pipeline=ghostlock`, then the full GhostLock
   chain; `native exited code=0`, `enforce=1`, run store `completed`, and no DirtyFrag stage line
   and no `--w1-only` in either log. OnePlus remains.
+- The bundle's derived order, diting: **done 2026-11-10, build 724** — the bundled 5.10.236 asset
+  carries `["dirtyfrag", "ghostlock"]` with no debug override; `probe=db pass`,
+  `pipeline=dirtyfrag (profile order)`, W1-only then the stage `RESULT=OK script=0 enforce=1`,
+  run store `completed`, Enforcing. The OnePlus 6.6.66 bundled run remains.
 - A16, strict list: the bundled profile alone selects `dirtyfrag` (no toggle); the run should
   reach W1 → DirtyFrag → init shell → ksud; a stage failure prompts the reboot path.
 - A16, a hand-edited `["dirtyfrag", "ghostlock"]`: refused before the native (KDP).
