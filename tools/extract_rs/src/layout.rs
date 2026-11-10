@@ -96,14 +96,20 @@ fn dec_or_null(value: Option<u32>) -> String {
         .unwrap_or_else(|| "null".to_string())
 }
 
+/// The waiter's stamp shape from BTF: the compact strip keeps `prio` on
+/// `rt_mutex_waiter`; the 6.6+ `rt_waiter_node` pair nests the tree/pi entries
+/// and drops it. `None` when the image carries no BTF (the caller then uses the
+/// labelled template).
+pub fn waiter_is_compact(btf: &Btf) -> Option<bool> {
+    btf.named_struct("rt_mutex_waiter")
+        .map(|_| btf.field("rt_mutex_waiter", "prio").is_some())
+}
+
 /// Derives the three layout groups. BTF is primary; the release template fills
 /// only what BTF cannot supply, and the fact keeps that label.
 pub fn derive(btf: Option<&Btf>, release: &str) -> LayoutFacts {
     let family_compact = family::is_compact_waiter_family(release);
-    let btf_compact = btf.and_then(|btf| {
-        btf.named_struct("rt_mutex_waiter")
-            .map(|_| btf.field("rt_mutex_waiter", "prio").is_some())
-    });
+    let btf_compact = btf.and_then(waiter_is_compact);
     if let Some(compact) = btf_compact {
         if compact != family_compact {
             eprintln!(

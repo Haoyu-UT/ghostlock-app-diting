@@ -572,9 +572,10 @@ pub(crate) fn multicast_waiter_off_at(
 #[cfg(test)]
 mod tests {
     use super::{
-        compat_carrier_coverage, fpsimd_copy_destination, multicast_geometry_corroborated,
-        multicast_geometry_btf_only, pselect_shift_from_delta, remove_waiter_uses_current,
-        select_cred_caps, select_cred_refs, sigreturn_offset,
+        compat_carrier_coverage, fpsimd_copy_destination, max_pselect_shift,
+        multicast_geometry_corroborated, multicast_geometry_btf_only,
+        pselect_shift_from_delta, remove_waiter_uses_current, select_cred_caps, select_cred_refs,
+        sigreturn_offset,
     };
     use std::collections::BTreeMap;
 
@@ -682,13 +683,19 @@ mod tests {
 
     #[test]
     fn pselect_delta_classifies_geometry_and_the_waiter_band() {
-        assert_eq!(pselect_shift_from_delta(0), Ok(0));
-        assert_eq!(pselect_shift_from_delta(8), Ok(1));
-        assert_eq!(pselect_shift_from_delta(24), Ok(3));
-        assert_eq!(pselect_shift_from_delta(32), Ok(4));
-        assert!(pselect_shift_from_delta(-8).is_err());
-        assert!(pselect_shift_from_delta(4).is_err());
-        assert!(pselect_shift_from_delta(40).is_err());
+        assert_eq!(pselect_shift_from_delta(0, true), Ok(0));
+        assert_eq!(pselect_shift_from_delta(8, true), Ok(1));
+        assert_eq!(pselect_shift_from_delta(24, true), Ok(3));
+        assert_eq!(pselect_shift_from_delta(32, true), Ok(4));
+        assert!(pselect_shift_from_delta(-8, true).is_err());
+        assert!(pselect_shift_from_delta(4, true).is_err());
+        assert!(pselect_shift_from_delta(40, true).is_err());
+        /* The 6.6+ rt_waiter_node strip stamps two more words, so its last
+         * usable shift is 2; shift 3 would be refused by the native. */
+        assert_eq!(pselect_shift_from_delta(16, false), Ok(2));
+        assert!(pselect_shift_from_delta(24, false).is_err());
+        assert_eq!(max_pselect_shift(true), 4);
+        assert_eq!(max_pselect_shift(false), 2);
     }
 
     #[test]
@@ -884,26 +891,53 @@ impl WaiterLayout {
 }
 
 /// The route's fd_set word table: `PSELECT_ROUTE_NFDS` fd slots over three
-/// sets, and the compact waiter strip's last word. The waiter shift is the
-/// layout delta in qwords; the last strip word must still land inside the
-/// copied table (`(320 + 63) / 64 * 3 = 15` words, strip words 0..10).
-pub const MAX_PSELECT_SHIFT: u64 = 4;
+/// sets, `(320 + 63) / 64 * 3 = 15` 64-bit words. The waiter shift is the
+/// layout delta in qwords; the strip's last word must still land inside the
+/// copied table.
+pub const PSELECT_TABLE_WORDS: u64 = (PSELECT_ROUTE_NFDS + 63) / 64 * 3;
+
+/// Stamped words in the two `rt_mutex_waiter` shapes: the compact strip
+/// (5.10/5.15/6.1, strip words 0..10) is 11 words, the 6.6+ `rt_waiter_node`
+/// pair (0..12) is 13.
+pub const PSELECT_COMPACT_STRIP_WORDS: u64 = 11;
+pub const PSELECT_NON_COMPACT_STRIP_WORDS: u64 = 13;
+
+/// The largest derived shift that keeps the strip inside the table. The shape
+/// is a per-image fact (`layout::waiter_is_compact`), not a release gate: a
+/// non-compact image with shift 3-4 would otherwise be declared feasible here
+/// and then refused by the native's `select_stack_build_fdsets` (step 34).
+pub fn max_pselect_shift(compact: bool) -> u64 {
+    let strip = if compact {
+        PSELECT_COMPACT_STRIP_WORDS
+    } else {
+        PSELECT_NON_COMPACT_STRIP_WORDS
+    };
+    PSELECT_TABLE_WORDS - strip
+}
 
 /// Classify the pselect/futex overlap in bytes. A negative or misaligned delta
-/// is a geometric impossibility, as is a shift beyond the word table; every
-/// other derivation failure stays a generic error (Unknown, not Infeasible).
-pub fn pselect_shift_from_delta(delta: i64) -> std::result::Result<u64, String> {
+/// is a geometric impossibility, as is a shift beyond the table for the image's
+/// waiter shape; every other derivation failure stays a generic error (Unknown,
+/// not Infeasible).
+pub fn pselect_shift_from_delta(delta: i64, compact: bool) -> std::result::Result<u64, String> {
     if delta < 0 || delta % 8 != 0 {
         return Err(format!(
             "pselect/futex overlap is not a non-negative qword: delta={delta}"
         ));
     }
     let shift = (delta / 8) as u64;
-    if shift > MAX_PSELECT_SHIFT {
+    let limit = max_pselect_shift(compact);
+    if shift > limit {
+        let strip = if compact {
+            PSELECT_COMPACT_STRIP_WORDS
+        } else {
+            PSELECT_NON_COMPACT_STRIP_WORDS
+        };
+        let shape = if compact { "compact" } else { "non-compact" };
         return Err(format!(
             "futex waiter starts {shift} qwords above the fd_set buffer; the route's \
-             word table holds 15 words and the waiter strip 11 (max feasible shift is \
-             {MAX_PSELECT_SHIFT})"
+             word table holds {PSELECT_TABLE_WORDS} words and the {shape} waiter strip \
+             {strip} (max feasible shift is {limit})"
         ));
     }
     Ok(shift)
@@ -1163,7 +1197,13 @@ pub fn derive_pselect_layout(
         .sum();
     let futex_waiter = -(futex_sum as i64) + *waiter_local as i64;
     let delta = futex_waiter - pselect_word0;
-    let shift = pselect_shift_from_delta(delta).map_err(|reason| {
+    // The strip length depends on the waiter shape: the 6.6+ rt_waiter_node
+    // pair stamps two words beyond the compact strip. A BTF-less image is the
+    // 5.10 codegen template, which is compact.
+    let compact_waiter = btf
+        .and_then(crate::layout::waiter_is_compact)
+        .unwrap_or(true);
+    let shift = pselect_shift_from_delta(delta, compact_waiter).map_err(|reason| {
         ExtractError::infeasible_with(
             reason,
             pselect_numbers(
@@ -1175,10 +1215,12 @@ pub fn derive_pselect_layout(
             ),
         )
     })?;
-    if shift == MAX_PSELECT_SHIFT {
+    if shift == max_pselect_shift(compact_waiter) {
         eprintln!(
             "warning: waiter fits at the last usable word (shift={shift}); \
-             the strip's last word lands at global word 14 of 15"
+             the strip's last word lands at global word {} of {}",
+            PSELECT_TABLE_WORDS - 1,
+            PSELECT_TABLE_WORDS
         );
     }
     let chain = pselect_chain
