@@ -39,6 +39,11 @@
 # mm_struct stride was restored on the four regenerated 5.10 assets; only
 # 5.10.168-00001 is in this fixture, and its bytes moved (960, the value its
 # QEMU dump measures). The other documents' bytes are unchanged.
+# Re-frozen 2026-11-10 (anchor alignment): the two bundled anchors whose bases
+# were 4-aligned now use the 8-aligned base with the usable prefix re-rounded
+# to a stride multiple -- 5.15.194 47903572/4096 -> 47903576/4064 and
+# 6.1.138-mi 36850380/4096 -> 36850384/4064 (the native refuses a misaligned
+# anchor). Only those two documents changed; every other row is unchanged.
 5.10.66-android12-9-00001-g41ff3fa8fff9-ab8171928 acc3c4c1679353e266d38defba40a30ec4738ffce91b5daea60884693a62c90a
 5.10.81-android12-9-00001-g6cd504626bae-ab8485363 997322dae97b7f0cd17220c2b80096643cf91b1c2cb26a2cc89b06eafd6aef1d
 5.10.101-android12-9-00005-ga829d48e78bd-ab9206161 040ba8c7b4b7bbca92dec172917dff698d81efc03257021e12eadaf14a9c61ea
@@ -56,7 +61,7 @@
 6.1.138-android14-11-g2ecae636cf9b-ab14676408 821ead4eeab1255202257d35b38ec0aee756d855d35fb2372f3fc8c0b4b09d88
 6.1.138-android14-11-g44bda9e8f6e9-ab13792638 2b8346246a8651104bfb99b5bd23a71e816e6bdc12dc51af51cb54b4eb6612f8
 6.1.138-android14-11-g6ab8c9a86a33-ab14396278 dd9bc03a9e3845aa37c0d64acd1e9ad691bce1f2c905bd3ba7f9754f517c4539
-6.1.138-android14-11-g965475777129-mi e0133545ff9737084193c298d34c1319557b32eff6e43d56fec370b067787074
+6.1.138-android14-11-g965475777129-mi 39325f9619186f4011a9a4e0f155bd86965594b058a1b07b72ae6b0a17fb1a66
 6.1.145-android14-11-g09f1c0074ad7-ab14226177 35707cd567a463c707456295486631fa436c143402261f098909c564db637687
 6.1.145-android14-11-g74d1702dab4d-ab14669069 d9545e818706bcb40dcf1e84855987cae52089732625179436500f370c5496d4
 6.1.145-android14-11-geaa643a2c0ee-ab14763719 d4c083c0e49ec1e6a6a823711418b955c593aed2be8efc69cccacf6c55d1f220

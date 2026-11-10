@@ -156,7 +156,8 @@ NATIVE_HOST_TESTS := \
   target_constants_test native_resource_test \
   profile_binary_test futex_hash_test scan_grid_test stride_verify_test \
   number_parse_test runtime_paths_test runtime_config_test handoff_probe_test victim_context_test \
-  run_state_test address_space_test cpp_link_probe_test compat_bitmap_test
+  run_state_test address_space_test cpp_link_probe_test compat_bitmap_test dirtyfrag_verdict_test \
+  anchor_align_test
 
 native-host-tests: $(addprefix $(HOST_BUILD_DIR)/,$(NATIVE_HOST_TESTS))
 	@status=0; for test in $^; do $$test || status=1; done; exit $$status
@@ -341,6 +342,14 @@ $(HOST_BUILD_DIR)/handoff_probe_test: core/tests/handoff_probe_test.cpp core/ses
 $(HOST_BUILD_DIR)/victim_context_test: core/tests/victim_context_test.cpp core/session/victim_context.cpp core/session/victim_context.hpp core/support/native_resource.cpp core/support/native_resource.hpp
 	@mkdir -p $(HOST_BUILD_DIR)
 	$(HOST_CXX) $(HOST_CXXFLAGS) -pthread -Icore core/tests/victim_context_test.cpp core/session/victim_context.cpp core/support/native_resource.cpp -o $@
+
+$(HOST_BUILD_DIR)/dirtyfrag_verdict_test: core/tests/dirtyfrag_verdict_test.cpp core/session/dirtyfrag_verdict.hpp
+	@mkdir -p $(HOST_BUILD_DIR)
+	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore $< -o $@
+
+$(HOST_BUILD_DIR)/anchor_align_test: core/tests/anchor_align_test.cpp core/route/lock_anchor.h
+	@mkdir -p $(HOST_BUILD_DIR)
+	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore $< -o $@
 
 product: ghostlock
 	@echo "=== ghostlock binary ready: $(GHOSTLOCK_BIN) ==="
