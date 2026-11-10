@@ -32,6 +32,7 @@ will land. Those remain the ROM preflight + the run itself.
 | `DirtyfragProbe` | `app/.../data/DirtyfragProbe.kt` + `app/.../jni/dfprobe.c` (new `libdfprobe.so`) | the ESP send/read-back test; own file only |
 | `DirtyfragPreflight` | `app/.../data/DirtyfragPreflight.kt`, reusing `DirtyfragPlan.kt` | the ROM-side structural check (hook import graph, cave fit, blob fit) |
 | `PipelineResolver` | `app/.../data/PipelineResolver.kt` | read/validate the ordered list, walk it pre-W1, classify, cache, log |
+| measured DB | `MeasuredProfileStore` (`dirtyfrag.probe`, `dirtyfrag.probe_rom`, `dirtyfrag.probe_protocol`) | record a clear probe result; the resolver reads it for the viability step only (§5.1) |
 | run store / UI | `GhostlockViewModel`, `RunStatusService`, strings | record the chosen entry and every rejection |
 | native wire | `src/core/profile/` | parse the resolved `pipeline` scalar and cross-check the invocation |
 | extractor | `tools/extract_rs` | `pipeline_order` (§7) |
@@ -123,6 +124,34 @@ return Refused(all reasons)
 - Stage failure after W1: the stub restores enforcing first when it fires; otherwise the app
   bounds the stage and prompts a reboot. The resolver is not re-entered.
 
+### 5.1 Measured-DB record
+
+A **clear** result is written to the on-device measured DB (`MeasuredProfileStore`), so the
+device keeps the fact and a later run can use it instead of re-probing:
+
+- **Clear** = `Pass` with the positive ESP control and the file control verified, or
+  `PrimitiveFailed` with the positive control verified (the SA decrypts; both file blocks stay
+  unchanged). `SetupFailed`, `Crashed` and `NotRun` are not written.
+- **Keys** (schema v1 already stores multiple facts per kernel; no schema bump):
+  - `dirtyfrag.probe` = `1` (pass) / `0` (primitive fail), source `dirtyfrag-probe`;
+  - `dirtyfrag.probe_rom` = a 63-bit hash of `Build.FINGERPRINT` (the ROM the setup ran on);
+  - `dirtyfrag.probe_protocol` = `1` (the probe protocol version).
+  The evidence line of `dirtyfrag.probe` carries the human basis: `control=pass block=<old>-><new>
+  want=<desired> rom=<fingerprint> protocol=1`; the UI shows source, evidence and `measured_at`.
+- **Matching.** A `0` with a matching protocol is a kernel-scoped verdict: skip DirtyFrag on the
+  same kernel without re-probing (the control proved the setup; the primitive is kernel-side). A
+  `1` is reused only when the protocol and the ROM hash match; a different ROM re-probes (the
+  setup may differ), though the kernel primitive is unchanged. Missing or stale keys → fresh
+  probe. A new clear result overwrites the three keys.
+- **Doctrine.** The measured DB stays a fact store, never a profile precedence layer. The probe
+  fact is the one **run-path read** of the store, scoped to the resolver's viability step: it
+  never changes a profile field, a route, or the pipeline list; it only feeds the entry that is
+  already listed. An unreadable/newer-schema DB is not overwritten and not trusted — the resolver
+  probes fresh. The `MeasuredProfileStore` class comment and `measured-db-plan.md` are amended
+  with this scoped exception.
+- **Write timing.** App-side, immediately after a clear result and before W1; a write failure is
+  logged and does not block the run; a crash before the read-back writes nothing.
+
 ## 6. Native / wire
 
 The profile now carries the list; the app resolves it to one scalar and writes it into the native
@@ -174,8 +203,53 @@ round-trip and mismatch tests. The list itself stays app-side.
    strict list runs DirtyFrag; the OnePlus best-effort list resolves to DirtyFrag.
 8. Bundle audit and the release cut (the parent design's items).
 
+### 9.1 Test matrix
+
+**Host (no device):**
+
+- **Crypto/IV:** AES-256-ECB decrypt of a known block (NIST vector) XOR desired; assert
+  `AES-CBC-decrypt(key, that IV, old_block) == desired`. Pure JVM test; the JNI is not involved.
+- **Classification:** (control pass, block changed) → `Pass`; (control pass, both blocks
+  unchanged) → `PrimitiveFailed`; (control fail / setup exception) → `SetupFailed`; uncleared
+  watchdog + new boot id → `Crashed`. None of the last three is written to the DB.
+- **Measured DB:** record/load the three probe keys alongside the existing slabinfo fact (schema
+  v1, multiple facts per kernel); evidence and `measured_at` round-trip; a DB without the probe
+  keys loads; matching by kernel + protocol + ROM hash; a mismatched protocol/ROM is not reused;
+  overwrite semantics; an unreadable/newer DB → no trust and no write; the slabinfo fact is
+  untouched.
+- **Resolver:** a fake DB/probe/preflight matrix — DB pass + matching ROM → no probe call; DB
+  pass + different ROM → probe; DB fail → DirtyFrag skipped; `SetupFailed` → next entry /
+  refusal; strict `["dirtyfrag"]`; KDP list refusal; no post-W1 fallback; run-store log.
+- **App/UI:** profile list parse and validation; the picker is absent; the resolution and the
+  measured fact appear with source/evidence; profile-core/app suites.
+
+**Device (diting 5.10.236 unless stated):**
+
+- **Pass path:** the probe returns `Pass`; the DB gets `dirtyfrag.probe=1`, `probe_rom`,
+  `probe_protocol=1`; the Measurements screen shows the fact; a second run in the same boot/ROM
+  resolves DirtyFrag from the DB (`probe=db`, no fresh probe) and the run completes.
+- **Setup failure:** a debug hook forces `SetupFailed`; no DB write; the resolver falls to
+  GhostLock **without W1** and `getenforce` stays `Enforcing`.
+- **Primitive failure:** the 6.1 duchamp (copy send path) if the probe APK can be installed (the
+  operator enables Install-via-USB); expect the control to pass and both file blocks unchanged →
+  `PrimitiveFailed`, DB `0`, DirtyFrag skipped. If the device is unavailable, a debug-injected
+  `PrimitiveFailed` covers the resolver matrix and the real copy-path probe stays a pending
+  device gate.
+- **Crash containment:** kill the app between the watchdog write and the read-back; on restart the
+  marker + changed boot id → `Crashed`, no DB write, DirtyFrag refused; the device stays
+  enforcing (the probe is pre-W1).
+- **ROM preflight:** a synthetic cave-too-small plan → `RomRejected`; the resolver falls to
+  GhostLock.
+- **A16 strict list:** profile validation refuses `["dirtyfrag", "ghostlock"]` on KDP; the A16
+  device run remains the reporter's/operator's gate.
+- **OnePlus 6.6.66:** the probe passes and the best-effort list resolves DirtyFrag.
+- **Gates:** every device run is recorded in the run store; the DB file and the Measurements
+  screen are captured; the normal host suites pass.
+
+### 9.2 Gates
+
 Host gates: extractor unit/corpus, profile-core, app, native. Device gates as above; every
-DirtyFrag run still requires the probe Pass and the preflight.
+DirtyFrag run still requires the probe `Pass` (fresh or a matching DB record) and the preflight.
 
 ## 10. Non-goals
 
