@@ -141,6 +141,9 @@ its strings are retired. The debug-only `second_way` intent becomes a debug orde
 logged, silently ignored in release builds, and still subject to the list validation (it cannot
 force GhostLock on KDP).
 
+Implementation of the probe, the ROM preflight, the resolver and their gates:
+[`dirtyfrag-viability-probe-plan.md`](dirtyfrag-viability-probe-plan.md).
+
 ### 3.4 Native / wire
 
 - The app resolves the list to one pipeline and passes the **resolved scalar** to the native.
