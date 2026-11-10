@@ -242,8 +242,9 @@ pub fn conf_route_geometry(
     route: &str,
     release: &str,
     pselect_shift: Option<i64>,
+    waiter_compact: bool,
 ) -> Vec<(&'static str, i64)> {
-    conf_route_geometry_with_sigreturn(route, release, pselect_shift, None)
+    conf_route_geometry_with_sigreturn(route, release, pselect_shift, None, waiter_compact)
 }
 
 /// The AArch32 compat select carrier's route block, from the image-derived
@@ -288,68 +289,46 @@ pub fn conf_multicast_route_geometry(
 }
 
 /// The route's branch geometry, with the sigreturn offsets the extractor
-/// derived for this image. `None` falls back to the patch-range constants
-/// (a labelled heuristic in the caller's log).
+/// derived for this image and the image's waiter shape. `None` falls back to
+/// the patch-range constants (a labelled heuristic in the caller's log).
 pub fn conf_route_geometry_with_sigreturn(
     route: &str,
     release: &str,
     pselect_shift: Option<i64>,
     sigreturn_offsets: Option<(i64, i64)>,
+    waiter_compact: bool,
 ) -> Vec<(&'static str, i64)> {
-    // The 5.10 codegen constants apply to any 5.10 build; the route decision
-    // itself is made from the image's own geometry (or the family constant only
-    // as the labelled zero-feasible fallback, supplied by the caller).
-    if crate::family::is_5_10(release) {
-        match route {
-            "select_stack" => {
-                if let Some(shift) = pselect_shift {
-                    return vec![
-                        ("waiter_shift", shift),
-                        ("compact_waiter", crate::family::SELECT_COMPACT_WAITER),
-                    ];
-                }
-            }
-            "sigreturn" => {
-                if let Some((sve, plain)) = sigreturn_offsets
-                    .or_else(|| crate::family::sigreturn_offsets(release))
-                {
-                    return vec![
-                        ("waiter_off_sve", sve),
-                        ("waiter_off_plain", plain),
-                    ];
-                }
-            }
-            _ => {}
+    // The 5.10 sigreturn patch-range constants apply to any 5.10 build; the
+    // route decision itself is made from the image's own geometry.
+    if crate::family::is_5_10(release) && route == "sigreturn" {
+        if let Some((sve, plain)) =
+            sigreturn_offsets.or_else(|| crate::family::sigreturn_offsets(release))
+        {
+            return vec![("waiter_off_sve", sve), ("waiter_off_plain", plain)];
         }
     }
     match route {
         "select_stack" => pselect_shift
             .map(|shift| {
                 let mut geometry = vec![("waiter_shift", shift)];
-                /* The waiter shape is a family property, not optional tuning:
-                 * the compact strip fits the 15-word fd_set table at a positive
-                 * shift, the rb_node shape does not (its last word lands two
-                 * slots further out). A select-only profile generated for a
-                 * compact family without this flag takes the rb_node branch and
-                 * refuses at word 14 -> global 15 (6.1.138, 2026-10-28). The
-                 * 6.6/6.12 families keep the non-compact shape. */
-                if crate::family::is_compact_waiter_family(release) {
+                /* The waiter shape is a per-image fact (`layout::
+                 * waiter_compact`, read from the image's BTF or the labelled
+                 * BTF-less template), not a release property: the compact strip
+                 * fits the 15-word fd_set table at a positive shift, the
+                 * rb_node shape does not (its last word lands two slots further
+                 * out). The caller passes the fact; no release predicate is
+                 * consulted here. */
+                if waiter_compact {
                     geometry.push(("compact_waiter", crate::family::SELECT_COMPACT_WAITER));
                 }
                 geometry
             })
             .unwrap_or_default(),
-        // android14-6.1 is the compact-waiter family; no other family has a
-        // measured tcp layout.
-        "tcp_zerocopy"
-            if kernel_layout_verified(Some(release))
-                && crate::symbols::kernel_struct_macro(Some(release))
-                    == Some("STRUCT_OFFSETS_6_1") =>
-        {
-            vec![("compact_waiter", 1)]
-        }
-        // `multicast_waiter` has no release-keyed branch: its block comes from
-        // the route verdict's own numbers (`conf_multicast_route_geometry`).
+        // `tcp_zerocopy` carries only execution tuning in the wire schema; its
+        // section has no `compact_waiter` field and the runtime takes the
+        // global `waiter_layout.compact` fact. `multicast_waiter` has no
+        // release-keyed branch either: its block is built from the route
+        // verdict's own numbers (`conf_multicast_route_geometry`).
         _ => Vec::new(),
     }
 }
@@ -1238,18 +1217,18 @@ mod tests {
         // the family constant: a delta=8 image emits -1, and no shift means the
         // caller (the verdict engine) must supply the labelled fallback.
         assert_eq!(
-            conf_route_geometry("select_stack", "5.10.246-gki", Some(-1)),
+            conf_route_geometry("select_stack", "5.10.246-gki", Some(-1), true),
             vec![("waiter_shift", -1), ("compact_waiter", 1)]
         );
-        assert!(conf_route_geometry("select_stack", "5.10.246-gki", None).is_empty());
+        assert!(conf_route_geometry("select_stack", "5.10.246-gki", None, true).is_empty());
         // sigreturn has no BTF derivation dependency; the patch-range fallback
         // differs by the strip home (0x1c0 vs 0x210).
         assert_eq!(
-            conf_route_geometry("sigreturn", "5.10.246-gki", None),
+            conf_route_geometry("sigreturn", "5.10.246-gki", None, true),
             vec![("waiter_off_sve", 256), ("waiter_off_plain", 240)]
         );
         assert_eq!(
-            conf_route_geometry("sigreturn", "5.10.81-android12-9", None),
+            conf_route_geometry("sigreturn", "5.10.81-android12-9", None, true),
             vec![("waiter_off_sve", 336), ("waiter_off_plain", 320)]
         );
         assert_eq!(
@@ -1257,35 +1236,39 @@ mod tests {
                 "sigreturn",
                 "5.10.236-android12-9",
                 None,
-                Some((256, 240))
+                Some((256, 240)),
+                true
             ),
             vec![("waiter_off_sve", 256), ("waiter_off_plain", 240)]
         );
         assert_eq!(
-            conf_route_geometry("select_stack", "6.6.89-android15-8", Some(-2)),
+            conf_route_geometry("select_stack", "6.6.89-android15-8", Some(-2), false),
             vec![("waiter_shift", -2)]
         );
-        assert!(conf_route_geometry("select_stack", "6.6.89-android15-8", None).is_empty());
-        // 6.1 and 5.15 are the flat compact-waiter families: a select-only
-        // profile must carry the flag, or the route takes the rb_node branch
-        // and refuses at word 14 -> global 15 (measured on 6.1.138).
+        assert!(conf_route_geometry("select_stack", "6.6.89-android15-8", None, false).is_empty());
+        // 6.1 and 5.15 are compact; the flag must accompany the shift or the
+        // route takes the rb_node branch and refuses at word 14 -> global 15.
         assert_eq!(
             conf_route_geometry(
                 "select_stack",
                 "6.1.138-android14-11-g44bda9e8f6e9-ab13792638",
-                Some(1)
+                Some(1),
+                true
             ),
             vec![("waiter_shift", 1), ("compact_waiter", 1)]
         );
         assert_eq!(
-            conf_route_geometry("select_stack", "5.15.194-android13-8", Some(2)),
+            conf_route_geometry("select_stack", "5.15.194-android13-8", Some(2), true),
             vec![("waiter_shift", 2), ("compact_waiter", 1)]
         );
-        assert_eq!(
-            conf_route_geometry("tcp_zerocopy", "6.1.118-android14-11", Some(1)),
-            vec![("compact_waiter", 1)]
+        // tcp_zerocopy has no geometry keys in the wire schema; the old
+        // release-keyed emission was never read by the decoder.
+        assert!(
+            conf_route_geometry("tcp_zerocopy", "6.1.118-android14-11", Some(1), true).is_empty()
         );
-        assert!(conf_route_geometry("tcp_zerocopy", "6.6.89-android15-8", Some(-2)).is_empty());
+        assert!(
+            conf_route_geometry("tcp_zerocopy", "6.6.89-android15-8", Some(-2), false).is_empty()
+        );
         // `multicast_waiter` is not release-keyed: its block comes from the
         // route verdict's own numbers, so the release string alone yields
         // nothing -- including on a major-5 release.
@@ -1293,22 +1276,46 @@ mod tests {
             conf_route_geometry(
                 "multicast_waiter",
                 "5.15.189-android13-8-00016-g51bba4309aac-ab14546557",
-                Some(-2)
+                Some(-2),
+                true
             )
             .is_empty()
         );
-        assert!(conf_route_geometry("multicast_waiter", "6.6.89-android15-8", Some(-2)).is_empty());
+        assert!(
+            conf_route_geometry("multicast_waiter", "6.6.89-android15-8", Some(-2), false)
+                .is_empty()
+        );
     }
 
     #[test]
     fn unverified_route_geometry_is_a_partial_candidate() {
         // No image-derived shift: the route branch stays empty rather than
         // borrowing the -2 family default.
-        assert!(conf_route_geometry("select_stack", "6.7.1-generic", None).is_empty());
+        assert!(conf_route_geometry("select_stack", "6.7.1-generic", None, false).is_empty());
         // An image-derived shift is kept.
         assert_eq!(
-            conf_route_geometry("select_stack", "6.7.1-generic", Some(-1)),
+            conf_route_geometry("select_stack", "6.7.1-generic", Some(-1), false),
             vec![("waiter_shift", -1)]
+        );
+    }
+
+    #[test]
+    fn select_waiter_shape_follows_the_image_fact() {
+        // The flag follows `layout::waiter_compact` (BTF), not the release: a
+        // 6.1 image whose BTF says non-compact omits it, and a 6.6 image whose
+        // BTF says compact carries it.
+        assert_eq!(
+            conf_route_geometry("select_stack", "6.1.138-android14-11", Some(1), false),
+            vec![("waiter_shift", 1)]
+        );
+        assert_eq!(
+            conf_route_geometry("select_stack", "6.6.89-android15-8", Some(-2), true),
+            vec![("waiter_shift", -2), ("compact_waiter", 1)]
+        );
+        // The BTF-less 5.10 template stays compact.
+        assert_eq!(
+            conf_route_geometry("select_stack", "5.10.236-android12-9", Some(-2), true),
+            vec![("waiter_shift", -2), ("compact_waiter", 1)]
         );
     }
 

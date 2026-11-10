@@ -1197,6 +1197,9 @@ fn run(cli: &Cli) -> Result<i32> {
                 })
             })
             .map(|verdict| &verdict.numbers);
+        /* The waiter shape is a per-image fact; the render and the superset
+         * both take it from the same layout derivation. */
+        let layouts = layout::derive(btf.as_ref(), release_text);
         let mut geometry = if let Some(compat) = chosen_compat.clone() {
             compat
         } else if let Some(numbers) = multicast_numbers {
@@ -1207,6 +1210,7 @@ fn run(cli: &Cli) -> Result<i32> {
                 release_text,
                 route_shift,
                 sigreturn_offsets,
+                layouts.waiter_compact.value,
             )
         } else {
             Vec::new()
@@ -1483,7 +1487,6 @@ fn run(cli: &Cli) -> Result<i32> {
             empty_zero_page: kallsyms::unique(&symbols, "empty_zero_page")
                 .and_then(|value| value.checked_sub(base)),
         };
-        let layouts = layout::derive(btf.as_ref(), release_text);
         /* Page-free Stage 1: the selinux field offsets and, when the route's
          * anchor triple was derived, the W1 scratch slot inside that region.
          * The scratch arithmetic needs the physical pair the native will use
@@ -1644,6 +1647,7 @@ fn run(cli: &Cli) -> Result<i32> {
                         release_text,
                         shift,
                         sigreturn_offsets,
+                        layouts.waiter_compact.value,
                     )
                     .into_iter()
                     .map(|(key, value)| (key.to_string(), value))
