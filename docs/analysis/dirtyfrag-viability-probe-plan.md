@@ -60,12 +60,13 @@ authentication. The native receives `encapPort`, `senderPort`, `spi`, `aesKey`.
 1. Setup; any exception/`IpSecManager`/socket failure → `SetupFailed(reason)`. A setup failure is
    **not** "DirtyFrag broken".
 2. File control: write the sentinel normally, read it back → proves the file/read path.
-3. **Positive ESP control (spike, §8).** A file-free packet through the same SA whose decrypted
-   payload the app observes. The candidate mechanisms: receive the decapsulated inner datagram on
-   the encapsulation socket, or a second crafted packet with a sentinel carried in a pipe page and
-   a userspace-visible result. If no reliable control can be built, the fallback is two distinct
-   file blocks with different desired values; both must land. The control is required before the
-   probe can distinguish "fixed/copy" from "transform not applied".
+3. **Positive ESP control (validated, §8).** A valid inner UDP segment (UDP header + a fixed
+   16-byte sentinel, ESP padding/trailer with next-header UDP) AES-CBC encrypted under the same SA
+   and sent to the encapsulation port; the decapsulated segment is received on a loopback
+   `DatagramSocket`. A received sentinel proves the SA/policy/decrypt path, so the file test's
+   failure is attributable to the send path or the ESP guard. Validated on the diting (spike
+   evidence: `external/port/dirtyfrag-probe-spike-2026-11-10/`). The control runs first; an
+   exception/timeout/mismatch is `SetupFailed`, never `PrimitiveFailed`.
 4. File test: ESP-write the desired block, poll the read-back for up to 1 s (20 × 50 ms); PASS
    iff the block is exactly the desired bytes.
 5. Result: `Pass`, `PrimitiveFailed` (control passed, block unchanged), `SetupFailed(reason)`,
@@ -172,9 +173,10 @@ round-trip and mismatch tests. The list itself stays app-side.
 
 ## 8. Spikes and open questions
 
-1. **The positive control.** The largest uncertainty: how to observe the SA's decryption without
-   the file write (encap socket receive vs a pipe-sentinel packet). The probe is not shippable
-   until the control works on the diting; without it, a FAIL cannot be attributed.
+1. **The positive control — validated 2026-11-10.** The inner-UDP-sentinel control PASSed on the
+   diting (5.10.236, Enforcing) together with the file test; the mechanism is fixed in §3 step 3
+   and the evidence is `external/port/dirtyfrag-probe-spike-2026-11-10/`. Remaining: productize
+   the fixed 16-byte sentinel and the control timeout.
 2. **JNI packaging.** A new `libdfprobe.so` (CMake/Make target, ABI, load path) versus adding the
    function to an existing native library. Keep the probe independent of the attack engine.
 3. **Probe crash containment.** App-process watchdog + boot id; a kernel oops/reboot is a
@@ -187,7 +189,9 @@ round-trip and mismatch tests. The list itself stays app-side.
 
 ## 9. Implementation order and gates
 
-1. Spike the positive control on the diting (standalone probe APK, no product change).
+1. ~~Spike the positive control on the diting~~ — **done 2026-11-10**: the inner UDP sentinel was
+   received through the same SA and the file test PASSed. Evidence:
+   `external/port/dirtyfrag-probe-spike-2026-11-10/`.
 2. `libdfprobe.so` + `DirtyfragProbe` (own file only); unit-test the IV vector and the result
    classification on the host; device: diting Pass.
 3. `DirtyfragPreflight` from `DirtyfragPlan`; unit tests with synthetic ELF/plan cases; device:
