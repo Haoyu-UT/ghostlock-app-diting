@@ -86,6 +86,11 @@ class MainActivity : ComponentActivity() {
             }
             viewModel.runDirtyfragProbeCheck()
         }
+        /* Debug-only: `am start --ez preflight_check true` runs the ROM
+         * preflight (the stage's cave/hook analysis) without an attack. */
+        if (BuildConfig.DEBUG && intent?.hasExtra("preflight_check") == true) {
+            viewModel.runDirtyfragPreflightCheck()
+        }
         setContent {
             GhostlockRoute(viewModel, ::handleEffect)
         }

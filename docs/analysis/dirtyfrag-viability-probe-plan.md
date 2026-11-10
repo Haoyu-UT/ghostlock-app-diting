@@ -7,12 +7,15 @@ ordered pipeline list, resolved before W1) and
 §2.4. This plan covers the probe, the ROM preflight and the resolver; the extractor's
 `pipeline_order` (§7) is a prerequisite, not a separate design.
 
-**Status 2026-11-10 — steps 1–2 done on the diting.** The positive-control spike passed
+**Status 2026-11-10 — steps 1–3 done on the diting.** The positive-control spike passed
 (`external/port/dirtyfrag-probe-spike-2026-11-10/`); the product probe (`libdfprobe.so` +
 `DirtyfragProbe` + `ProbeCrypto`) is implemented and device-gated: build 717 passes with the
-measured-DB record, and a seeded crash marker yields `Crashed`, no DB write, marker cleared
-(`external/port/dirtyfrag-probe-product-2026-11-10/`). Next: the ROM preflight, then the resolver
-with the ordered-list/profile schema (the extractor `pipeline_order` prerequisite).
+measured-DB record, and a seeded crash marker yields `Crashed`, no DB write, marker cleared. The
+ROM preflight (`DirtyfragPlan.preflight`) is implemented and accepts the diting's libc++
+(`page_remain=2520`, matching the stage-1 margin) with unit tests for the cave page-remainder,
+boundary, file-end and branch-range rules
+(`external/port/dirtyfrag-probe-product-2026-11-10/`). Next: the resolver with the
+ordered-list/profile schema (the extractor `pipeline_order` prerequisite).
 
 **Goal.** Before W1, decide whether DirtyFrag is viable on **this running ROM**, and feed the
 ordered-list resolver. A pass is a licence to try DirtyFrag; a fail or an unverifiable result
@@ -91,16 +94,22 @@ authentication. The native receives `encapPort`, `senderPort`, `spi`, `aesKey`.
 
 ## 4. ROM preflight
 
-Reuse `DirtyfragPlan.build` on the running ROM (it already reads the libs, finds the sentry
-constructor and computes the cave/branch layout):
+Implemented as `DirtyfragPlan.preflight()` on the running ROM, sharing `build()`'s ELF/hook
+analysis (the device gate: the diting's libc++ is `Feasible`, `page_remain=2520`):
 
-- the hook target exists and is imported by init/libbase (the call path is present);
-- the cave/blob fit (the plan's blob length, the tail-page fit, the zero-run fallback);
-- the target file is readable and the block alignment is valid;
-- record DEFEX/verity presence and any policy/service facts the plan can see; do not claim more
+- the sentry constructor exists in libc++'s dynamic symbols (the init/libbase import graph is the
+  stage-1 static check, not re-parsed here);
+- the cave fits: the remainder of the cave's **4 KiB page** — the exec segment's last page is the
+  mapping the stub runs from — must hold the 420-byte blob. The RW segment's `.data.rel.ro` alias
+  shares that page by design (COWed in live processes), so a shared page is not an overlap error;
+  a cave at a page boundary has no executable page and is refused; the hook and blob must be
+  inside the file; both branches must fit the ARM64 B range;
+- DEFEX/verity/policy are recorded from what the app can see; the preflight does not claim more
   than the static read supports (the A16 second way is the only Samsung evidence).
 
-`RomFeasible` or `RomRejected(reasons)`. Cached per boot id; the ROM does not change mid-boot.
+`Feasible` or `Rejected(reasons)`; cached per boot id. The first draft rejected the diting's real
+libc++ for "overlapping" the RW segment; the stage-1 margins (2520/2256, 640/1200) show the page
+remainder is the intended rule.
 
 ## 5. Resolver
 
@@ -203,8 +212,10 @@ round-trip and mismatch tests. The list itself stays app-side.
    classification on the host; device: diting Pass~~ — **done 2026-11-10**: build 717 passes on
    the diting and records the DB facts; the crash marker yields `Crashed` with no write. Evidence:
    `external/port/dirtyfrag-probe-product-2026-11-10/`.
-3. `DirtyfragPreflight` from `DirtyfragPlan`; unit tests with synthetic ELF/plan cases; device:
-   diting accepted, a synthetic cave-too-small case rejected.
+3. ~~`DirtyfragPreflight` from `DirtyfragPlan`; unit tests with synthetic ELF/plan cases; device:
+   diting accepted, a synthetic cave-too-small case rejected~~ — **done 2026-11-10**: the
+   page-remainder/boundary/file-end/branch rules are unit-tested and the diting's libc++ is
+   `Feasible` (`page_remain=2520`). Evidence: the product session dir.
 4. `PipelineResolver` + run-store/UI; app tests for the matrix (both feasible with probe pass /
    primitive-fail / setup-fail; strict list; KDP; cache); remove the pipeline picker.
 5. Extractor `pipeline_order` + profile list + ship tool (can land in parallel; it gates the cut,

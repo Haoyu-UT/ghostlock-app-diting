@@ -35,6 +35,9 @@ interface GhostlockRepository {
     /** Debug/test: run the DirtyFrag viability probe and return a one-line report. */
     suspend fun probeDirtyfrag(): String = "probe=NotRun (unsupported)"
 
+    /** Debug/test: run the DirtyFrag ROM preflight and return a one-line report. */
+    suspend fun preflightDirtyfrag(): String = "preflight=NotRun (unsupported)"
+
     /** The user's vr.ko task-tag-clear choice (Auto recommends; On/Off are final). */
     fun setVrKoTagClear(mode: VrKoMode)
 

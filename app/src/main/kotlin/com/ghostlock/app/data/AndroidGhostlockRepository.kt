@@ -857,6 +857,14 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         line
     }
 
+    override suspend fun preflightDirtyfrag(): String = withContext(Dispatchers.IO) {
+        val preflight = DirtyfragPlan.preflight(appContext, File("/system/lib64/libc++.so"))
+        val line = "preflight=${if (preflight.feasible) "Feasible" else "Rejected"} " +
+            "reasons=${preflight.reasons.joinToString("; ")} details=${preflight.details}"
+        Log.i(DirtyfragProbe.Tag, line)
+        line
+    }
+
     override suspend fun runExploitWithShizuku(pair: CpuPair, onLog: (String) -> Unit): Int {
         /* The Shizuku service runs as uid 2000 and cannot write the app's run
          * folder; the module sidecar is a direct-entry diagnostic. Its AIDL also

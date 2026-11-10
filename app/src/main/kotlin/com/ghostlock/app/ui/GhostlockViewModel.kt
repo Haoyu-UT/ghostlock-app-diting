@@ -1079,6 +1079,16 @@ class GhostlockViewModel(
         }
     }
 
+    /** Debug-only: run the DirtyFrag ROM preflight without an attack. */
+    fun runDirtyfragPreflightCheck() {
+        viewModelScope.launch {
+            val report = runCatching {
+                withContext(Dispatchers.IO) { repository.preflightDirtyfrag() }
+            }.getOrElse { "preflight=NotRun error=$it" }
+            appendLog("<b> $report")
+        }
+    }
+
     /** Explains why the run button is greyed out. */
     fun onProfileInvalid() {
         val state = state.value
