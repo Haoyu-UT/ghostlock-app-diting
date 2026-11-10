@@ -19,8 +19,10 @@ before W1 with the ROM preflight/probe/DB callbacks, and the generation picker i
 resolver's diting device gates are complete: the GhostLock order, the debug DirtyFrag order, and
 the forced pre-W1 fallback (a one-shot debug fault injection at the resolver; the run took the
 full GhostLock chain with no DirtyFrag step and no `--w1-only`). The native resolved-scalar
-cross-check is implemented and device-gated (§3.4), and the bundle now carries the derived order
-(§3.5). The OnePlus bundled run remains.
+cross-check is implemented and device-gated (§3.4), and the bundle carries the derived order
+(§3.5). The OnePlus bundled run is done (2026-11-11, build 725: fresh `probe=pass` recorded,
+`pipeline=dirtyfrag (profile order)`, W1-only + stage `RESULT=OK script=0 enforce=1`, store
+`completed`, Enforcing). The implementation is complete; the release cut remains.
 
 ## 1. Problem
 
@@ -260,7 +262,10 @@ logs it (`pipeline=ghostlock (legacy default)`); it never silently picks `dirtyf
 - The bundle's derived order, diting: **done 2026-11-10, build 724** — the bundled 5.10.236 asset
   carries `["dirtyfrag", "ghostlock"]` with no debug override; `probe=db pass`,
   `pipeline=dirtyfrag (profile order)`, W1-only then the stage `RESULT=OK script=0 enforce=1`,
-  run store `completed`, Enforcing. The OnePlus 6.6.66 bundled run remains.
+  run store `completed`, Enforcing. **Done on the OnePlus 6.6.66 (2026-11-11, build 725):** the
+  leftover A/B external profile was cleared so the bundle applied; the fresh probe passed and was
+  recorded, `pipeline=dirtyfrag (profile order)`, the stage ended `RESULT=OK script=0 enforce=1`
+  (`oppo_shell` root), store `completed`, Enforcing.
 - A16, strict list: the bundled profile alone selects `dirtyfrag` (no toggle); the run should
   reach W1 → DirtyFrag → init shell → ksud; a stage failure prompts the reboot path.
 - A16, a hand-edited `["dirtyfrag", "ghostlock"]`: refused before the native (KDP).
@@ -278,7 +283,8 @@ logs it (`pipeline=ghostlock (legacy default)`); it never silently picks `dirtyf
    `pipeline=… verified against the invocation` with matching transmitted/recomputed digests.
 5. Store/bundle order; interim curation; regenerate; content-aware `--check`.
 6. Host gates.
-7. Device gates (diting, OnePlus fallback, A16 strict).
+7. Device gates (diting, OnePlus fallback, A16 strict). **Diting and OnePlus done
+   (2026-11-10/11);** the A16's strict list is asset- and host-tested (no unit).
 8. **Measured bundle audit (final task)** — section 7; reconcile every asset's order.
 9. Build and NAS delivery after the audit.
 
