@@ -264,11 +264,12 @@ round-trip and mismatch tests. The list itself stays app-side.
   resolves DirtyFrag from the DB (`probe=db`, no fresh probe) and the run completes.
 - **Setup failure:** a debug hook forces `SetupFailed`; no DB write; the resolver falls to
   GhostLock **without W1** and `getenforce` stays `Enforcing`.
-- **Primitive failure:** the 6.1 duchamp (copy send path) if the probe APK can be installed (the
-  operator enables Install-via-USB); expect the control to pass and both file blocks unchanged →
-  `PrimitiveFailed`, DB `0`, DirtyFrag skipped. If the device is unavailable, a debug-injected
-  `PrimitiveFailed` covers the resolver matrix and the real copy-path probe stays a pending
-  device gate.
+- **Primitive failure (done on the duchamp 2026-11-11):** the 6.1 duchamp (copy send path): the
+  probe returned `PrimitiveFailed` — `control=pass` but the block was byte-identical before and
+  after — and the DB recorded `dirtyfrag.probe=0`, `probe_protocol=1`, `probe_rom` for
+  OS3.0.9.0.WNLMIXM; DirtyFrag is skipped on this kernel (its static order is `["ghostlock"]`,
+  "the UDP send path copies spliced pages"). The earlier `INSTALL_FAILED_USER_RESTRICTED` was the
+  keyguard, not the Install-via-USB toggle: `wm dismiss-keyguard` then the install succeeded.
 - **Crash containment:** kill the app between the watchdog write and the read-back; on restart the
   marker + changed boot id → `Crashed`, no DB write, DirtyFrag refused; the device stays
   enforcing (the probe is pre-W1).
