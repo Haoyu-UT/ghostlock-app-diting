@@ -32,6 +32,9 @@ interface GhostlockRepository {
     /** Second way: a W1-only run followed by the DirtyFrag page-cache stage. */
     fun setSecondWay(enabled: Boolean)
 
+    /** Debug/test: run the DirtyFrag viability probe and return a one-line report. */
+    suspend fun probeDirtyfrag(): String = "probe=NotRun (unsupported)"
+
     /** The user's vr.ko task-tag-clear choice (Auto recommends; On/Off are final). */
     fun setVrKoTagClear(mode: VrKoMode)
 

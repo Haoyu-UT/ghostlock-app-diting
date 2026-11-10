@@ -3,17 +3,21 @@ package com.ghostlock.app.data
 import java.io.File
 import java.nio.charset.StandardCharsets
 
-/** One root-measured fact about one kernel. */
+/** One root-measured or app-probed fact about one kernel. */
 internal data class MeasuredFact(
     /** Dotted profile path the fact belongs to (`kernelsnitch.mm_struct_sz`). */
     val key: String,
     val value: Long,
-    /** Who measured it: only [MeasuredProfileStore.SourceRootSlabinfo] today. */
+    /** Who measured it: [MeasuredProfileStore.SourceRootSlabinfo] or
+     * [MeasuredProfileStore.SourceDirtyfragProbe]. */
     val source: String,
     /** The raw line the value came from, kept so the UI can show its basis. */
     val evidence: String,
     val measuredAt: Long,
 )
+
+/** The result of matching a stored probe fact against the running device. */
+internal enum class ProbeReuse { Pass, PrimitiveFailed, None }
 
 internal data class MeasuredKernel(
     val release: String,
@@ -24,19 +28,33 @@ internal data class MeasuredKernel(
 }
 
 /**
- * The measured database: per-kernel ground truth, never behaviour.
+ * The measured database: per-kernel ground truth and one controlled probe fact.
  *
- * Written only from the root phase's `/proc/slabinfo` read (the root script
- * leaves `$HOME_DIR/.ghostlock_slabinfo`; the app ingests it after a completed
- * run) and only through [record]. The run path never reads this store — a fact
- * reaches a run only when the user merges it into a profile and selects that
- * document. Format and rationale: `docs/analysis/measured-db-plan.md`.
+ * Written from the root phase's `/proc/slabinfo` read (after a completed run)
+ * and from a **clear** DirtyFrag viability probe result (before W1). The run
+ * path reads the store only for the probe fact, in the pipeline resolver's
+ * viability step; it never reaches a profile value or a route. A profile value
+ * still reaches a run only when the user merges it into a profile and selects
+ * that document. Format and rationale: `docs/analysis/measured-db-plan.md`.
  */
 internal class MeasuredProfileStore(private val file: File) {
     companion object {
         const val SchemaVersion = 1L
         const val SourceRootSlabinfo = "root-slabinfo"
+        const val SourceDirtyfragProbe = "dirtyfrag-probe"
         const val KeyMmStructSz = "kernelsnitch.mm_struct_sz"
+        const val KeyDirtyfragProbe = "dirtyfrag.probe"
+        const val KeyDirtyfragProbeRom = "dirtyfrag.probe_rom"
+        const val KeyDirtyfragProbeProtocol = "dirtyfrag.probe_protocol"
+
+        /** A 63-bit fingerprint hash, stored in the fact's Long value. */
+        fun romHash(fingerprint: String): Long {
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+                .digest(fingerprint.toByteArray(StandardCharsets.UTF_8))
+            var value = 0L
+            for (index in 0 until 8) value = (value shl 8) or (digest[index].toLong() and 0xff)
+            return value and 0x7fff_ffff_ffff_ffffL
+        }
 
         /** Slab sizes this app will believe; a garbled read is refused, not stored. */
         private val PlausibleObjectSize = 64L..65536L
@@ -95,15 +113,78 @@ internal class MeasuredProfileStore(private val file: File) {
      * schema is not overwritten with this build's idea of it.
      */
     @Synchronized
-    fun record(release: String, fact: MeasuredFact): Boolean {
-        if (release.isEmpty() || fact.key.isEmpty()) return false
+    fun record(release: String, fact: MeasuredFact): Boolean = recordAll(release, listOf(fact))
+
+    /**
+     * Records a clear DirtyFrag probe result for [release]: the value, the ROM
+     * fingerprint hash and the probe protocol, in one atomic write. A
+     * `SetupFailed`/`Crashed`/`NotRun` result is not a fact and returns false.
+     */
+    @Synchronized
+    fun recordDirtyfragProbe(
+        release: String,
+        outcome: DirtyfragProbe.Outcome,
+        romFingerprint: String,
+        evidence: String,
+        now: Long = System.currentTimeMillis(),
+    ): Boolean {
+        val value = when (outcome) {
+            DirtyfragProbe.Outcome.Pass -> 1L
+            DirtyfragProbe.Outcome.PrimitiveFailed -> 0L
+            else -> return false
+        }
+        val facts = listOf(
+            MeasuredFact(KeyDirtyfragProbe, value, SourceDirtyfragProbe, evidence, now),
+            MeasuredFact(
+                KeyDirtyfragProbeRom,
+                romHash(romFingerprint),
+                SourceDirtyfragProbe,
+                "rom=$romFingerprint",
+                now,
+            ),
+            MeasuredFact(
+                KeyDirtyfragProbeProtocol,
+                DirtyfragProbe.ProtocolVersion,
+                SourceDirtyfragProbe,
+                "protocol=${DirtyfragProbe.ProtocolVersion}",
+                now,
+            ),
+        )
+        return recordAll(release, facts)
+    }
+
+    /**
+     * The reuse rule: a primitive fail is kernel-scoped and only needs the
+     * protocol to match; a pass also needs the same ROM fingerprint.
+     */
+    @Synchronized
+    fun probeReuse(
+        release: String,
+        romFingerprint: String,
+        protocol: Long = DirtyfragProbe.ProtocolVersion,
+    ): ProbeReuse {
+        val kernel = kernel(release) ?: return ProbeReuse.None
+        val fact = kernel.fact(KeyDirtyfragProbe) ?: return ProbeReuse.None
+        val storedProtocol =
+            kernel.fact(KeyDirtyfragProbeProtocol)?.value ?: return ProbeReuse.None
+        if (storedProtocol != protocol) return ProbeReuse.None
+        if (fact.value == 0L) return ProbeReuse.PrimitiveFailed
+        val rom = kernel.fact(KeyDirtyfragProbeRom)?.value ?: return ProbeReuse.None
+        return if (rom == romHash(romFingerprint)) ProbeReuse.Pass else ProbeReuse.None
+    }
+
+    /** Records [facts] for [release] in one write, replacing entries by key. */
+    @Synchronized
+    fun recordAll(release: String, facts: List<MeasuredFact>): Boolean {
+        if (release.isEmpty() || facts.isEmpty() || facts.any { it.key.isEmpty() }) return false
         val loaded = load()
         if (!loaded.readable) return false
         val kernels = loaded.kernels.toMutableList()
         val index = kernels.indexOfFirst { it.release == release }
         val current = if (index >= 0) kernels[index].facts else emptyList()
-        val facts = current.filterNot { it.key == fact.key } + fact
-        val updated = MeasuredKernel(release, fact.measuredAt, facts.sortedBy { it.key })
+        val keys = facts.mapTo(mutableSetOf()) { it.key }
+        val merged = current.filterNot { it.key in keys } + facts
+        val updated = MeasuredKernel(release, facts.maxOf { it.measuredAt }, merged.sortedBy { it.key })
         if (index >= 0) kernels[index] = updated else kernels += updated
         return write(kernels)
     }

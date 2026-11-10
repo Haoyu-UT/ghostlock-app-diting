@@ -11,6 +11,7 @@ import android.provider.DocumentsContract
 import android.view.WindowInsetsController
 import android.view.WindowManager
 import android.widget.Toast
+import java.io.File
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -75,6 +76,15 @@ class MainActivity : ComponentActivity() {
          * way on and persists it, so a harness restart keeps the setting. */
         if (BuildConfig.DEBUG && intent?.hasExtra("second_way") == true) {
             viewModel.toggleSecondWay(intent.getBooleanExtra("second_way", false))
+        }
+        /* Debug-only: `am start --ez probe_check true` runs the DirtyFrag
+         * viability probe without an attack and records a clear result. */
+        if (BuildConfig.DEBUG && intent?.hasExtra("probe_check") == true) {
+            if (intent.getBooleanExtra("probe_marker", false)) {
+                /* Seeds the watchdog marker a killed probe would leave. */
+                File(filesDir, ".df-probe-in-progress").writeText("seeded by probe_marker")
+            }
+            viewModel.runDirtyfragProbeCheck()
         }
         setContent {
             GhostlockRoute(viewModel, ::handleEffect)

@@ -1069,6 +1069,16 @@ class GhostlockViewModel(
 
     fun onRun() = runExploit()
 
+    /** Debug-only: run the DirtyFrag viability probe without an attack. */
+    fun runDirtyfragProbeCheck() {
+        viewModelScope.launch {
+            val report = runCatching {
+                withContext(Dispatchers.IO) { repository.probeDirtyfrag() }
+            }.getOrElse { "probe=NotRun error=$it" }
+            appendLog("<b> $report")
+        }
+    }
+
     /** Explains why the run button is greyed out. */
     fun onProfileInvalid() {
         val state = state.value

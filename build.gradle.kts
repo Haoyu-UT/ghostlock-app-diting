@@ -123,12 +123,28 @@ tasks.register<Exec>("buildGhostlockCompatHelper") {
     outputs.file(file("build/native/ghostlock32"))
 }
 
+tasks.register<Exec>("buildDirtyfragProbe") {
+    description = "buildDirtyfragProbe"
+    workingDir(file("src"))
+    commandLine("make", "dfprobe")
+    val ndk = resolveNdkDir()
+    environment("ANDROID_NDK_HOME", ndk)
+    environment("NDK_ROOT", ndk)
+    inputs.files(
+        fileTree("src/core/probe") { include("**/*.c", "**/*.h") },
+        file("src/Makefile"),
+    )
+    outputs.file(file("build/native/libdfprobe.so"))
+}
+
 tasks.register<Copy>("prepareGhostlockJniLibs") {
     description = "prepareGhostlockJniLibs"
     dependsOn("buildGhostlockNative")
     dependsOn("buildGhostlockCompatHelper")
+    dependsOn("buildDirtyfragProbe")
     from("build/native/ghostlock") { rename { "libghostlock.so" } }
     from("build/native/ghostlock32") { rename { "libghostlock32.so" } }
+    from("build/native/libdfprobe.so") { rename { "libdfprobe.so" } }
     into("app/src/main/jniLibs/arm64-v8a")
     /* Strip only the packaged copies: static libc++ carries its DWARF into the
      * binary, while the top-level ghostlock keeps its symbols for the
@@ -138,7 +154,7 @@ tasks.register<Copy>("prepareGhostlockJniLibs") {
         .resolveSibling("llvm-strip").absolutePath
     val packagedDir = File(rootDir, "app/src/main/jniLibs/arm64-v8a")
     doLast {
-        for (name in listOf("libghostlock.so", "libghostlock32.so")) {
+        for (name in listOf("libghostlock.so", "libghostlock32.so", "libdfprobe.so")) {
             val code = ProcessBuilder(stripPath, "--strip-all", File(packagedDir, name).absolutePath)
                 .inheritIO()
                 .start()

@@ -104,11 +104,25 @@ HOST_BUILD_DIR := $(BUILD_ROOT)/host-test
 # Every generated artifact stays under build/ so nothing lands in the repo root.
 GHOSTLOCK_BIN := $(NATIVE_BUILD_DIR)/ghostlock
 
-.PHONY: all ghostlock clean product
+# --- DirtyFrag viability probe (JNI) ---------------------------------------
+# A small in-process library loaded by DirtyfragProbe; it sends one ESP-in-UDP
+# packet whose payload is spliced from a file page. The transform is created
+# Java-side (IpSecManager). See docs/analysis/dirtyfrag-viability-probe-plan.md.
+DFPROBE_BIN := $(NATIVE_BUILD_DIR)/libdfprobe.so
+DFPROBE_SRC := core/probe/dfprobe.c
+
+.PHONY: all ghostlock dfprobe clean product
 
 all: ghostlock
 
 ghostlock: $(GHOSTLOCK_BIN)
+
+dfprobe: $(DFPROBE_BIN)
+
+$(DFPROBE_BIN): $(DFPROBE_SRC) Makefile
+	@echo "Using NDK compiler: $(NDK_CC)"
+	@mkdir -p $(dir $@)
+	$(NDK_CC) -O2 -shared -fPIC -Wall -Wextra -Icore $(DFPROBE_SRC) -o $@
 
 $(GHOSTLOCK_BIN): $(OBJS) Makefile
 	@echo "Using NDK compiler: $(NDK_CC)"

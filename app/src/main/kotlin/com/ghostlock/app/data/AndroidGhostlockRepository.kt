@@ -840,6 +840,23 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             runExploitBinary(pair, "libghostlock.so", archivedLog, debugDir, runDir, writeSidecar)
         }
 
+    override suspend fun probeDirtyfrag(): String = withContext(Dispatchers.IO) {
+        val release = System.getProperty("os.version", "").orEmpty()
+        val result = DirtyfragProbe.run(appContext, filesDir)
+        val clear = result.outcome == DirtyfragProbe.Outcome.Pass ||
+            result.outcome == DirtyfragProbe.Outcome.PrimitiveFailed
+        val recorded = clear && measuredProfiles.recordDirtyfragProbe(
+            release,
+            result.outcome,
+            Build.FINGERPRINT,
+            result.evidence,
+        )
+        val line = "probe=${result.outcome} reason=${result.reason} " +
+            "evidence=${result.evidence} db=$recorded"
+        Log.i(DirtyfragProbe.Tag, line)
+        line
+    }
+
     override suspend fun runExploitWithShizuku(pair: CpuPair, onLog: (String) -> Unit): Int {
         /* The Shizuku service runs as uid 2000 and cannot write the app's run
          * folder; the module sidecar is a direct-entry diagnostic. Its AIDL also
