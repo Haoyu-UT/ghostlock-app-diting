@@ -118,6 +118,14 @@ object ProfileResolver {
         if (fallbackTo != null && fallbackTo != "none" && fallbackTo !in RouteNames) {
             errors += ConfigError("fallback.to", "unknown fallback route")
         }
+        /* A KDP image may only take the DirtyFrag second way: the credential
+         * forging chain is fatal there, and the legacy ghostlock default (a
+         * missing pipeline) must not run. */
+        if ((profile["kdp"] as? Number)?.toLong() == 1L &&
+            (profile["pipeline"] as? String)?.trim()?.lowercase() != "dirtyfrag"
+        ) {
+            errors += ConfigError("pipeline", "a KDP image requires the dirtyfrag pipeline")
+        }
         val task = profile["task_struct"] as? Map<*, *>
         if (task == null) {
             errors += ConfigError("task_struct", "not an object")

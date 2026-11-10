@@ -8,6 +8,19 @@ import org.junit.Test
 
 class ProfileResolverTest {
     @Test
+    fun `a KDP profile requires the dirtyfrag pipeline`() {
+        fun pipelineErrors(profile: Map<String, Any?>) =
+            ProfileResolver.validateMerged(profile, "select_stack", "none")
+                .filter { it.fieldPath == "pipeline" }
+
+        assertTrue(pipelineErrors(valueMapOf("kdp" to 1L, "pipeline" to "ghostlock")).isNotEmpty())
+        assertTrue(pipelineErrors(valueMapOf("kdp" to 1L)).isNotEmpty())
+        assertTrue(pipelineErrors(valueMapOf("kdp" to 1L, "pipeline" to "DIRTYFRAG")).isEmpty())
+        assertTrue(pipelineErrors(valueMapOf("kdp" to 0L, "pipeline" to "ghostlock")).isEmpty())
+        assertTrue(pipelineErrors(valueMapOf("pipeline" to "ghostlock")).isEmpty())
+    }
+
+    @Test
     fun `nativeValue folds selected cpus into the recommended slots`() {
         val profile = valueMapOf(
             "execution" to valueMapOf("selected_cpus" to valueMapOf("main" to 3)),

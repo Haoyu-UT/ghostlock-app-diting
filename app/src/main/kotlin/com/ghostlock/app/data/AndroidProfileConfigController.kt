@@ -84,15 +84,7 @@ internal class AndroidProfileConfigController(
             ?.takeIf { it.isNotEmpty() }
         val invalidPaths = validateProfileFields(full, route, fallbackTo) +
             ProfileResolver.validateMerged(full, route, fallbackTo)
-                .mapTo(mutableSetOf()) { it.fieldPath } +
-            /* A profile that carries the KDP fact but omits the selector is
-             * from the transition window; the legacy ghostlock default must
-             * not run the known-fatal chain there. */
-            if (pipeline == null && (full["kdp"] as? Number)?.toLong() == 1L) {
-                setOf("pipeline")
-            } else {
-                emptySet()
-            }
+                .mapTo(mutableSetOf()) { it.fieldPath }
         /* Invalid fields missing from the resolved document still get a row,
          * otherwise the run stays blocked with no red field to fix. */
         materializeInvalidPaths(full, invalidPaths)
