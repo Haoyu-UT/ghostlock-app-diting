@@ -7,7 +7,9 @@ import com.ghostlock.app.domain.model.CpuPair
 import com.ghostlock.app.domain.model.ProfileConfig
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNull
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -46,11 +48,20 @@ class DeviceDefaultsTest {
     }
 
     @Test
-    fun `a device without an entry gets the generic timing`() = runBlocking {
-        val config = controller("not-diting").load(release, CpuPair(0, 1))
+    fun `a device in the map gets the generic timing`() = runBlocking {
+        val config = controller("yunluo").load(release, CpuPair(0, 1))
         assertEquals(1000L, value(config, "execution.race.route_wait_ms"))
         assertEquals(50000L, value(config, "execution.race.setup_settle_us"))
         assertEquals(50000L, value(config, "execution.routes.select_stack.enter_delay_us"))
+    }
+
+    @Test
+    fun `a device the physical map does not name is refused`() = runBlocking {
+        val config = controller("not-diting").load(release, CpuPair(0, 1))
+        assertFalse(config.hasProfile)
+        assertTrue(
+            config.layers?.externalError.orEmpty().contains("does not name not-diting"),
+        )
     }
 
     @Test
@@ -72,7 +83,9 @@ class DeviceDefaultsTest {
             assertEquals(1073741824L, yunluo["kernel_phys_offset"])
             assertEquals(1073741824L, rubens["kernel_phys_load"])
             assertEquals(1073741824L, rubens["kernel_phys_offset"])
-            assertNull(PerDevicePhys.resolve(document, "some-other-device")["kernel_phys_load"])
+            assertThrows(IllegalArgumentException::class.java) {
+                PerDevicePhys.resolve(document, "some-other-device")
+            }
         }
     }
 

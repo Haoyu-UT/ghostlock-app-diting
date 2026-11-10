@@ -785,7 +785,15 @@ internal class AndroidProfileConfigController(
         document: ValueMap,
         overrides: ValueMap?,
     ): ValueMap {
-        val resolvedDocument = PerDevicePhys.resolveFor(document, deviceCandidates).document
+        /* A controller without any device identity (test/exporter callers) is
+         * device-neutral: the maps resolve to the native default, as the
+         * exporter's own .bin does. The app always has an identity, and a map
+         * that does not name it is refused by PerDevicePhys. */
+        val resolvedDocument = if (deviceCandidates.isEmpty()) {
+            PerDevicePhys.resolveNeutral(document)
+        } else {
+            PerDevicePhys.resolveFor(document, deviceCandidates).document
+        }
         val tuningExecution = readExecutionTuning()
         val routePresets = ProfileConfig.Routes
             .mapNotNull { route -> readExecutionRoute(route)?.let { route to it } }

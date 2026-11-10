@@ -47,6 +47,7 @@ class ControllerOverrideTest {
             context = context,
             externalProfiles = external,
             preferences = preferences,
+            deviceCodename = "diting",
             overrideStore = MemoryOverrideStore(),
             forcedSelection = ProfileSelection.Bundled(release),
         )
@@ -69,6 +70,7 @@ class ControllerOverrideTest {
             context = context,
             externalProfiles = external,
             preferences = preferences,
+            deviceCodename = "diting",
         )
         assertEquals(bundledValue, generalValue(live.load(release, pair), editPath))
     }
@@ -79,6 +81,7 @@ class ControllerOverrideTest {
             context = context,
             externalProfiles = external,
             preferences = preferences,
+            deviceCodename = "diting",
         )
         live.updateGeneral(release, pair, mapOf(editPath to 42L))
         assertEquals(bundledValue, generalValue(live.load(release, pair), editPath))
