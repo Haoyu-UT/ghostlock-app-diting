@@ -106,27 +106,27 @@ properties the kernel image cannot carry. The app already plans the stage agains
 ROM; it gains a pre-flight refusal when the target/cave is absent (app line, separate change),
 so a bundled DirtyFrag profile cannot fail after W1 on an unsupported ROM.
 
-### 2.4 Bundling rule (a default, not a lock-in)
+### 2.4 Bundling rule (an order, resolved at execution time)
 
-- `ship_golden_profiles.py` chooses the cut's pipeline from the stored superset:
-  **`dirtyfrag` when its verdict is `feasible`; otherwise `ghostlock` when `feasible`; otherwise
-  the entry is not shippable** (it already requires a feasible route). It passes
-  `--pipeline <chosen>` to the extractor.
-- The cut's route is chosen independently by `choose_route` (`ROUTE_PRIORITY`): a DirtyFrag cut
-  on a sigreturn-only or multicast-only image takes that route. The tool does not require
+- The superset carries the extractor's `pipeline_order` (both feasible → `["dirtyfrag",
+  "ghostlock"]`; only one → that one; neither → not shippable). `ship_golden_profiles.py` writes
+  it into the cut and validates every entry against `pipelines[]`; a `meta.txt` order is an
+  optional curation override, not a requirement.
+- The cut's route is chosen independently by `choose_route` (`ROUTE_PRIORITY`): a DirtyFrag-first
+  cut on a sigreturn-only or multicast-only image takes that route. The tool does not require
   `select_stack`; the pipeline verdict only requires that some route can deliver W1.
 - `--check` must stay green; the bundle counts and the `index.conf` registration are regenerated
-  with `--apply`, and any profile whose verdict is not feasible keeps GhostLock.
+  with `--apply`. An asset whose order names an infeasible pipeline is a defect.
 
-Consequence: the diting 5.10.236, the 6.6 and the 6.12 entries above ship `pipeline =
-dirtyfrag`; the 6.1 entries (send path `Copy`) keep GhostLock. This is the per-image form of the
-decision already taken from the A/B: DirtyFrag is the default when the image says it can work.
+Consequence: the diting 5.10.236 and the 6.6/6.12 entries ship `["dirtyfrag", "ghostlock"]`; the
+6.1 entries (send path `Copy`) ship `["ghostlock"]`; the KDP A16 ships the strict `["dirtyfrag"]`.
 
-**The default is not a lock-in.** The extractor always reports both pipelines with their
-verdicts; the App's parse/export flow must present them and let the user choose, the same way the
-route choice works today. The bundle's `pipeline` only decides what the shipped profile selects
-when the user does not choose; it must never hide the other feasible pipeline. The App's
-pre-flight then validates the *chosen* pipeline (for DirtyFrag, the userspace hook target/cave).
+**The order is not a user prompt.** The generation flow writes the extractor's order; the app
+resolves it at execution time before W1 — the static verdict plus, for DirtyFrag, the ROM
+preflight, the primitive probe and the live state — and falls back only to an entry the profile
+lists. Until that resolver ships, the bundle keeps the conservative curation (only device-verified
+entries put `dirtyfrag` first; everything else is `["ghostlock"]`). Design:
+`profile-pipeline-selection-plan.md` §3.1–3.3.
 
 ## 3. Implementation steps
 
