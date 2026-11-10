@@ -7,15 +7,17 @@ ordered pipeline list, resolved before W1) and
 §2.4. This plan covers the probe, the ROM preflight and the resolver; the extractor's
 `pipeline_order` (§7) is a prerequisite, not a separate design.
 
-**Status 2026-11-10 — steps 1–3 done on the diting.** The positive-control spike passed
+**Status 2026-11-10 — steps 1–5 done; steps 4–5 host-gated.** The positive-control spike passed
 (`external/port/dirtyfrag-probe-spike-2026-11-10/`); the product probe (`libdfprobe.so` +
 `DirtyfragProbe` + `ProbeCrypto`) is implemented and device-gated: build 717 passes with the
 measured-DB record, and a seeded crash marker yields `Crashed`, no DB write, marker cleared. The
 ROM preflight (`DirtyfragPlan.preflight`) is implemented and accepts the diting's libc++
-(`page_remain=2520`, matching the stage-1 margin) with unit tests for the cave page-remainder,
-boundary, file-end and branch-range rules
-(`external/port/dirtyfrag-probe-product-2026-11-10/`). Next: the resolver with the
-ordered-list/profile schema (the extractor `pipeline_order` prerequisite).
+(`page_remain=2520`, matching the stage-1 margin) with unit tests. The ordered pipeline list and
+the resolver are implemented on the host: the extractor derives `pipeline_order` and writes the
+profile's `pipeline = [ ... ]`, the app parses the list (legacy scalar/missing migrate), the cut
+writes it, `PipelineResolver` walks the order before W1 with the preflight/probe/DB callbacks,
+and the generation picker is retired. Remaining: the native resolved-scalar cross-check (step 6)
+and the resolver's device gates (a diting run, a forced pre-W1 fallback, OnePlus/A16).
 
 **Goal.** Before W1, decide whether DirtyFrag is viable on **this running ROM**, and feed the
 ordered-list resolver. A pass is a licence to try DirtyFrag; a fail or an unverifiable result
@@ -216,10 +218,13 @@ round-trip and mismatch tests. The list itself stays app-side.
    diting accepted, a synthetic cave-too-small case rejected~~ — **done 2026-11-10**: the
    page-remainder/boundary/file-end/branch rules are unit-tested and the diting's libc++ is
    `Feasible` (`page_remain=2520`). Evidence: the product session dir.
-4. `PipelineResolver` + run-store/UI; app tests for the matrix (both feasible with probe pass /
-   primitive-fail / setup-fail; strict list; KDP; cache); remove the pipeline picker.
-5. Extractor `pipeline_order` + profile list + ship tool (can land in parallel; it gates the cut,
-   not the probe).
+4. ~~`PipelineResolver` + run-store/UI; app tests for the matrix; remove the pipeline picker~~
+   — **done (host) 2026-11-10**: the extractor emits `pipeline_order`, the app parses the list,
+   `PipelineResolver` walks it with the preflight/probe/DB callbacks, and the picker is retired.
+   The device matrix (a resolver run, the forced pre-W1 fallback) remains.
+5. ~~Extractor `pipeline_order` + profile list + ship tool (can land in parallel; it gates the
+   cut, not the probe)~~ — **done (host) 2026-11-10**: the extractor unit/store suites, the app
+   tests and ship `--check` pass; the store supersets carry the order.
 6. Native scalar cross-check; digest/golden.
 7. Device gates: diting best-effort list resolves to DirtyFrag and the run completes; a forced
    setup failure falls to GhostLock **without W1** (device stays enforcing); a forced primitive

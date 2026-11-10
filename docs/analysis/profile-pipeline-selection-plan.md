@@ -12,6 +12,12 @@ DirtyFrag stage depends on the ROM (libc++/libbase hook, cave, policy) and on ru
 DirtyFrag where it verifies and fall back to the proven chain **without ever making the device
 permissive for a stage it could not verify**.
 
+**Implementation status (2026-11-10).** The ordered list is implemented end to end on the host:
+the extractor derives/writes `pipeline_order` and the profile's `pipeline = [ ... ]`, the app
+parses the list (legacy scalar/missing migrate), the cut writes it, `PipelineResolver` walks it
+before W1 with the ROM preflight/probe/DB callbacks, and the generation picker is retired. The
+native resolved-scalar cross-check (§3.4) and the resolver's device gates remain.
+
 ## 1. Problem
 
 The A16 run `20261108-224100` is the evidence. The app resolved the **bundled** A16 profile
