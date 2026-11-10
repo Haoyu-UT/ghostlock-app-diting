@@ -7,17 +7,20 @@ ordered pipeline list, resolved before W1) and
 §2.4. This plan covers the probe, the ROM preflight and the resolver; the extractor's
 `pipeline_order` (§7) is a prerequisite, not a separate design.
 
-**Status 2026-11-10 — steps 1–5 done; steps 4–5 host-gated.** The positive-control spike passed
-(`external/port/dirtyfrag-probe-spike-2026-11-10/`); the product probe (`libdfprobe.so` +
-`DirtyfragProbe` + `ProbeCrypto`) is implemented and device-gated: build 717 passes with the
+**Status 2026-11-10 — steps 1–5 done; steps 4–5 device-gated on the diting.** The positive-control
+spike passed (`external/port/dirtyfrag-probe-spike-2026-11-10/`); the product probe (`libdfprobe.so`
++ `DirtyfragProbe` + `ProbeCrypto`) is implemented and device-gated: build 717 passes with the
 measured-DB record, and a seeded crash marker yields `Crashed`, no DB write, marker cleared. The
 ROM preflight (`DirtyfragPlan.preflight`) is implemented and accepts the diting's libc++
 (`page_remain=2520`, matching the stage-1 margin) with unit tests. The ordered pipeline list and
-the resolver are implemented on the host: the extractor derives `pipeline_order` and writes the
-profile's `pipeline = [ ... ]`, the app parses the list (legacy scalar/missing migrate), the cut
-writes it, `PipelineResolver` walks the order before W1 with the preflight/probe/DB callbacks,
-and the generation picker is retired. Remaining: the native resolved-scalar cross-check (step 6)
-and the resolver's device gates (a diting run, a forced pre-W1 fallback, OnePlus/A16).
+the resolver are implemented and device-gated on the diting (build 721): the bundled profile's
+`["ghostlock"]` order runs the full chain (`pipeline=ghostlock (profile order)`, completed); the
+debug `["dirtyfrag"]` order reuses the measured-DB probe (`probe=db pass`), runs W1-only + the
+stage (`RESULT=OK script=0 enforce=1`, root shell `uid=0`, 28 blocks restored, completed) and
+leaves SELinux Enforcing. Remaining: the forced pre-W1 fallback (a best-effort list, proving
+GhostLock without W1), the OnePlus/A16 lists, the native resolved-scalar cross-check (step 6), and
+the bundle's curated order flip. Evidence:
+`external/port/pipeline-resolver-2026-11-10/`.
 
 **Goal.** Before W1, decide whether DirtyFrag is viable on **this running ROM**, and feed the
 ordered-list resolver. A pass is a licence to try DirtyFrag; a fail or an unverifiable result
@@ -219,9 +222,11 @@ round-trip and mismatch tests. The list itself stays app-side.
    page-remainder/boundary/file-end/branch rules are unit-tested and the diting's libc++ is
    `Feasible` (`page_remain=2520`). Evidence: the product session dir.
 4. ~~`PipelineResolver` + run-store/UI; app tests for the matrix; remove the pipeline picker~~
-   — **done (host) 2026-11-10**: the extractor emits `pipeline_order`, the app parses the list,
-   `PipelineResolver` walks it with the preflight/probe/DB callbacks, and the picker is retired.
-   The device matrix (a resolver run, the forced pre-W1 fallback) remains.
+   — **done (host + diting) 2026-11-10**: the extractor emits `pipeline_order`, the app parses the
+   list, `PipelineResolver` walks it with the preflight/probe/DB callbacks, and the picker is
+   retired. Diting: `pipeline=ghostlock (profile order)` completed; the debug dirtyfrag order
+   reused the DB probe and completed with `RESULT=OK enforce=1`. Remaining: the forced pre-W1
+   fallback and the OnePlus/A16 lists.
 5. ~~Extractor `pipeline_order` + profile list + ship tool (can land in parallel; it gates the
    cut, not the probe)~~ — **done (host) 2026-11-10**: the extractor unit/store suites, the app
    tests and ship `--check` pass; the store supersets carry the order.
