@@ -36,6 +36,7 @@ class OptionSupersetTest {
             { "pipeline": "dirtyfrag", "verdict": "feasible",
               "reason": "the ESP fix is absent; send path ip_append_page" }
           ],
+          "pipeline_order": ["dirtyfrag", "ghostlock"],
           "plans": [
             { "route": "select_stack",
               "page": { "route": "select_stack", "anchor": null, "scratch": null,
@@ -132,16 +133,25 @@ class OptionSupersetTest {
     }
 
     @Test
-    fun `both feasible pipelines are exposed and the cut carries the chosen one`() {
+    fun `both feasible pipelines are exposed and the cut carries the order`() {
         val superset = requireNotNull(OptionSuperset.parse(sample))
         val feasible = superset.feasiblePipelines
         assertEquals(listOf("ghostlock", "dirtyfrag"), feasible.map { it.pipeline })
+        assertEquals(listOf("dirtyfrag", "ghostlock"), superset.pipelineOrder)
         val plan = superset.plansFor("select_stack")!!.safeOptions[0]
-        val chosen = requireNotNull(superset.cut("select_stack", plan, pipeline = "dirtyfrag"))
-        assertTrue(chosen.contains("pipeline = \"dirtyfrag\""))
-        /* A cut with no pipeline keeps the legacy reading (none); the parse
-         * flow always passes the chosen one. */
-        val legacy = requireNotNull(superset.cut("select_stack", plan))
+        /* The cut uses the superset's order by default... */
+        val chosen = requireNotNull(superset.cut("select_stack", plan))
+        assertTrue(chosen.contains("pipeline = ["))
+        assertTrue(chosen.contains("\"dirtyfrag\""))
+        assertTrue(chosen.contains("\"ghostlock\""))
+        /* ...and an explicit order replaces it; an empty one is the legacy
+         * no-pipeline form. */
+        val override = requireNotNull(
+            superset.cut("select_stack", plan, pipelineOrder = listOf("ghostlock")),
+        )
+        assertTrue(override.contains("\"ghostlock\""))
+        assertFalse(override.contains("\"dirtyfrag\""))
+        val legacy = requireNotNull(superset.cut("select_stack", plan, pipelineOrder = emptyList()))
         assertFalse(legacy.contains("pipeline ="))
     }
 

@@ -386,7 +386,6 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         dtboPath: String?,
         overwrite: Boolean,
         route: String?,
-        pipeline: String?,
         onLog: (String) -> Unit,
     ): ParseResult {
         val parsedFile = File(filesDir, "offsets_parse.tmp")
@@ -481,10 +480,6 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 if (route != null) {
                     add("--route")
                     add(route)
-                }
-                if (pipeline != null) {
-                    add("--pipeline")
-                    add(pipeline)
                 }
             }
             val captured = mutableListOf<String>()
@@ -894,17 +889,17 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 }
 
                 else -> {
-                    val pipeline = config.pipeline?.lowercase() ?: "ghostlock"
-                    if (config.pipeline == null) {
+                    val order = config.pipelineOrder.ifEmpty { listOf("ghostlock") }
+                    if (config.pipelineOrder.isEmpty()) {
                         archivedLog(
                             "<s> pipeline=ghostlock (legacy default; profile has no " +
                                 "pipeline key)",
                         )
                     }
-                    if (pipeline != "ghostlock") {
+                    if ("ghostlock" !in order) {
                         archivedLog(
-                            "<s> error: profile pipeline=$pipeline; the Shizuku path " +
-                                "does not carry the pipeline selection yet (use the direct path)",
+                            "<s> error: profile pipeline order=${order.joinToString(",")}; " +
+                                "the Shizuku path only runs GhostLock (use the direct path)",
                         )
                         return@withDebugAttackLog 1
                     }
@@ -1279,34 +1274,82 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                         config.invalidPaths.take(6).joinToString(),
                 )
             }
-            /* The profile selects the pipeline; the Advanced toggle is a
-             * debug-only override. A profile without the key predates the
-             * selector and is refused, never defaulted. */
+            /* The profile carries an ordered pipeline list; resolve it before
+             * W1. GhostLock is viable on its static verdict (the profile
+             * validator refuses a KDP list containing it). DirtyFrag needs the
+             * ROM preflight and the primitive probe (or a matching measured-DB
+             * record). No fallback after W1; a failed stage is restore/reboot. */
             val pipeline = run {
-                val fromProfile = config.pipeline?.lowercase()
-                if (BuildConfig.DEBUG && secondWay) {
-                    onLog(
-                        "<k> pipeline=dirtyfrag (debug override; profile=" +
-                            "${fromProfile ?: "legacy default ghostlock"})",
-                    )
-                    "dirtyfrag"
-                } else {
-                    when (fromProfile) {
-                        "ghostlock", "dirtyfrag" -> {
-                            onLog("<k> pipeline=$fromProfile (profile)")
-                            fromProfile
-                        }
-                        /* Every profile authored before the selector was a
-                         * GhostLock plan; the default preserves that intent. */
-                        null -> "ghostlock".also {
-                            onLog(
-                                "<k> pipeline=ghostlock (legacy default; profile has " +
-                                    "no pipeline key)",
-                            )
-                        }
-                        else -> error("profile has unknown pipeline '$fromProfile'")
+                val order = when {
+                    BuildConfig.DEBUG && secondWay -> {
+                        onLog("<k> pipeline order=dirtyfrag (debug override)")
+                        listOf("dirtyfrag")
                     }
+                    config.pipelineOrder.isEmpty() -> {
+                        onLog(
+                            "<k> pipeline=ghostlock (legacy default; profile has no " +
+                                "pipeline key)",
+                        )
+                        listOf("ghostlock")
+                    }
+                    else -> config.pipelineOrder
                 }
+                val decision = PipelineResolver.resolve(
+                    order,
+                    ghostlock = { null },
+                    dirtyfrag = {
+                        val rom = DirtyfragPlan.preflight(
+                            appContext,
+                            File("/system/lib64/libc++.so"),
+                        )
+                        if (!rom.feasible) {
+                            "ROM preflight: " + rom.reasons.joinToString("; ")
+                        } else {
+                            when (val reuse = measuredProfiles.probeReuse(release, Build.FINGERPRINT)) {
+                                ProbeReuse.Pass -> {
+                                    onLog(
+                                        "<k> probe=db pass (protocol " +
+                                            DirtyfragProbe.ProtocolVersion + ")",
+                                    )
+                                    null
+                                }
+                                ProbeReuse.PrimitiveFailed ->
+                                    "measured DB says the primitive does not land"
+                                ProbeReuse.None -> {
+                                    val result = DirtyfragProbe.run(appContext, filesDir)
+                                    val clear =
+                                        result.outcome == DirtyfragProbe.Outcome.Pass ||
+                                            result.outcome == DirtyfragProbe.Outcome.PrimitiveFailed
+                                    if (clear) {
+                                        measuredProfiles.recordDirtyfragProbe(
+                                            release,
+                                            result.outcome,
+                                            Build.FINGERPRINT,
+                                            result.evidence,
+                                        )
+                                    }
+                                    when (result.outcome) {
+                                        DirtyfragProbe.Outcome.Pass -> {
+                                            onLog("<k> probe=pass ${result.evidence}")
+                                            null
+                                        }
+                                        else -> "probe ${result.outcome}: ${result.reason}"
+                                    }
+                                }
+                            }
+                        }
+                    },
+                )
+                val selected = decision.pipeline
+                    ?: error(
+                        "no viable pipeline: " +
+                            decision.rejected.joinToString("; ").ifEmpty { "empty order" },
+                    )
+                if (decision.rejected.isNotEmpty()) {
+                    onLog("<k> pipeline fallback: ${decision.rejected.joinToString("; ")}")
+                }
+                onLog("<k> pipeline=$selected (profile order)")
+                selected
             }
             var profileBlob = profileController.nativeDocument(config)
                 ?: error("profile is unavailable for $release")

@@ -355,8 +355,8 @@ data class ProfileConfig(
     val route: String? = null,
     /** Declared fallback route ("none"/"<route>"); null means unset. */
     val fallbackTo: String? = null,
-    /** The profile's selected execution chain (`ghostlock`/`dirtyfrag`); null = legacy. */
-    val pipeline: String? = null,
+    /** The profile's ordered pipeline preference; empty = legacy ghostlock. */
+    val pipelineOrder: List<String> = emptyList(),
     /** Dotted paths whose resolved value violates the geometry rules. */
     val invalidPaths: Set<String> = emptySet(),
 ) {

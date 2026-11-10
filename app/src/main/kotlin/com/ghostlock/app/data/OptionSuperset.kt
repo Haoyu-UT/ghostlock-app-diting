@@ -125,6 +125,9 @@ data class OptionSuperset(
     /** The image's pipeline verdicts (`pipelines[]`); empty on a superset
      * written before the selector existed. */
     val pipelines: List<OptionPipeline> = emptyList(),
+    /** The extractor's default pipeline order (highest precedence first); the
+     * cut writes it into the profile's `pipeline` list. */
+    val pipelineOrder: List<String> = emptyList(),
 ) {
     /** The device key this superset was generated for, when it has one. */
     val device: String? get() = devices.firstOrNull()?.device
@@ -147,7 +150,7 @@ data class OptionSuperset(
         route: String,
         plan: OptionPlan,
         device: String? = null,
-        pipeline: String? = null,
+        pipelineOrder: List<String>? = null,
     ): String? {
         val routeOption = routes.firstOrNull { it.route == route && it.verdict == Feasible }
             ?: return null
@@ -170,10 +173,12 @@ data class OptionSuperset(
             document["kernel_phys_load"] = selected.physLoad?.let { mapOf(selected.device to it) }
             document["kernel_phys_offset"] = selected.physOffset?.let { mapOf(selected.device to it) }
         }
-        /* The route's pipeline is an explicit key now (the extractor requires
-         * it when both are feasible); a cut without one would read as the
-         * legacy ghostlock default. */
-        pipeline?.let { document["pipeline"] = it }
+        /* The profile carries the ordered pipeline preference; a cut without
+         * one would read as the legacy ghostlock default. */
+        val order = pipelineOrder ?: this.pipelineOrder
+        if (order.isNotEmpty()) {
+            document["pipeline"] = order
+        }
         val block = linkedMapOf<String, Any?>()
         routeOption.geometry.forEach { (key, value) -> block[key] = value }
         plan.anchor?.let { anchor ->
@@ -272,6 +277,8 @@ data class OptionSuperset(
                     reason = map["reason"] as? String ?: "",
                 )
             }
+            val pipelineOrder = root["pipeline_order"].asValueList().orEmpty()
+                .mapNotNull { (it as? String)?.trim()?.lowercase()?.takeIf(String::isNotEmpty) }
             OptionSuperset(
                 release = root["release"] as? String ?: return@runCatching null,
                 kernelMajor = (root["kernel_major"] as? Number)?.toInt(),
@@ -283,6 +290,7 @@ data class OptionSuperset(
                 profile = profile,
                 devices = devices,
                 pipelines = pipelines,
+                pipelineOrder = pipelineOrder,
             )
         }.getOrNull()
 

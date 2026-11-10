@@ -120,11 +120,23 @@ object ProfileResolver {
         }
         /* A KDP image may only take the DirtyFrag second way: the credential
          * forging chain is fatal there, and the legacy ghostlock default (a
-         * missing pipeline) must not run. */
+         * missing pipeline) must not run. The order must be the strict
+         * `["dirtyfrag"]`: an infeasible GhostLock fallback is a defect. */
+        val pipelineOrder = when (val raw = profile["pipeline"]) {
+            is String -> listOf(raw.trim().lowercase()).filter { it.isNotEmpty() }
+            is List<*> -> raw.mapNotNull {
+                (it as? String)?.trim()?.lowercase()?.takeIf(String::isNotEmpty)
+            }
+            else -> emptyList()
+        }
+        val unknownPipelines = pipelineOrder.filter { it !in PipelineNames }
+        if (unknownPipelines.isNotEmpty()) {
+            errors += ConfigError("pipeline", "unknown pipeline ${unknownPipelines.first()}")
+        }
         if ((profile["kdp"] as? Number)?.toLong() == 1L &&
-            (profile["pipeline"] as? String)?.trim()?.lowercase() != "dirtyfrag"
+            ("dirtyfrag" !in pipelineOrder || "ghostlock" in pipelineOrder)
         ) {
-            errors += ConfigError("pipeline", "a KDP image requires the dirtyfrag pipeline")
+            errors += ConfigError("pipeline", "a KDP image requires the strict dirtyfrag pipeline")
         }
         val task = profile["task_struct"] as? Map<*, *>
         if (task == null) {
@@ -373,4 +385,5 @@ object ProfileResolver {
     }
 
     private val RouteNames = RouteKind.entries.map { it.token }
+    private val PipelineNames = setOf("ghostlock", "dirtyfrag")
 }

@@ -80,10 +80,14 @@ struct Cli {
     /// route written to --format conf; defaults to the analysis suggestion
     #[arg(long, value_parser = ["tcp_zerocopy", "select_stack", "multicast_waiter", "sigreturn"])]
     route: Option<String>,
-    /// pipeline written to --format conf; required when both are feasible.
-    /// The extractor only reports feasibility; it never prefers one.
+    /// deprecated single-choice pipeline override; the profile now carries an
+    /// ordered list. Mutually exclusive with --pipeline-order.
     #[arg(long, value_parser = ["ghostlock", "dirtyfrag"])]
     pipeline: Option<String>,
+    /// ordered pipeline preference (`dirtyfrag,ghostlock`), highest first;
+    /// defaults to the derived order (dirtyfrag first when both are feasible)
+    #[arg(long, value_delimiter = ',', value_parser = ["ghostlock", "dirtyfrag"])]
+    pipeline_order: Option<Vec<String>>,
     /// write the per-route feasibility verdicts as JSON (route, verdict,
     /// numbers, chosen route); exit 7 signals ambiguity
     #[arg(long)]
@@ -1054,7 +1058,40 @@ fn run(cli: &Cli) -> Result<i32> {
                 }
             }
         };
-        let pipeline = if let Some(forced) = cli.pipeline.as_deref() {
+        let pipeline_order: Vec<String> = if let Some(order) = cli.pipeline_order.as_deref() {
+            if cli.pipeline.is_some() {
+                eprintln!("error: pass --pipeline or --pipeline-order, not both");
+                return Ok(3);
+            }
+            if order.is_empty() {
+                eprintln!("error: --pipeline-order is empty");
+                return Ok(3);
+            }
+            for name in order {
+                match pipeline_verdicts.iter().find(|entry| entry.pipeline == *name) {
+                    Some(entry) if entry.verdict == "infeasible" => {
+                        eprintln!(
+                            "error: pipeline-order entry {name} is infeasible on this \
+                             kernel: {}",
+                            entry.reason
+                        );
+                        return Ok(3);
+                    }
+                    Some(entry) if entry.verdict == "unknown" => {
+                        eprintln!(
+                            "warning: pipeline-order entry {name} is unverified (unknown): {}",
+                            entry.reason
+                        );
+                    }
+                    Some(_) => {}
+                    None => {
+                        eprintln!("error: unknown pipeline {name}");
+                        return Ok(3);
+                    }
+                }
+            }
+            order.to_vec()
+        } else if let Some(forced) = cli.pipeline.as_deref() {
             match pipeline_verdicts.iter().find(|entry| entry.pipeline == forced) {
                 Some(entry) if entry.verdict == "infeasible" => {
                     eprintln!(
@@ -1068,9 +1105,9 @@ fn run(cli: &Cli) -> Result<i32> {
                         "warning: forced pipeline {forced} is unverified (unknown): {}",
                         entry.reason
                     );
-                    Some(forced.to_string())
+                    vec![forced.to_string()]
                 }
-                Some(_) => Some(forced.to_string()),
+                Some(_) => vec![forced.to_string()],
                 None => {
                     eprintln!("error: unknown pipeline {forced}");
                     return Ok(3);
@@ -1080,39 +1117,22 @@ fn run(cli: &Cli) -> Result<i32> {
             /* The --no-disasm control is a diagnostic pass: the pipeline
              * cannot be measured, and the route/anchor check must still run. */
             eprintln!("warning: --no-disasm: pipeline not measured; the profile omits it");
-            None
+            Vec::new()
         } else {
-            let feasible: Vec<&str> = pipeline_verdicts
-                .iter()
-                .filter(|entry| entry.verdict == "feasible")
-                .map(|entry| entry.pipeline.as_str())
-                .collect();
-            match feasible.as_slice() {
-                [one] => Some((*one).to_string()),
-                [] => {
-                    eprintln!(
-                        "error: no feasible pipeline on this kernel; the profile cannot \
-                         select one"
-                    );
-                    if cli.options_out.is_some() {
-                        ambiguous = true;
-                        None
-                    } else {
-                        return Ok(7);
-                    }
+            let order = pipeline::default_order(&pipeline_verdicts);
+            if order.is_empty() {
+                eprintln!(
+                    "error: no feasible pipeline on this kernel; the profile cannot \
+                     select one"
+                );
+                if cli.options_out.is_some() {
+                    ambiguous = true;
+                    Vec::new()
+                } else {
+                    return Ok(7);
                 }
-                _ => {
-                    eprintln!(
-                        "error: more than one feasible pipeline ({}); pass --pipeline",
-                        feasible.join(", ")
-                    );
-                    if cli.options_out.is_some() {
-                        ambiguous = true;
-                        None
-                    } else {
-                        return Ok(7);
-                    }
-                }
+            } else {
+                order
             }
         };
         if let Some(path) = &cli.feasible_out {
@@ -1601,7 +1621,7 @@ fn run(cli: &Cli) -> Result<i32> {
             phys_source,
             symbols: &symbol_offsets,
             structs: &struct_offsets,
-            pipeline: pipeline.as_deref(),
+            pipeline_order: &pipeline_order,
             kdp: pipeline_facts.kdp,
             route: route.as_deref(),
             route_geometry: &geometry,
@@ -1662,7 +1682,7 @@ fn run(cli: &Cli) -> Result<i32> {
                 phys_source,
                 symbols: &symbol_offsets,
                 structs: &struct_offsets,
-                pipeline: None,
+                pipeline_order: &[],
                 kdp: pipeline_facts.kdp,
                 route: None,
                 route_geometry: &[],
@@ -1685,6 +1705,7 @@ fn run(cli: &Cli) -> Result<i32> {
                 verdicts: &route_verdicts,
                 pipeline_facts: &pipeline_facts,
                 pipelines: &pipeline_verdicts,
+                pipeline_order: &pipeline_order,
                 geometry: &all_geometry,
                 initialized,
                 kernel: &boot.kernel,

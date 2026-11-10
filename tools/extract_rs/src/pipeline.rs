@@ -15,7 +15,9 @@
 //!   page-free routes are a quality flag, not a dependency.
 //!
 //! The facts are recorded in the option superset and the generation log. The
-//! profile carries only the chosen `pipeline`.
+//! extractor derives the default order (`dirtyfrag` first when both are
+//! feasible); the profile carries that order, and the app resolves it at run
+//! time before W1. The order is a policy, not an author prompt.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -206,6 +208,23 @@ pub fn verdicts(facts: &PipelineFacts, routes: &[RouteVerdict]) -> Vec<PipelineO
         )
     };
     vec![ghostlock, dirtyfrag]
+}
+
+/// The default pipeline order: `dirtyfrag` first when both are feasible (the
+/// 2026-11-10 A/B measured it faster), the one feasible pipeline otherwise,
+/// empty when neither is. A documented policy; a profile may carry an
+/// explicit override order.
+pub fn default_order(verdicts: &[PipelineOption]) -> Vec<String> {
+    let feasible: Vec<&str> = verdicts
+        .iter()
+        .filter(|entry| entry.verdict == "feasible")
+        .map(|entry| entry.pipeline.as_str())
+        .collect();
+    ["dirtyfrag", "ghostlock"]
+        .into_iter()
+        .filter(|name| feasible.contains(name))
+        .map(str::to_string)
+        .collect()
 }
 
 /// `CONFIG_KDP=y` or a KDP-only symbol. The symbol wins over a config that
@@ -403,6 +422,22 @@ mod tests {
         assert!(!shared_frag_test_line("orr w8, w8, #0x20"));
         assert!(!shared_frag_test_line("tbnz w8, #6, 0x1000"));
         assert!(!shared_frag_test_line("and w8, w9, #0x21"));
+    }
+
+    #[test]
+    fn default_order_prefers_dirtyfrag_and_lists_only_feasible() {
+        let routes = vec![route("select_stack", Feasibility::Feasible)];
+        let both = verdicts(
+            &facts(Some(false), EspFix::Absent, SendPath::IpAppendPage),
+            &routes,
+        );
+        assert_eq!(default_order(&both), vec!["dirtyfrag", "ghostlock"]);
+        let kdp = verdicts(&facts(Some(true), EspFix::Absent, SendPath::IpAppendPage), &routes);
+        assert_eq!(default_order(&kdp), vec!["dirtyfrag"]);
+        let copy = verdicts(&facts(Some(false), EspFix::Absent, SendPath::Copy), &routes);
+        assert_eq!(default_order(&copy), vec!["ghostlock"]);
+        let fixed = verdicts(&facts(Some(false), EspFix::Present, SendPath::IpAppendPage), &routes);
+        assert_eq!(default_order(&fixed), vec!["ghostlock"]);
     }
 
     #[test]

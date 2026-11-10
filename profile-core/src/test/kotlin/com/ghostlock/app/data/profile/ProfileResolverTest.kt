@@ -8,16 +8,24 @@ import org.junit.Test
 
 class ProfileResolverTest {
     @Test
-    fun `a KDP profile requires the dirtyfrag pipeline`() {
+    fun `a KDP profile requires the strict dirtyfrag order`() {
         fun pipelineErrors(profile: Map<String, Any?>) =
             ProfileResolver.validateMerged(profile, "select_stack", "none")
                 .filter { it.fieldPath == "pipeline" }
 
-        assertTrue(pipelineErrors(valueMapOf("kdp" to 1L, "pipeline" to "ghostlock")).isNotEmpty())
+        assertTrue(
+            pipelineErrors(valueMapOf("kdp" to 1L, "pipeline" to listOf("ghostlock")))
+                .isNotEmpty(),
+        )
+        assertTrue(
+            pipelineErrors(valueMapOf("kdp" to 1L, "pipeline" to listOf("dirtyfrag", "ghostlock")))
+                .isNotEmpty(),
+        )
         assertTrue(pipelineErrors(valueMapOf("kdp" to 1L)).isNotEmpty())
-        assertTrue(pipelineErrors(valueMapOf("kdp" to 1L, "pipeline" to "DIRTYFRAG")).isEmpty())
-        assertTrue(pipelineErrors(valueMapOf("kdp" to 0L, "pipeline" to "ghostlock")).isEmpty())
-        assertTrue(pipelineErrors(valueMapOf("pipeline" to "ghostlock")).isEmpty())
+        assertTrue(pipelineErrors(valueMapOf("kdp" to 1L, "pipeline" to listOf("DIRTYFRAG"))).isEmpty())
+        assertTrue(pipelineErrors(valueMapOf("kdp" to 0L, "pipeline" to listOf("ghostlock"))).isEmpty())
+        assertTrue(pipelineErrors(valueMapOf("pipeline" to listOf("ghostlock"))).isEmpty())
+        assertTrue(pipelineErrors(valueMapOf("pipeline" to listOf("bogus"))).isNotEmpty())
     }
 
     @Test

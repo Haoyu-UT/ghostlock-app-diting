@@ -83,10 +83,6 @@ interface GhostlockRepository {
         /** Selects one route explicitly; null lets the extractor decide and
          * returns [ParseResult.Ambiguous] when more than one is Feasible. */
         route: String? = null,
-        /** The pipeline the profile selects (`ghostlock`/`dirtyfrag`). The
-         * extractor requires it when both are feasible; null lets it decide
-         * and returns [ParseResult.Ambiguous] for the app's pipeline picker. */
-        pipeline: String? = null,
         onLog: (String) -> Unit = {},
     ): ParseResult
 

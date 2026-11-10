@@ -194,14 +194,14 @@ def choose_pipeline(options, meta):
 
 
 def asset_pipeline(path):
-    """The `pipeline = "..."` line of a rendered asset, if present."""
+    """The first entry of the asset's `pipeline` order, if present."""
     try:
         text = open(path, encoding="utf-8").read()
     except OSError:
         return None
-    match = re.search(r'(?m)^\s*pipeline\s*=\s*"([^"]+)"', text) or re.search(
-        r'(?m)^\s*pipeline\s*=\s*([A-Za-z0-9_-]+)', text
-    )
+    match = re.search(r'(?m)^\s*pipeline\s*=\s*\[\s*"([^"]+)"', text) or re.search(
+        r'(?m)^\s*pipeline\s*=\s*"([^"]+)"', text
+    ) or re.search(r'(?m)^\s*pipeline\s*=\s*([A-Za-z0-9_-]+)', text)
     return match.group(1).strip().lower() if match else None
 
 

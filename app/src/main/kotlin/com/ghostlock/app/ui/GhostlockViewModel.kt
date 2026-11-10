@@ -95,10 +95,9 @@ private data class ParseRequest(
     val dtboPath: String? = null,
     val overwrite: Boolean = false,
     val route: String? = null,
-    val pipeline: String? = null,
 )
 
-private enum class ParseDialogStage { Mode, PhysImage, Pipeline, Route, Plan, Lock, Source }
+private enum class ParseDialogStage { Mode, PhysImage, Route, Plan, Lock, Source }
 
 class GhostlockViewModel(
     private val repository: GhostlockRepository,
@@ -136,9 +135,6 @@ class GhostlockViewModel(
     private var pendingRouteChoices: List<RouteVerdict> = emptyList()
     /** The option superset from the ambiguous pass, when the extractor wrote one. */
     private var pendingRouteOptions: OptionSuperset? = null
-    /** The pipeline picker on screen (both pipelines feasible). */
-    private var pendingPipelineParse: ParseRequest? = null
-    private var pendingPipelineChoices: List<OptionPipeline> = emptyList()
     private var pendingLockParse: ParseResult.Parsed? = null
     /** The page-free option offer on screen. */
     private var pendingPlanParse: ParseResult.Parsed? = null
@@ -1487,33 +1483,6 @@ class GhostlockViewModel(
                 }
             }
 
-            ParseDialogStage.Pipeline -> {
-                val parse = pendingPipelineParse
-                val pipeline = pendingPipelineChoices.getOrNull(index)?.pipeline
-                val routes = pendingRouteChoices
-                val options = pendingRouteOptions
-                pendingPipelineParse = null
-                pendingPipelineChoices = emptyList()
-                parseDialogStage = ParseDialogStage.Mode
-                if (parse != null && pipeline != null) {
-                    appendLog("pipeline chosen: $pipeline")
-                    val next = parse.copy(pipeline = pipeline)
-                    if (routes.size > 1) {
-                        showRouteDialog(next, routes, options)
-                    } else {
-                        pendingParse = next
-                        val synthetic = options?.let { options ->
-                            parsedFromOptions(options, routes.singleOrNull()?.route, pipeline)
-                        }
-                        if (synthetic != null) {
-                            viewModelScope.launch(Dispatchers.IO) { advancePhys(synthetic) }
-                        } else {
-                            launchParse()
-                        }
-                    }
-                }
-            }
-
             ParseDialogStage.Route -> {
                 val parse = pendingRouteParse
                 val route = pendingRouteChoices.getOrNull(index)?.route
@@ -1524,15 +1493,11 @@ class GhostlockViewModel(
                 parseDialogStage = ParseDialogStage.Mode
                 if (parse != null && route != null) {
                     appendLog("route chosen: $route")
-                    /* The pipeline is already chosen by now (the picker
-                     * precedes the route picker when both are feasible); a
-                     * single feasible pipeline is the only possible value. */
-                    val pipeline = parse.pipeline ?: options?.feasiblePipelines?.singleOrNull()?.pipeline
-                    appendLog("pipeline: ${pipeline ?: "legacy default"}")
+                    appendLog("pipeline order: ${options?.pipelineOrder?.joinToString(", ") ?: "legacy default"}")
                     /* Keep the sidecar re-run path; when the superset is
                      * present the route choice itself needs no second pass. */
-                    pendingParse = parse.copy(route = route, pipeline = pipeline)
-                    val synthetic = options?.let { parsedFromOptions(it, route, pipeline) }
+                    pendingParse = parse.copy(route = route)
+                    val synthetic = options?.let { parsedFromOptions(it, route) }
                     if (synthetic != null) {
                         viewModelScope.launch(Dispatchers.IO) { advancePhys(synthetic) }
                     } else {
@@ -1646,14 +1611,6 @@ class GhostlockViewModel(
     }
 
     fun onDialogDismiss() {
-        if (parseDialogStage == ParseDialogStage.Pipeline) {
-            pendingPipelineParse = null
-            pendingPipelineChoices = emptyList()
-            pendingRouteChoices = emptyList()
-            pendingRouteOptions = null
-            parseDialogStage = ParseDialogStage.Mode
-            appendLog("result: pipeline choice cancelled")
-        }
         if (parseDialogStage == ParseDialogStage.Route) {
             pendingRouteParse = null
             pendingRouteChoices = emptyList()
@@ -1954,7 +1911,7 @@ class GhostlockViewModel(
                 val result = parseSourceUseCase(
                     request.input, request.xblPath, request.uefiPath,
                     request.vendorBootPath, request.dtboPath,
-                    request.overwrite, request.route, request.pipeline, ::appendLog,
+                    request.overwrite, request.route, ::appendLog,
                 )
             ) {
                 is ParseResult.RequiresOverwrite -> {
@@ -1973,26 +1930,11 @@ class GhostlockViewModel(
                         showNotice(R.string.parse_result_title, R.string.parse_failed)
                     } else {
                         val options = result.options
-                        val pipelines = options?.feasiblePipelines.orEmpty()
-                        if (request.pipeline == null && pipelines.size > 1) {
-                            /* Both pipelines are feasible: the extractor
-                             * requires a choice, and it is the user's (the
-                             * route dialog follows when the route is also
-                             * ambiguous). */
-                            pendingPipelineParse = request
-                            pendingPipelineChoices = pipelines
-                            pendingRouteChoices = feasible
-                            pendingRouteOptions = options
-                            parseDialogStage = ParseDialogStage.Pipeline
-                            showPipelineDialog(pipelines)
-                        } else {
-                            /* A single feasible pipeline is the only choice;
-                             * carry it so the cut writes the selector line. */
-                            val resolved = request.copy(
-                                pipeline = request.pipeline ?: pipelines.singleOrNull()?.pipeline,
-                            )
-                            showRouteDialog(resolved, feasible, options)
-                        }
+                        appendLog(
+                            "result: pipeline order " +
+                                (options?.pipelineOrder?.joinToString(", ") ?: "legacy default"),
+                        )
+                        showRouteDialog(request, feasible, options)
                     }
                 }
 
@@ -2014,25 +1956,8 @@ class GhostlockViewModel(
         }
     }
 
-    /** The pipeline picker: both pipelines are feasible, and the extractor
-     * requires a choice before it writes a profile. */
-    private fun showPipelineDialog(choices: List<OptionPipeline>) {
-        mutableState.update {
-            it.copy(
-                dialogVisible = true,
-                dialogType = DialogType.LIST,
-                dialogTitleRes = R.string.parse_pipeline_title,
-                dialogItems = choices.map { "${it.pipeline} — ${it.reason}" },
-                dialogItemResIds = emptyList(),
-                dialogItemGrades = emptyList(),
-                dialogLeadingResId = null,
-                dialogCurrentItemIndex = -1,
-                /* The picker must be the only overlay on screen; a log sheet
-                 * behind it would swallow its taps. */
-                executionSheetVisible = false,
-            )
-        }
-    }
+    /** The pipeline picker is retired: the extractor derives the order and the
+     * run path resolves it before W1. Kept out of the UI deliberately. */
 
     /** The route picker: every feasible route is derived from the image, and
      * which one runs is a device fact. The labels carry the waiter shape and
@@ -2283,7 +2208,6 @@ class GhostlockViewModel(
     private fun parsedFromOptions(
         options: OptionSuperset,
         route: String?,
-        pipeline: String?,
     ): ParseResult.Parsed? {
         val chosenRoute = route
             ?: options.routes.firstOrNull { it.verdict == OptionSuperset.Feasible }?.route
@@ -2293,7 +2217,7 @@ class GhostlockViewModel(
             is OptionDecision.Auto -> decision.plan
             else -> plans.safeOptions.firstOrNull() ?: plans.anchorOnly ?: plans.page
         }
-        val document = options.cut(chosenRoute, plan, options.device, pipeline) ?: return null
+        val document = options.cut(chosenRoute, plan, options.device) ?: return null
         return ParseResult.Parsed(
             releases = listOf(options.release),
             missing = if (options.physLoad == null) setOf("kernel_phys_load") else emptySet(),

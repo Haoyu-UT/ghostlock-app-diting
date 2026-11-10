@@ -63,6 +63,12 @@ pub struct Superset {
     /// the choice belongs to the profile author, not the extractor.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pipelines: Vec<PipelineOption>,
+    /// The default pipeline order (highest precedence first), derived from
+    /// `pipelines[]` or the operator's `--pipeline-order` override. The cut
+    /// writes it into the profile's `pipeline` list; the app resolves it
+    /// before W1.
+    #[serde(default)]
+    pub pipeline_order: Vec<String>,
     pub candidates: Vec<CandidateOption>,
     pub plans: Vec<RoutePlans>,
     /// The common profile blocks rendered once (route-less). A cut selects a
@@ -232,6 +238,8 @@ pub struct Input<'a> {
     /// The measured pipeline facts and verdicts (recorded, not cut).
     pub pipeline_facts: &'a PipelineFacts,
     pub pipelines: &'a [PipelineOption],
+    /// The order the cut writes into the profile.
+    pub pipeline_order: &'a [String],
     /// Full geometry per feasible route (the cut needs all of them).
     pub geometry: &'a BTreeMap<String, BTreeMap<String, i64>>,
     /// `selinux_state.initialized`; `None` fails the scratch arithmetic closed.
@@ -299,6 +307,7 @@ pub fn build(input: &Input<'_>) -> Superset {
         routes,
         pipeline_facts: input.pipeline_facts.clone(),
         pipelines: input.pipelines.to_vec(),
+        pipeline_order: input.pipeline_order.to_vec(),
         candidates,
         plans,
         devices,
@@ -906,6 +915,7 @@ mod tests {
             }],
             pipeline_facts: PipelineFacts::default(),
             pipelines: Vec::new(),
+            pipeline_order: Vec::new(),
             candidates: Vec::new(),
             plans: vec![RoutePlans {
                 route: "select_stack".to_string(),

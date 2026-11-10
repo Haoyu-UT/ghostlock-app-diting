@@ -78,10 +78,13 @@ internal class AndroidProfileConfigController(
         }
         val route = routeNameOf(full)
         val fallbackTo = fallbackTargetOf(full)
-        val pipeline = (full["pipeline"] as? String)
-            ?.trim()
-            ?.lowercase()
-            ?.takeIf { it.isNotEmpty() }
+        val pipelineOrder = when (val raw = full["pipeline"]) {
+            is String -> listOf(raw.trim().lowercase()).filter { it.isNotEmpty() }
+            is List<*> -> raw.mapNotNull {
+                (it as? String)?.trim()?.lowercase()?.takeIf(String::isNotEmpty)
+            }
+            else -> emptyList()
+        }
         val invalidPaths = validateProfileFields(full, route, fallbackTo) +
             ProfileResolver.validateMerged(full, route, fallbackTo)
                 .mapTo(mutableSetOf()) { it.fieldPath }
@@ -124,7 +127,7 @@ internal class AndroidProfileConfigController(
             general = generalFields(full, baseline, route, fallbackTo),
             route = route,
             fallbackTo = fallbackTo,
-            pipeline = pipeline,
+            pipelineOrder = pipelineOrder,
             invalidPaths = invalidPaths,
         )
     }

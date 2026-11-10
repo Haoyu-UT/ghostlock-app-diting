@@ -389,9 +389,9 @@ pub struct ConfInputs<'a> {
     pub phys_source: &'a str,
     pub symbols: &'a BTreeMap<String, Option<u64>>,
     pub structs: &'a BTreeMap<String, Option<u32>>,
-    /// The profile's pipeline selection. Omitted for the route-less common
-    /// profile: the superset carries the measured verdicts instead.
-    pub pipeline: Option<&'a str>,
+    /// The ordered pipeline preference written into the profile. Omitted for
+    /// the route-less common profile: the superset carries the order instead.
+    pub pipeline_order: &'a [String],
     /// The KDP fact. `Some(true)` emits `kdp = 1`; the app's KDP guard pairs
     /// it with an explicit pipeline, and a non-KDP profile is unchanged.
     pub kdp: Option<bool>,
@@ -529,8 +529,14 @@ pub fn render_conf_with_device(input: &ConfInputs<'_>, device: Option<&str>) -> 
         fact_sources.insert(0, format!("device={name}"));
     }
     lines.insert(1, format!("# fact_sources: {}", fact_sources.join("; ")));
-    if let Some(pipeline) = input.pipeline {
-        lines.push(format!("pipeline = \"{pipeline}\""));
+    if !input.pipeline_order.is_empty() {
+        let list = input
+            .pipeline_order
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("pipeline = [ {list} ]"));
     }
     /* Decimal only: HOCON has no `0x` literal, and the Kotlin reader
      * (`getLongAt`) accepts a Number only, so a hex spelling would be silently
@@ -792,7 +798,7 @@ mod tests {
         let (symbols, structs) = conf_fixture();
         let geometry: Vec<(&'static str, i64)> = vec![("waiter_shift", -2)];
         let inputs = ConfInputs {
-            pipeline: None,
+            pipeline_order: &[],
             kdp: None,
             release: "5.10.198-android12-9-00085-g226a9632f13d-ab11136126",
             phys: Some(0x4000_0000),
@@ -823,7 +829,7 @@ mod tests {
         let (symbols, structs) = conf_fixture();
         let geometry: Vec<(&'static str, i64)> = vec![("waiter_shift", -2)];
         let out = render_conf(&ConfInputs {
-            pipeline: None,
+            pipeline_order: &[],
             kdp: None,
             release: "6.6.89-android15-8-g0889fe95bb10-ab14402178-4k",
             phys: Some(0x4000_0000),
@@ -866,7 +872,7 @@ mod tests {
         let (symbols, structs) = conf_fixture();
         let geometry: Vec<(&'static str, i64)> = vec![("compact_waiter", 1)];
         let out = render_conf(&ConfInputs {
-            pipeline: None,
+            pipeline_order: &[],
             kdp: None,
             release: "6.1.118-android14-11-gca0ef6d17716-ab13624819",
             phys: None,
@@ -950,7 +956,7 @@ mod tests {
             ),
         };
         let out = render_conf(&ConfInputs {
-            pipeline: None,
+            pipeline_order: &[],
             kdp: None,
             release: "6.6.89-android15-8-g0889fe95bb10-ab14402178-4k",
             phys: None,
@@ -1043,7 +1049,7 @@ mod tests {
             ),
         };
         let out = render_conf(&ConfInputs {
-            pipeline: None,
+            pipeline_order: &[],
             kdp: None,
             release: "6.1.25-android14-11-g8744d1c0cf31-ab10888519",
             phys: None,
@@ -1098,7 +1104,7 @@ mod tests {
             refs: vec![(0x80, 0xffffffc00ab23a80)],
         };
         let out = render_conf(&ConfInputs {
-            pipeline: None,
+            pipeline_order: &[],
             kdp: None,
             release: "5.15.189-android13-8-00016-g51bba4309aac-ab14546557",
             phys: None,
@@ -1128,7 +1134,7 @@ mod tests {
     fn operator_physical_override_is_in_the_fact_sources_header() {
         let (symbols, structs) = conf_fixture();
         let out = render_conf(&ConfInputs {
-            pipeline: None,
+            pipeline_order: &[],
             kdp: None,
             release: "6.6.89-android15-8-g0889fe95bb10-ab14402178-4k",
             phys: Some(0xa800_0000),
@@ -1172,7 +1178,7 @@ mod tests {
         ]);
         let geometry = conf_multicast_route_geometry(&numbers, &structs);
         let out = render_conf(&ConfInputs {
-            pipeline: None,
+            pipeline_order: &[],
             kdp: None,
             release: "5.15.189-android13-8-00016-g51bba4309aac-ab14546557",
             phys: None,
@@ -1369,7 +1375,7 @@ mod tests {
         let symbols: BTreeMap<String, Option<u64>> = BTreeMap::new();
         let structs: BTreeMap<String, Option<u32>> = BTreeMap::new();
         let out = render_conf(&ConfInputs {
-            pipeline: None,
+            pipeline_order: &[],
             kdp: None,
             release: "5.15.178-g3575c47dc7ce-dirty",
             phys: None,
@@ -1397,7 +1403,7 @@ mod tests {
     fn unverified_release_omits_kernelsnitch_defaults() {
         let (symbols, structs) = conf_fixture();
         let out = render_conf(&ConfInputs {
-            pipeline: None,
+            pipeline_order: &[],
             kdp: None,
             release: "6.7.1-generic",
             phys: None,
@@ -1434,7 +1440,7 @@ mod tests {
         ]);
         let geometry = conf_multicast_route_geometry(&numbers, &structs);
         let out = render_conf(&ConfInputs {
-            pipeline: None,
+            pipeline_order: &[],
             kdp: None,
             release: "5.15.178-g3575c47dc7ce-dirty",
             phys: None,
@@ -1611,7 +1617,7 @@ mod tests {
         ]);
         let geometry = conf_multicast_route_geometry(&numbers, &structs);
         let generated = render_conf(&ConfInputs {
-            pipeline: None,
+            pipeline_order: &[],
             kdp: None,
             release: &release,
             phys: None,
