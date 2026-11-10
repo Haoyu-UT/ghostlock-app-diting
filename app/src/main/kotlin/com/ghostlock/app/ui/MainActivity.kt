@@ -1,9 +1,11 @@
 package com.ghostlock.app.ui
 
+import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.DocumentsContract
 import android.view.WindowInsetsController
@@ -58,6 +60,13 @@ class MainActivity : ComponentActivity() {
             viewModel.onExportProfileDocumentPicked(uri?.toString())
         }
 
+    /* The run-status notification is the run's visible proof and the reason the
+     * app keeps running when the KSU manager takes the foreground. */
+    private val notificationPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            viewModel.onNotificationPermissionResult(granted)
+        }
+
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -109,6 +118,21 @@ class MainActivity : ComponentActivity() {
             GhostlockEffect.OpenShizuku -> packageManager
                 .getLaunchIntentForPackage(SHIZUKU_PACKAGE)
                 ?.let(::startActivity)
+
+            GhostlockEffect.RequestNotificationPermission -> if (Build.VERSION.SDK_INT >=
+                Build.VERSION_CODES.TIRAMISU
+            ) {
+                notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+
+            is GhostlockEffect.OpenManager -> {
+                val launch = packageManager.getLaunchIntentForPackage(effect.packageName)
+                if (launch != null) {
+                    startActivity(launch)
+                } else {
+                    Toast.makeText(this, R.string.run_notif_manager_missing, Toast.LENGTH_SHORT).show()
+                }
+            }
         }
     }
 
@@ -181,6 +205,7 @@ private fun GhostlockRoute(
 
             override fun onShizukuChanged(enabled: Boolean) = viewModel.toggleShizuku(enabled)
             override fun onOpenManagerPicker() = viewModel.onOpenManagerPicker()
+            override fun onOpenManager() = viewModel.onOpenManager()
             override fun onDialogItemSelected(index: Int) = viewModel.onDialogItemSelected(index)
             override fun onDialogInputChange(value: String) = viewModel.onDialogInputChange(value)
             override fun onDialogConfirm(value: String) = viewModel.onDialogConfirm(value)

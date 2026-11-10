@@ -63,6 +63,7 @@
     <string name="parse_missing_phys_mediatek">缺少 kernel_phys_load / kernel_phys_offset。联发科镜像没有 xbl_config 或 BTF，提取器无法仅从 boot.img 推导，运行时回退会在 W1 失败。最简单的办法：重新解析并附加 vendor_boot.img。如果被拒绝（对齐模式无法识别），请改为在已 root 的设备上运行单独的 tools/mtk-phys 提取器，再把两个值填入高级参数覆盖。</string>
     <string name="parse_result_title">解析结果</string>
     <string name="parse_route_title">多条路线均可用，请选择一条</string>
+    <string name="parse_pipeline_title">两条管线均可用，请选择一条</string>
     <string name="parse_lock_title">锁来源 — 请选择</string>
     <string name="parse_lock_page">页面 — 锁在回收页中；不会选错内核对象，成功率较低</string>
     <string name="parse_lock_anchor">锚点 — 使用镜像中的零 .bss 区域；区域正确时成功率更高，选错会破坏内核数据</string>
@@ -404,4 +405,22 @@
     <string name="preflight_anchor_grid">锚点状态文件与当前配置的槽位网格不一致。请重启手机后再运行。</string>
     <string name="preflight_cpu_title">CPU 组合不可用</string>
     <string name="preflight_cpu_message">所选 CPU 组合当前不可用（系统可能暂停了该核心）。请换一组 CPU，或重启手机后再试。</string>
+    <!-- 运行状态通知：前台服务让攻击进程在 KernelSU 管理器切到前台时不被冻结。 -->
+    <string name="run_notif_channel_name">运行状态</string>
+    <string name="run_notif_channel_description">攻击进度与结果</string>
+    <string name="run_notif_running_title">GhostLock 正在运行</string>
+    <string name="run_notif_running_text">攻击进行中。请保持应用在前台；KernelSU 管理器可能会切到前台。</string>
+    <string name="run_notif_success_title">Root 已就绪</string>
+    <string name="run_notif_success_text_ghostlock">KernelSU 已加载，SELinux 已恢复。</string>
+    <string name="run_notif_success_text_dirtyfrag">已获得 root shell，页缓存已恢复。</string>
+    <string name="run_notif_failure_title">运行结束</string>
+    <string name="run_notif_failure_text">未获得 root。打开应用查看日志。</string>
+    <string name="run_notif_permission_title">允许发送通知？</string>
+    <string name="run_notif_permission_message">GhostLock 用一条通知显示运行状态，并在其他应用（例如 KernelSU 管理器）切到前台时保持攻击进程继续运行。拒绝后运行仍可继续，但状态只能在应用内查看。</string>
+    <string name="run_notif_permission_allow">允许</string>
+    <string name="run_notif_permission_later">暂不</string>
+    <string name="run_status_root_active">Root 已就绪</string>
+    <string name="run_status_failed">未获得 root</string>
+    <string name="run_notif_open_manager">打开 KernelSU 管理器</string>
+    <string name="run_notif_manager_missing">未找到 KernelSU 管理器，或它没有启动界面。</string>
 </resources>

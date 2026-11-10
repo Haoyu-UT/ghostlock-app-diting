@@ -31,6 +31,11 @@ class OptionSupersetTest {
               "reason": "cap 0x40", "anchor_capable": false, "geometry": { "compact_waiter": 1 } }
           ],
           "candidates": [],
+          "pipelines": [
+            { "pipeline": "ghostlock", "verdict": "feasible", "reason": "KDP is not enabled" },
+            { "pipeline": "dirtyfrag", "verdict": "feasible",
+              "reason": "the ESP fix is absent; send path ip_append_page" }
+          ],
           "plans": [
             { "route": "select_stack",
               "page": { "route": "select_stack", "anchor": null, "scratch": null,
@@ -124,6 +129,20 @@ class OptionSupersetTest {
 
         val none = plans.copy(pageFree = emptyList())
         assertTrue(none.decision() is OptionDecision.NoPageFree)
+    }
+
+    @Test
+    fun `both feasible pipelines are exposed and the cut carries the chosen one`() {
+        val superset = requireNotNull(OptionSuperset.parse(sample))
+        val feasible = superset.feasiblePipelines
+        assertEquals(listOf("ghostlock", "dirtyfrag"), feasible.map { it.pipeline })
+        val plan = superset.plansFor("select_stack")!!.safeOptions[0]
+        val chosen = requireNotNull(superset.cut("select_stack", plan, pipeline = "dirtyfrag"))
+        assertTrue(chosen.contains("pipeline = \"dirtyfrag\""))
+        /* A cut with no pipeline keeps the legacy reading (none); the parse
+         * flow always passes the chosen one. */
+        val legacy = requireNotNull(superset.cut("select_stack", plan))
+        assertFalse(legacy.contains("pipeline ="))
     }
 
     @Test

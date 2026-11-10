@@ -63,6 +63,7 @@
     <string name="parse_missing_phys_mediatek">Missing kernel_phys_load / kernel_phys_offset. MediaTek images carry no xbl_config or BTF, so the extractor cannot derive them from boot.img alone and the runtime fallback fails at W1. Easiest fix: parse again and attach vendor_boot.img. If that is refused (an unrecognized alignment pattern), run the separate tools/mtk-phys extractor on a rooted device instead, then set both in advanced overrides.</string>
     <string name="parse_result_title">Extraction result</string>
     <string name="parse_route_title">Multiple routes are available — choose one</string>
+    <string name="parse_pipeline_title">Both pipelines are feasible — choose one</string>
     <string name="parse_lock_title">Lock source — choose one</string>
     <string name="parse_lock_page">Page — the lock lives in the reclaimed payload page; it cannot pick a wrong kernel object, lower success rate</string>
     <string name="parse_lock_anchor">Anchor — use the image\'s zeroed .bss region; higher success if the region is correct, a wrong region can corrupt kernel data</string>
@@ -404,4 +405,23 @@
     <string name="preflight_anchor_grid">The anchor state file does not match this profile\'s slot grid. Reboot the phone, then run.</string>
     <string name="preflight_cpu_title">CPU pair unavailable</string>
     <string name="preflight_cpu_message">The selected CPU pair is currently unavailable (the system may have paused one of its cores). Choose another pair, or reboot and try again.</string>
+    <!-- Run-status notification: the foreground service keeps the attack out of
+         the cached (freezable) state while the KernelSU manager is in front. -->
+    <string name="run_notif_channel_name">Run status</string>
+    <string name="run_notif_channel_description">Attack progress and result</string>
+    <string name="run_notif_running_title">GhostLock is running</string>
+    <string name="run_notif_running_text">Attack in progress. Keep the app open; the KernelSU manager may come to the front.</string>
+    <string name="run_notif_success_title">Root active</string>
+    <string name="run_notif_success_text_ghostlock">KernelSU loaded and SELinux restored.</string>
+    <string name="run_notif_success_text_dirtyfrag">Root shell obtained; page cache restored.</string>
+    <string name="run_notif_failure_title">Run finished</string>
+    <string name="run_notif_failure_text">Root was not obtained. Open the app for the log.</string>
+    <string name="run_notif_permission_title">Allow notifications?</string>
+    <string name="run_notif_permission_message">GhostLock shows the run status in a notification, and keeps the attack running when another app (such as the KernelSU manager) comes to the front. Without this permission the run still works, but its status is only visible inside the app.</string>
+    <string name="run_notif_permission_allow">Allow</string>
+    <string name="run_notif_permission_later">Not now</string>
+    <string name="run_status_root_active">Root active</string>
+    <string name="run_status_failed">Root not obtained</string>
+    <string name="run_notif_open_manager">Open KernelSU manager</string>
+    <string name="run_notif_manager_missing">KernelSU manager is not installed or has no launch screen.</string>
 </resources>

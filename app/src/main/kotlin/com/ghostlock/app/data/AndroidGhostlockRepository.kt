@@ -386,6 +386,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         dtboPath: String?,
         overwrite: Boolean,
         route: String?,
+        pipeline: String?,
         onLog: (String) -> Unit,
     ): ParseResult {
         val parsedFile = File(filesDir, "offsets_parse.tmp")
@@ -480,6 +481,10 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 if (route != null) {
                     add("--route")
                     add(route)
+                }
+                if (pipeline != null) {
+                    add("--pipeline")
+                    add(pipeline)
                 }
             }
             val captured = mutableListOf<String>()
