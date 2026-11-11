@@ -206,6 +206,7 @@ namespace ghostlock::route {
 
 #if defined(__ANDROID__)
 #include "race/threads.hpp"
+#include "route/route_middleware.hpp"
 #include "route/route_policy.hpp"
 
 namespace ghostlock::route {
@@ -259,7 +260,11 @@ namespace ghostlock::route {
             pr_info("W2b: firing prebuilt init_cred+8 repair\n");
         }
         exploit_session.race.fast_repair.store(1);
-        const Status repaired = race::run_main_route_threads(repair_request);
+        /* The repair is a write like any other and must take the same route
+         * dispatch as W1/W2: a compat-carrier profile has no 64-bit multicast
+         * geometry, so the direct race call this replaces refused it. */
+        const Status repaired =
+                route::middleware::run_middleware_route(exploit_session, repair_request);
         exploit_session.race.fast_repair.store(0);
         if (!repaired) {
             pr_warning("W2 fast repair route failed\n");

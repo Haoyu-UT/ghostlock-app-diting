@@ -339,16 +339,18 @@ namespace {
         const long wait_ret = futex_op(command, &engine->wait_futex,
                                        FUTEX_WAIT_REQUEUE_PI, 0, wait_timeout,
                                        &engine->target_futex, 0);
-        log_value("compat-engine: waiter futex ret", wait_ret);
-        log_value("compat-engine: waiter futex errno", errno);
-        log_line("compat-engine: waiter woke; entering the route park");
+        const int32_t wait_errno = errno;
         int32_t route_fd = -1;
         if (command.mode == static_cast<uint32_t>(ghostlock::compat::CarrierMode::Multicast)) {
             /* The compat MCAST_BLOCK_SOURCE copy: the waiter's only syscall
              * between the futex return and the consumer's walk. The kernel's
              * is_compat_task() branch copies command.stamp over the stale
              * waiter; the walk is triggered after the copy, as the 64-bit
-             * multicast route does. */
+             * multicast route does. The diagnostics are deferred as well: the
+             * timed-out futex leaves the kernel's pi_blocked_on pointing at the
+             * waiter on this stack, so even a log write in this window is a
+             * reuse the walk can see (2026-11-12 the device's deaths clustered
+             * on these lines). They are logged after the drain. */
             errno = 0;
             route_fd = static_cast<int32_t>(
                 syscall(__NR_socket, AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0));
@@ -375,6 +377,8 @@ namespace {
                 engine->route_errno = errno;
             }
         } else {
+            log_value("compat-engine: waiter futex ret", wait_ret);
+            log_value("compat-engine: waiter futex errno", wait_errno);
             log_line("compat-engine: waiter woke; entering _newselect");
             engine->consumer_go.store(1);
             struct timeval tv {};
@@ -392,7 +396,12 @@ namespace {
         }
         engine->drain_ms = wait_consumer_idle(engine, kDrainMs);
         if (command.mode == static_cast<uint32_t>(ghostlock::compat::CarrierMode::Multicast)) {
-            /* The walk is over; the waiter may syscall again. */
+            /* The walk is over; the waiter may syscall again. These are the
+             * multicast path's deferred diagnostics (see the note before the
+             * socket call). */
+            log_value("compat-engine: waiter futex ret", wait_ret);
+            log_value("compat-engine: waiter futex errno", wait_errno);
+            log_line("compat-engine: waiter woke; entering the route park");
             log_value("compat-engine: setsockopt ret", engine->route_result);
             log_value("compat-engine: setsockopt errno", engine->route_errno);
             if (route_fd >= 0) (void) close(route_fd);

