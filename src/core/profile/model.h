@@ -159,6 +159,18 @@ namespace ghostlock::profile {
         std::optional<uint32_t> mcast_buffer_size;
         std::optional<uint32_t> mcast_task_offset;
         std::optional<uint32_t> mcast_lock_offset;
+        /* Compat (AArch32) multicast carrier: when the 64-bit
+         * `group_source_req` copy cannot reach the waiter, the route runs in
+         * the armv7 helper whose `is_compat_task()` branch copies the 32-bit
+         * struct to a different stack local. `compat_waiter_off` is the
+         * derived strip offset inside that copy, `compat_buffer_size` the
+         * compat struct size and `compat_futex_abi` 0/time32-1/time64.
+         * Absent `compat_carrier` (or 0) keeps the 64-bit route.
+         * See docs/analysis/compat-multicast-carrier-plan.md. */
+        std::optional<uint8_t> mcast_compat_carrier;
+        std::optional<int32_t> mcast_compat_waiter_off;
+        std::optional<uint32_t> mcast_compat_buffer_size;
+        std::optional<uint8_t> mcast_compat_futex_abi;
         /* Image-relative offset of a zero, writable, reference-free region used
          * as the walk's fake rt_mutex instead of the reclaimed page. Absent =>
          * the reclaimed page is used, i.e. the previous behaviour.
@@ -234,6 +246,12 @@ namespace ghostlock::profile {
     struct MulticastWaiterLayout {
         std::optional<int32_t> waiter_offset;
         std::optional<uint32_t> buffer_size, task_offset, lock_offset;
+        /* The AArch32 compat variant (docs/analysis/compat-multicast-carrier-plan.md):
+         * the armv7 helper's `MCAST_BLOCK_SOURCE` copy carries the strip. */
+        std::optional<uint8_t> compat_carrier;
+        std::optional<int32_t> compat_waiter_off;
+        std::optional<uint32_t> compat_buffer_size;
+        std::optional<uint8_t> compat_futex_abi;
         /* The same anchor keys the other routes carry. The lock word is
          * route-independent, and a document never merges another route's
          * section, so this route's own section has to be able to state it.
@@ -544,6 +562,10 @@ namespace ghostlock::profile {
                            .buffer_size = values_.geometry.mcast_buffer_size,
                            .task_offset = values_.geometry.mcast_task_offset,
                            .lock_offset = values_.geometry.mcast_lock_offset,
+                           .compat_carrier = values_.geometry.mcast_compat_carrier,
+                           .compat_waiter_off = values_.geometry.mcast_compat_waiter_off,
+                           .compat_buffer_size = values_.geometry.mcast_compat_buffer_size,
+                           .compat_futex_abi = values_.geometry.mcast_compat_futex_abi,
                            /* One shared anchor storage for every route (the
                             * sigreturn route already reuses these fields);
                             * only the transport section differs. */

@@ -225,6 +225,14 @@ namespace ghostlock::binary_profile {
             OPT("buffer_size", geometry.mcast_buffer_size),
             OPT("task_offset", geometry.mcast_task_offset),
             OPT("lock_offset", geometry.mcast_lock_offset),
+            /* The AArch32 compat variant: the armv7 helper's
+             * MCAST_BLOCK_SOURCE copy carries the strip
+             * (docs/analysis/compat-multicast-carrier-plan.md). Absent/0 keeps
+             * the 64-bit route. */
+            OPT("compat_carrier", geometry.mcast_compat_carrier),
+            OPT("compat_waiter_off", geometry.mcast_compat_waiter_off),
+            OPT("compat_buffer_size", geometry.mcast_compat_buffer_size),
+            OPT("compat_futex_abi", geometry.mcast_compat_futex_abi),
             /* The anchor trio is stated by this route's own section, for the
              * same reason as the sigreturn route's below: the decoder never
              * merges across routes. Optional, and absence keeps the

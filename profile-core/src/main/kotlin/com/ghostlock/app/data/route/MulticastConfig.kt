@@ -16,12 +16,16 @@ data class MulticastConfig(
         geometry.bufferSize?.let { add("buffer_size" to it.toULong()) }
         geometry.taskOffset?.let { add("task_offset" to it.toULong()) }
         geometry.lockOffset?.let { add("lock_offset" to it.toULong()) }
+        geometry.compatCarrier?.let { add("compat_carrier" to it.toULong()) }
+        geometry.compatWaiterOff?.let { add("compat_waiter_off" to it.toLong().toULong()) }
+        geometry.compatBufferSize?.let { add("compat_buffer_size" to it.toULong()) }
+        geometry.compatFutexAbi?.let { add("compat_futex_abi" to it.toULong()) }
         geometry.lockAnchorImage?.let { add("lock_anchor_image" to it) }
         geometry.lockAnchorBytes?.let { add("lock_anchor_bytes" to it) }
         geometry.lockAnchorStride?.let { add("lock_anchor_stride" to it) }
     }
 
-    /** Mirrors native `kRouteMulticast`; all seven are optional. */
+    /** Mirrors native `kRouteMulticast`; all eleven are optional. */
     override fun keys(): List<String> = SchemaKeys
 
     override fun apply(key: String, value: ULong): RouteConfig = when (key) {
@@ -29,6 +33,10 @@ data class MulticastConfig(
         "buffer_size" -> copy(geometry = geometry.copy(bufferSize = value.toUInt()))
         "task_offset" -> copy(geometry = geometry.copy(taskOffset = value.toUInt()))
         "lock_offset" -> copy(geometry = geometry.copy(lockOffset = value.toUInt()))
+        "compat_carrier" -> copy(geometry = geometry.copy(compatCarrier = value.toUByte()))
+        "compat_waiter_off" -> copy(geometry = geometry.copy(compatWaiterOff = value.toLong().toInt()))
+        "compat_buffer_size" -> copy(geometry = geometry.copy(compatBufferSize = value.toUInt()))
+        "compat_futex_abi" -> copy(geometry = geometry.copy(compatFutexAbi = value.toUByte()))
         "lock_anchor_image" -> copy(geometry = geometry.copy(lockAnchorImage = value))
         "lock_anchor_bytes" -> copy(geometry = geometry.copy(lockAnchorBytes = value))
         "lock_anchor_stride" -> copy(geometry = geometry.copy(lockAnchorStride = value))
@@ -38,6 +46,7 @@ data class MulticastConfig(
     companion object {
         private val SchemaKeys = listOf(
             "waiter_off", "buffer_size", "task_offset", "lock_offset",
+            "compat_carrier", "compat_waiter_off", "compat_buffer_size", "compat_futex_abi",
             "lock_anchor_image", "lock_anchor_bytes", "lock_anchor_stride",
         )
 
@@ -51,6 +60,10 @@ data class MulticastConfig(
                 bufferSize = value("mcast.buffer_size")?.toUInt(),
                 taskOffset = value("mcast.task_offset")?.toUInt(),
                 lockOffset = value("mcast.lock_offset")?.toUInt(),
+                compatCarrier = value("mcast.compat_carrier")?.toUByte(),
+                compatWaiterOff = value("mcast.compat_waiter_off")?.toInt(),
+                compatBufferSize = value("mcast.compat_buffer_size")?.toUInt(),
+                compatFutexAbi = value("mcast.compat_futex_abi")?.toUByte(),
                 /* Branch-relative, like the select route's anchor keys:
                  * `ProfileResolver.nativeValue` maps these onto
                  * `route.multicast_waiter.*` (and the fallback branch). */
@@ -68,6 +81,18 @@ data class MulticastGeometry(
     val bufferSize: UInt?,
     val taskOffset: UInt?,
     val lockOffset: UInt?,
+    /**
+     * The AArch32 compat variant (docs/analysis/compat-multicast-carrier-plan.md):
+     * when the 64-bit `group_source_req` copy cannot reach the waiter, the
+     * armv7 helper's `MCAST_BLOCK_SOURCE` copy carries the strip.
+     * `compatWaiterOff` is the derived strip offset inside the compat copy,
+     * `compatBufferSize` the compat struct size, `compatFutexAbi` 0/time32,
+     * 1/time64. Absent `compatCarrier` (or 0) keeps the 64-bit route.
+     */
+    val compatCarrier: UByte? = null,
+    val compatWaiterOff: Int? = null,
+    val compatBufferSize: UInt? = null,
+    val compatFutexAbi: UByte? = null,
     /**
      * Image-relative offset of a zero, writable, reference-free kernel region
      * used as the walk's fake `rt_mutex` instead of the reclaimed payload page.
