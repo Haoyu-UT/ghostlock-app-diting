@@ -533,6 +533,23 @@ fn sigreturn_verdict(
             );
         }
     };
+    /* The route's stamp is the eleven-word compact waiter strip. A 6.6+
+     * rt_waiter_node waiter is a different object; a feasible geometry there
+     * would emit a block the native cannot run, so refuse and name the shape
+     * (the same guard the route, the native profile load and the app carry). */
+    if let Some(btf) = btf {
+        match crate::layout::waiter_is_compact(btf) {
+            Some(true) => {}
+            Some(false) => {
+                return unknown_verdict(
+                    "sigreturn",
+                    "the 6.6+ rt_waiter_node waiter shape is not representable by the \
+                     sigreturn route's eleven-word compact stamp",
+                );
+            }
+            None => return unknown_verdict("sigreturn", "BTF names no rt_mutex_waiter shape"),
+        }
+    }
     match derive_sigreturn_layout(
         kernel,
         rel_symbols,
@@ -611,6 +628,28 @@ fn multicast_verdict(
             return unknown_verdict(
                 "multicast_waiter",
                 "BTF rt_mutex_waiter task/lock missing",
+            );
+        }
+    };
+    /* The route stamps the 5.x compact eleven-word strip. A 6.6+ image's
+     * `rt_waiter_node` shape is a different object; a feasible geometry there
+     * would emit a block the native cannot run, so the verdict refuses and
+     * names the shape (the block is emitted only from a feasible verdict). */
+    let waiter_compact = match btf {
+        Some(btf) => match crate::layout::waiter_is_compact(btf) {
+            Some(compact) => compact,
+            None => {
+                return unknown_verdict(
+                    "multicast_waiter",
+                    "BTF names no rt_mutex_waiter shape",
+                );
+            }
+        },
+        None if waiter_template_5_10 => true,
+        None => {
+            return unknown_verdict(
+                "multicast_waiter",
+                "no BTF and no 5.10 waiter template for this image",
             );
         }
     };
@@ -701,6 +740,16 @@ fn multicast_verdict(
             }
             Err(err) => errors.push(err.to_string()),
         }
+    }
+    if !waiter_compact && !feasible.is_empty() {
+        /* A feasible copy window (below) would emit the route block, but the
+         * route's stamp is the 5.x compact eleven-word strip. Refuse, naming
+         * the shape; an infeasible window keeps its own geometry verdict. */
+        return unknown_verdict(
+            "multicast_waiter",
+            "the 6.6+ rt_waiter_node waiter shape is not representable by the \
+             multicast route's eleven-word compact stamp",
+        );
     }
     if feasible.len() == 1 {
         let (copy_fn, size, geometry) = feasible.remove(0);

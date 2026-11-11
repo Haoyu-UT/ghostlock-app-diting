@@ -449,6 +449,35 @@ namespace ghostlock::profile {
             return values_.misc.compact_waiter.value_or(0) != 0;
         }
 
+        /* Whether the device's `rt_mutex_waiter` is the compact 5.x-6.1 shape,
+         * the one the multicast and sigreturn routes stamp as an eleven-word
+         * strip. The per-image `waiter_layout.compact` is authoritative; the
+         * release family is the fallback for profiles that predate it (5.x and
+         * 6.1 compact, 6.6+ the `rt_waiter_node` shape). The legacy
+         * `compact_waiter` flag is route-specific and is deliberately not
+         * consulted. A profile that states neither is non-compact, so the
+         * route guard fails closed. */
+        [[nodiscard]] bool waiter_is_compact() const noexcept {
+            if (!loaded_) return false;
+            if (values_.waiter.compact.has_value()) {
+                return *values_.waiter.compact != 0;
+            }
+            unsigned major = 0;
+            unsigned minor = 0;
+            const char *p = release();
+            while (*p >= '0' && *p <= '9') {
+                major = major * 10U + static_cast<unsigned>(*p - '0');
+                p++;
+            }
+            if (major == 0 || *p != '.') return false;
+            p++;
+            while (*p >= '0' && *p <= '9') {
+                minor = minor * 10U + static_cast<unsigned>(*p - '0');
+                p++;
+            }
+            return major == 5U || (major == 6U && minor == 1U);
+        }
+
         [[nodiscard]] std::optional<uint8_t> cred_usage_size() const noexcept {
             return loaded_ ? values_.credential.usage_size : std::nullopt;
         }

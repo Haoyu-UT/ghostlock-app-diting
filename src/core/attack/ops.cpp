@@ -96,6 +96,28 @@ namespace ghostlock::attack {
         /* PROFILE-SUGGEST-01: execution tuning arrives fully merged from Kotlin;
          * the native side only consumes the resolved values. */
         session::g_exploit_session.profile = profile::TargetProfile::from(&decoded);
+        /* The multicast and sigreturn routes stamp the compact eleven-word
+         * `rt_mutex_waiter` strip. A 6.6+ image's `rt_waiter_node` shape is a
+         * different object (handing the walk `pi_tree.rb_left` as `lock`), so
+         * a profile that selects either on such a device is refused here --
+         * the extractor already refuses to emit one. This is the runtime guard
+         * for a hand-edited or imported document. */
+        const auto route = session::g_exploit_session.profile.route();
+        const auto fallback = session::g_exploit_session.profile.fallback_route();
+        const auto guarded = [](profile::RouteKind kind) {
+            return kind == profile::RouteKind::MulticastWaiter ||
+                   kind == profile::RouteKind::Sigreturn;
+        };
+        if ((guarded(route) || guarded(fallback)) &&
+            !session::g_exploit_session.profile.waiter_is_compact()) {
+            const auto offending = guarded(route) ? route : fallback;
+            pr_error("profile route %s needs the compact rt_mutex_waiter strip; "
+                     "this profile's waiter is the 6.6+ rt_waiter_node shape\n",
+                     offending == profile::RouteKind::MulticastWaiter
+                             ? "multicast_waiter"
+                             : "sigreturn");
+            throw FatalError{};
+        }
         pr_success("resolved profile loaded: %s\n",
                    session::g_exploit_session.profile.release());
         if (config::runtime_config_snapshot().apply_profile(&session::g_exploit_session.profile) != 0)

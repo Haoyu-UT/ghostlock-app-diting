@@ -331,6 +331,34 @@ class ProfileResolverTest {
         return profile
     }
 
+    @Test
+    fun `multicast and sigreturn routes need the compact waiter shape`() {
+        fun shapeErrors(profile: Map<String, Any?>, route: String) =
+            ProfileResolver.validateMerged(profile, route, "none").filter {
+                it.fieldPath == "route.$route" && it.message.contains("rt_waiter_node")
+            }
+
+        val compact = validProfile() + mapOf(
+            "release" to "5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284",
+        )
+        assertTrue(shapeErrors(compact, "multicast_waiter").isEmpty())
+        assertTrue(shapeErrors(compact, "sigreturn").isEmpty())
+
+        val explicitNonCompact = compact + mapOf(
+            "waiter_layout" to valueMapOf("compact" to 0),
+        )
+        assertTrue(shapeErrors(explicitNonCompact, "multicast_waiter").isNotEmpty())
+        assertTrue(shapeErrors(explicitNonCompact, "sigreturn").isNotEmpty())
+
+        val release66 = validProfile() + mapOf(
+            "release" to "6.6.66-android15-8-g29d86c5fc9dd-abogki428889875-4k",
+        )
+        assertTrue(shapeErrors(release66, "multicast_waiter").isNotEmpty())
+        assertTrue(shapeErrors(release66, "sigreturn").isNotEmpty())
+        /* The guard is route-scoped: a select route is unaffected. */
+        assertTrue(ProfileResolver.validateMerged(release66, "select_stack", "none").isEmpty())
+    }
+
     private fun validProfile(): MutableMap<String, Any?> = valueMapOf(
         "release" to "test",
         "schema_version" to 1,

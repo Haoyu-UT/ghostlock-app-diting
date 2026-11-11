@@ -176,7 +176,53 @@ object ProfileResolver {
         }
         errors += validateLayoutGroups(profile, route, fallbackTo)
         errors += validateStage1Blocks(profile, route, fallbackTo)
+        errors += validateRouteWaiterShape(profile, route, fallbackTo)
         return errors
+    }
+
+    /**
+     * The multicast and sigreturn routes stamp the compact eleven-word
+     * `rt_mutex_waiter` strip. A 6.6+ image's `rt_waiter_node` shape is a
+     * different object (the walk would read `pi_tree.rb_left` as `lock`), so a
+     * profile that selects either route on such a device is refused here and
+     * again by the native at profile load. `waiter_layout.compact` is
+     * authoritative; the release family is the fallback for profiles that
+     * predate it (5.x and 6.1 compact, 6.6+ non-compact; an unparsable release
+     * fails closed).
+     */
+    private fun validateRouteWaiterShape(
+        profile: Map<String, Any?>,
+        route: String?,
+        fallbackTo: String?,
+    ): List<ConfigError> {
+        val compact = profile.getLongAt("waiter_layout.compact")
+        val nonCompact = if (compact != null) {
+            compact == 0L
+        } else {
+            !releaseIsCompactWaiter(profile["release"] as? String)
+        }
+        if (!nonCompact) return emptyList()
+        val errors = mutableListOf<ConfigError>()
+        for ((path, name) in listOf(
+            "route" to route,
+            "fallback.route" to fallbackTo?.takeIf { it != "none" },
+        )) {
+            if (name == "multicast_waiter" || name == "sigreturn") {
+                errors += ConfigError(
+                    "$path.$name",
+                    "needs the compact rt_mutex_waiter strip; this profile's " +
+                        "waiter is the 6.6+ rt_waiter_node shape",
+                )
+            }
+        }
+        return errors
+    }
+
+    private fun releaseIsCompactWaiter(release: String?): Boolean {
+        val parts = release?.split('.') ?: return false
+        val major = parts.getOrNull(0)?.toIntOrNull() ?: return false
+        val minor = parts.getOrNull(1)?.takeWhile(Char::isDigit)?.toIntOrNull() ?: return false
+        return major == 5 || (major == 6 && minor == 1)
     }
 
     /**
