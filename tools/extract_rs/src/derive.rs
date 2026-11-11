@@ -8,7 +8,7 @@ use regex::Regex;
 use crate::btf::Btf;
 use crate::disasm::{
     add_sp_immediates, cmp_immediates, cmp_immediates_any_width, disassemble_range,
-    first_sp_frame, has_direct_call,
+    first_sp_frame, has_call_or_tail_branch, has_direct_call,
     is_mov_w0_wzr, is_mov_x1, materialized_address, validate_frame_live_at,
 };
 use crate::error::{ExtractError, Result};
@@ -135,18 +135,6 @@ pub struct TcpZerocopyLayout {
     pub delta: i64,
 }
 
-/// The TCP `getsockopt` chain: syscall entry, socket layer, proto-ops wrapper,
-/// protocol handler and option dispatcher. The two middle links are indirect
-/// (`sock->ops->getsockopt`, `sk_prot->getsockopt`), so the chain is named
-/// rather than walked; the direct links are validated in the derivation.
-const GETSOCKOPT_CHAIN: &[&str] = &[
-    "__arm64_sys_getsockopt",
-    "__sys_getsockopt",
-    "sock_common_getsockopt",
-    "tcp_getsockopt",
-    "do_tcp_getsockopt",
-];
-
 /// The fake waiter's last buffer word ends at 0x30 + 8; a copy cap below this
 /// cannot carry the whole stamp.
 pub const TCP_FAKE_WAITER_END: u64 = 0x38;
@@ -167,6 +155,59 @@ fn zc_local_before_call(lines: &[String], target: u64) -> Option<u64> {
             }
             if mov.is_match(previous) {
                 return Some(0);
+            }
+        }
+    }
+    None
+}
+
+/// The zc local when `tcp_zerocopy_receive` is inlined into its caller: the
+/// `TCP_ZEROCOPY_RECEIVE` case's `copy_from_sockptr(&zc, optval, len)`
+/// destination. Anchor on the length/cap pair (`cmp wN, #0xc` then
+/// `cmp wN, #cap+1`) — the same pair `copy_cap_from_dis` reads — and take the
+/// `add x0, sp, #imm` / `mov x0, sp` that feeds the copy call after it.
+fn zc_local_inlined(lines: &[String]) -> Option<u64> {
+    let cmp = Regex::new(r"(?i)\bcmp\s+w(\d+),\s*#0x([0-9a-f]+)\b").ok()?;
+    let add = Regex::new(r"(?i)\badd\s+x0,\s*sp,\s*#0x([0-9a-f]+)").unwrap();
+    let mov = Regex::new(r"(?i)\bmov\s+x0,\s*sp\b").unwrap();
+    let bl = Regex::new(r"(?i)\bbl\s+0x[0-9a-f]+\b").unwrap();
+    for (index, line) in lines.iter().enumerate() {
+        let Some(first) = cmp.captures(line) else {
+            continue;
+        };
+        if first.get(2).map(|value| value.as_str()) != Some("c") {
+            continue;
+        }
+        let register = first.get(1)?.as_str().to_string();
+        let end = (index + 5).min(lines.len());
+        let mut second = None;
+        for offset in 0..end.saturating_sub(index + 1) {
+            let Some(next) = cmp.captures(&lines[index + 1 + offset]) else {
+                continue;
+            };
+            if next.get(1).map(|value| value.as_str()) != Some(register.as_str()) {
+                continue;
+            }
+            let Some(limit) = u64::from_str_radix(next.get(2)?.as_str(), 16).ok() else {
+                continue;
+            };
+            if (0x11..=0x101).contains(&limit) {
+                second = Some(index + 1 + offset);
+                break;
+            }
+        }
+        let Some(second) = second else {
+            continue;
+        };
+        for at in (second + 1)..((second + 10).min(lines.len())) {
+            if let Some(captures) = add.captures(&lines[at]) {
+                return u64::from_str_radix(captures.get(1)?.as_str(), 16).ok();
+            }
+            if mov.is_match(&lines[at]) {
+                return Some(0);
+            }
+            if bl.is_match(&lines[at]) {
+                break;
             }
         }
     }
@@ -252,12 +293,6 @@ pub fn derive_tcp_zerocopy_layout(
     sorted_offsets: &[u64],
     waiter_depth: i64,
 ) -> Result<TcpZerocopyLayout> {
-    let receive = unique_offset(symbols, "tcp_zerocopy_receive").map_err(|_| {
-        ExtractError::new(
-            "tcp_zerocopy_receive is absent from kallsyms (inlined or missing); \
-             the zc local is not derivable",
-        )
-    })?;
     let dis = disassemble_symbol(
         kernel,
         symbols,
@@ -265,11 +300,30 @@ pub fn derive_tcp_zerocopy_layout(
         "do_tcp_getsockopt",
         OBJDUMP_CAP,
     )?;
-    let zc_local = zc_local_before_call(&dis, receive).ok_or_else(|| {
-        ExtractError::new(
-            "do_tcp_getsockopt: no tcp_zerocopy_receive call with a stack zc local",
-        )
-    })?;
+    let zc_local = match unique_offset_optional(symbols, "tcp_zerocopy_receive") {
+        Some(receive) => zc_local_before_call(&dis, receive).ok_or_else(|| {
+            ExtractError::new(
+                "do_tcp_getsockopt: no tcp_zerocopy_receive call with a stack zc local",
+            )
+        })?,
+        None => {
+            /* The handler inlines tcp_zerocopy_receive(): the symbol is gone,
+             * but the ZEROCOPY case still copies the user struct into its own
+             * stack local right after the length/cap checks. */
+            if !tcp_zerocopy_receive_inlined(kernel, symbols, sorted_offsets) {
+                return Err(ExtractError::new(
+                    "tcp_zerocopy_receive is absent from kallsyms (inlined or missing); \
+                     the inlined call-site probe did not find it either",
+                ));
+            }
+            zc_local_inlined(&dis).ok_or_else(|| {
+                ExtractError::new(
+                    "do_tcp_getsockopt: the inlined TCP_ZEROCOPY_RECEIVE copy \
+                     destination is not unique or not found",
+                )
+            })?
+        }
+    };
     let mut caps = copy_cap_from_dis(&dis);
     caps.sort_unstable();
     caps.dedup();
@@ -281,19 +335,39 @@ pub fn derive_tcp_zerocopy_layout(
             )))
         }
     };
-    for (caller, callee) in [
-        ("__arm64_sys_getsockopt", "__sys_getsockopt"),
-        ("tcp_getsockopt", "do_tcp_getsockopt"),
-    ] {
-        let caller_dis = disassemble_symbol(kernel, symbols, sorted_offsets, caller, OBJDUMP_CAP)?;
-        let target = unique_offset(symbols, callee)?;
-        if !has_direct_call(&caller_dis, target) {
-            return Err(ExtractError::new(format!(
-                "{caller} does not directly call {callee}"
-            )));
-        }
+    /* The TCP getsockopt path: the syscall wrapper -> (__sys_getsockopt) ->
+     * sock_common_getsockopt -> tcp_getsockopt -> do_tcp_getsockopt. The socket
+     * layer's two links are indirect (`sock->ops->getsockopt`,
+     * `sk_prot->getsockopt`), so they are named rather than walked. Some builds
+     * inline __sys_getsockopt into the wrapper (6.1.134: the wrapper's 0x60
+     * frame carries the whole body and never calls the symbol), and that inlined
+     * link must not add a second frame. The last link is a direct call and is
+     * still validated. */
+    let wrapper = disassemble_symbol(
+        kernel,
+        symbols,
+        sorted_offsets,
+        "__arm64_sys_getsockopt",
+        OBJDUMP_CAP,
+    )?;
+    let sys_linked = unique_offset_optional(symbols, "__sys_getsockopt")
+        .is_some_and(|target| has_call_or_tail_branch(&wrapper, target));
+    let tcp = disassemble_symbol(kernel, symbols, sorted_offsets, "tcp_getsockopt", OBJDUMP_CAP)?;
+    if !has_direct_call(&tcp, unique_offset(symbols, "do_tcp_getsockopt")?) {
+        return Err(ExtractError::new(
+            "tcp_getsockopt does not directly call do_tcp_getsockopt",
+        ));
     }
-    let chain_sum = sum_chain_frames(kernel, symbols, sorted_offsets, GETSOCKOPT_CHAIN)?;
+    let mut chain: Vec<&str> = vec!["__arm64_sys_getsockopt"];
+    if sys_linked {
+        chain.push("__sys_getsockopt");
+    }
+    chain.extend([
+        "sock_common_getsockopt",
+        "tcp_getsockopt",
+        "do_tcp_getsockopt",
+    ]);
+    let chain_sum = sum_chain_frames(kernel, symbols, sorted_offsets, &chain)?;
     let zc_depth = -(chain_sum as i64) + zc_local as i64;
     let delta = zc_depth - (waiter_depth + 8);
     Ok(TcpZerocopyLayout {
@@ -1665,38 +1739,58 @@ pub fn derive_sigreturn_layout(
     pi_tree_entry: u64,
 ) -> Result<SigreturnLayout> {
     let rt_name = "__arm64_sys_rt_sigreturn";
-    let rs_name = "restore_sigframe";
-    let plain_name = "restore_fpsimd_context";
-    let sve_name = "restore_sve_fpsimd_context";
     let rt = disassemble_symbol(kernel, symbols, sorted_offsets, rt_name, OBJDUMP_CAP)?;
-    let rs = disassemble_symbol(kernel, symbols, sorted_offsets, rs_name, OBJDUMP_CAP)?;
-    let plain = disassemble_symbol(kernel, symbols, sorted_offsets, plain_name, OBJDUMP_CAP)?;
-    let sve = disassemble_symbol(kernel, symbols, sorted_offsets, sve_name, OBJDUMP_CAP)?;
-    let rt_rs = unique_offset(symbols, rs_name)?;
-    let rs_plain = unique_offset(symbols, plain_name)?;
-    let rs_sve = unique_offset(symbols, sve_name)?;
-    for (lines, target, caller) in [
-        (&rt, rt_rs, rt_name),
-        (&rs, rs_plain, rs_name),
-        (&rs, rs_sve, rs_name),
-    ] {
-        let anchor = Regex::new(&format!(r"(?i)\bbl\s+0x{target:x}\b")).unwrap();
-        validate_frame_live_at(lines, &anchor, caller)?;
-    }
     let rt_frame = first_sp_frame(&rt, rt_name)?;
-    let rs_frame = first_sp_frame(&rs, rs_name)?;
-    let plain_frame = first_sp_frame(&plain, plain_name)?;
-    let sve_frame = first_sp_frame(&sve, sve_name)?;
-    let chain_plain = rt_frame
-        .checked_add(rs_frame)
-        .and_then(|value| value.checked_add(plain_frame))
-        .ok_or_else(|| ExtractError::new("sigreturn plain chain overflow"))?;
-    let chain_sve = rt_frame
-        .checked_add(rs_frame)
-        .and_then(|value| value.checked_add(sve_frame))
-        .ok_or_else(|| ExtractError::new("sigreturn SVE chain overflow"))?;
-    let dst_plain = fpsimd_copy_destination(&plain, SIGRETURN_COPY_BYTES)?;
-    let dst_sve = fpsimd_copy_destination(&sve, SIGRETURN_COPY_BYTES)?;
+    /* The out-of-line helper shape (5.10) is preferred: its frames are separate
+     * and its calls are validated. A build that inlines the helpers (6.1:
+     * restore_sigframe and both restore_*_fpsimd_context are absent) carries
+     * the same two 0x200-byte vregs copies in the handler's own frame. */
+    let helpers_present = [
+        "restore_sigframe",
+        "restore_fpsimd_context",
+        "restore_sve_fpsimd_context",
+    ]
+    .iter()
+    .all(|name| unique_offset_optional(symbols, name).is_some());
+    let (chain_plain, chain_sve, dst_plain, dst_sve) = if helpers_present {
+        let rs_name = "restore_sigframe";
+        let plain_name = "restore_fpsimd_context";
+        let sve_name = "restore_sve_fpsimd_context";
+        let rs = disassemble_symbol(kernel, symbols, sorted_offsets, rs_name, OBJDUMP_CAP)?;
+        let plain = disassemble_symbol(kernel, symbols, sorted_offsets, plain_name, OBJDUMP_CAP)?;
+        let sve = disassemble_symbol(kernel, symbols, sorted_offsets, sve_name, OBJDUMP_CAP)?;
+        let rt_rs = unique_offset(symbols, rs_name)?;
+        let rs_plain = unique_offset(symbols, plain_name)?;
+        let rs_sve = unique_offset(symbols, sve_name)?;
+        for (lines, target, caller) in [
+            (&rt, rt_rs, rt_name),
+            (&rs, rs_plain, rs_name),
+            (&rs, rs_sve, rs_name),
+        ] {
+            let anchor = Regex::new(&format!(r"(?i)\bbl\s+0x{target:x}\b")).unwrap();
+            validate_frame_live_at(lines, &anchor, caller)?;
+        }
+        let rs_frame = first_sp_frame(&rs, rs_name)?;
+        let plain_frame = first_sp_frame(&plain, plain_name)?;
+        let sve_frame = first_sp_frame(&sve, sve_name)?;
+        let chain_plain = rt_frame
+            .checked_add(rs_frame)
+            .and_then(|value| value.checked_add(plain_frame))
+            .ok_or_else(|| ExtractError::new("sigreturn plain chain overflow"))?;
+        let chain_sve = rt_frame
+            .checked_add(rs_frame)
+            .and_then(|value| value.checked_add(sve_frame))
+            .ok_or_else(|| ExtractError::new("sigreturn SVE chain overflow"))?;
+        let dst_plain = fpsimd_copy_destination(&plain, SIGRETURN_COPY_BYTES)?;
+        let dst_sve = fpsimd_copy_destination(&sve, SIGRETURN_COPY_BYTES)?;
+        (chain_plain, chain_sve, dst_plain, dst_sve)
+    } else {
+        /* Inlined: both copies live in the handler's own frame; the
+         * destination must be unique (plain and SVE share it on the sampled
+         * 6.1 builds). A split-local build fails closed. */
+        let dst = fpsimd_copy_destination(&rt, SIGRETURN_COPY_BYTES)?;
+        (rt_frame, rt_frame, dst, dst)
+    };
     let copy_dst_plain = chain_plain
         .checked_sub(dst_plain)
         .ok_or_else(|| ExtractError::new("plain fpsimd copy destination exceeds the chain sum"))?;

@@ -298,9 +298,10 @@ pub fn conf_route_geometry_with_sigreturn(
     sigreturn_offsets: Option<(i64, i64)>,
     waiter_compact: bool,
 ) -> Vec<(&'static str, i64)> {
-    // The 5.10 sigreturn patch-range constants apply to any 5.10 build; the
-    // route decision itself is made from the image's own geometry.
-    if crate::family::is_5_10(release) && route == "sigreturn" {
+    // The offsets are image-derived when the verdict produced them; the
+    // 5.10 patch-range constants are only the fallback for a 5.10 build whose
+    // derivation did not run (the family function returns None elsewhere).
+    if route == "sigreturn" {
         if let Some((sve, plain)) =
             sigreturn_offsets.or_else(|| crate::family::sigreturn_offsets(release))
         {
@@ -1246,6 +1247,18 @@ mod tests {
                 true
             ),
             vec![("waiter_off_sve", 256), ("waiter_off_plain", 240)]
+        );
+        // A 6.x derivation is image-derived the same way; no family constant
+        // participates (the 6.1.134 handler copy gives 0xE8).
+        assert_eq!(
+            conf_route_geometry_with_sigreturn(
+                "sigreturn",
+                "6.1.134-android14-11-o-gd252f36df142",
+                None,
+                Some((232, 232)),
+                true
+            ),
+            vec![("waiter_off_sve", 232), ("waiter_off_plain", 232)]
         );
         assert_eq!(
             conf_route_geometry("select_stack", "6.6.89-android15-8", Some(-2), false),
