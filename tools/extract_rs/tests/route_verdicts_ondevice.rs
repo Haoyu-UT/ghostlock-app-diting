@@ -197,8 +197,10 @@ fn the_6_1_image_asks_for_a_route_choice() {
 /// (`external/test-kernels/6.1.134-…/ground-truth-routes.txt`): the tcp
 /// relation is infeasible with delta -0x170 (the wrapper inlines
 /// __sys_getsockopt, so that link contributes no extra frame), sigreturn is
-/// feasible with waiter_off 0xE8, and the selection is sigreturn. The sidecars
-/// are passed so this is the store's maximal invocation.
+/// feasible with waiter_off 0xE8, and the 64-bit multicast copy is too deep.
+/// The compat `MCAST_BLOCK_SOURCE` copy is feasible (time64 at 0xa8 under the
+/// 0x104 buffer), so the analysis now reports two feasible routes and refuses
+/// to choose between them; the sidecars are passed for the maximal invocation.
 #[test]
 fn the_realme_6_1_image_derives_its_ground_truth() {
     let Some(dir) = std::env::var_os("GHOSTLOCK_IMAGE_DIR") else {
@@ -249,9 +251,21 @@ fn the_realme_6_1_image_derives_its_ground_truth() {
             .unwrap_or_else(|| panic!("{release}: no {name} verdict"))
     };
     assert_eq!(route("select_stack")["verdict"], "infeasible", "{release}: select");
+    let multicast = route("multicast_waiter");
+    assert_eq!(multicast["verdict"], "feasible", "{release}: multicast");
+    assert_eq!(multicast["numbers"]["compat_carrier"], 1, "{release}: compat");
+    assert_eq!(multicast["numbers"]["compat_futex_abi"], 1, "{release}: abi");
     assert_eq!(
-        route("multicast_waiter")["verdict"], "infeasible",
-        "{release}: multicast"
+        multicast["numbers"]["compat_waiter_off"], 0xa8,
+        "{release}: compat waiter offset"
+    );
+    assert_eq!(
+        multicast["numbers"]["compat_buffer_size"], 0x104,
+        "{release}: compat buffer"
+    );
+    assert_eq!(
+        multicast["numbers"]["copy_depth"], 0x240,
+        "{release}: compat copy depth"
     );
     let sigreturn = route("sigreturn");
     assert_eq!(sigreturn["verdict"], "feasible", "{release}: sigreturn");
@@ -260,6 +274,85 @@ fn the_realme_6_1_image_derives_its_ground_truth() {
     let tcp = route("tcp_zerocopy");
     assert_eq!(tcp["verdict"], "infeasible", "{release}: tcp");
     assert_eq!(tcp["numbers"]["delta"], -368, "{release}: tcp delta");
-    assert_eq!(report["chosen"], "sigreturn", "{release}: chosen route");
+    assert!(
+        report["chosen"].is_null(),
+        "{release}: two feasible routes must not be chosen silently: {}",
+        report["chosen"]
+    );
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// The duchamp 6.1.138 image is the in-hand 6.1 test device. Its 64-bit
+/// multicast copy is too deep (short by 0x88 of the lock slot), but the compat
+/// copy at depth 0x230 lands at 0x48 under the 0x104 buffer; there both futex
+/// wrappers go through do_futex, so the home is 0x1e8 for either ABI. The
+/// analysis reports four feasible routes (select, multicast compat, sigreturn,
+/// tcp) and refuses to choose; the bundle's priority keeps select.
+#[test]
+fn the_duchamp_6_1_image_derives_the_compat_multicast_geometry() {
+    let Some(dir) = std::env::var_os("GHOSTLOCK_IMAGE_DIR") else {
+        eprintln!("skipping: GHOSTLOCK_IMAGE_DIR is not set");
+        return;
+    };
+    let binary = env!("CARGO_BIN_EXE_ghostlock-extract");
+    let release = "6.1.138-android14-11-g44bda9e8f6e9-ab13792638";
+    let entry = Path::new(&dir).join(release);
+    let image = entry.join(format!("Image-{release}"));
+    if !image.is_file() {
+        eprintln!("skipping: {release} is not in the store");
+        return;
+    }
+    let work = std::env::temp_dir().join(format!("ghostlock-gt-{}-{release}", std::process::id()));
+    std::fs::create_dir_all(&work).expect("temp dir");
+    let feasible = work.join("feasible.json");
+    let run = Command::new(binary)
+        .arg(&image)
+        .arg("--analysis")
+        .arg("--feasible-out")
+        .arg(&feasible)
+        .output()
+        .expect("run extractor");
+    assert!(
+        run.status.success(),
+        "{release}: analysis failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&feasible).expect("feasible report"))
+            .expect("parse feasible report");
+    let route = |name: &str| {
+        report["routes"]
+            .as_array()
+            .expect("routes")
+            .iter()
+            .find(|entry| entry["route"] == name)
+            .unwrap_or_else(|| panic!("{release}: no {name} verdict"))
+    };
+    assert_eq!(route("select_stack")["verdict"], "feasible", "{release}: select");
+    let multicast = route("multicast_waiter");
+    assert_eq!(multicast["verdict"], "feasible", "{release}: multicast");
+    assert_eq!(multicast["numbers"]["compat_carrier"], 1, "{release}: compat");
+    assert_eq!(multicast["numbers"]["compat_futex_abi"], 1, "{release}: abi");
+    assert_eq!(
+        multicast["numbers"]["compat_waiter_off"], 0x48,
+        "{release}: compat waiter offset"
+    );
+    assert_eq!(
+        multicast["numbers"]["compat_buffer_size"], 0x104,
+        "{release}: compat buffer"
+    );
+    assert_eq!(
+        multicast["numbers"]["copy_depth"], 0x230,
+        "{release}: compat copy depth"
+    );
+    assert_eq!(
+        multicast["numbers"]["source_overlap"], 1,
+        "{release}: source header overlap"
+    );
+    assert!(
+        report["chosen"].is_null(),
+        "{release}: multiple feasible routes must not be chosen silently: {}",
+        report["chosen"]
+    );
     let _ = std::fs::remove_dir_all(&work);
 }

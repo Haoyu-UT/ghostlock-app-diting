@@ -9,7 +9,7 @@ use crate::btf::Btf;
 use crate::disasm::{
     add_sp_immediates, cmp_immediates, cmp_immediates_any_width, disassemble_range,
     first_sp_frame, has_call_or_tail_branch, has_direct_call,
-    is_mov_w0_wzr, is_mov_x1, materialized_address, validate_frame_live_at,
+    is_mov_w0_wzr, is_mov_x1, materialized_address, split_line, validate_frame_live_at,
 };
 use crate::error::{ExtractError, Result};
 use crate::kallsyms::unique_or_err;
@@ -395,7 +395,6 @@ const SETSOCKOPT_CHAIN: &[&str] = &[
     "udp_setsockopt",
     "ip_setsockopt",
 ];
-const FUTEX_CHAIN: &[&str] = &["__arm64_sys_futex", "do_futex", "futex_wait_requeue_pi"];
 
 fn sum_chain_frames(
     kernel: &[u8],
@@ -575,19 +574,14 @@ pub(crate) fn multicast_waiter_off_at(
         chain.push(copy_fn);
     }
     let setsockopt_frames = sum_chain_frames(kernel, symbols, sorted, &chain)?;
-    let futex_frames = sum_chain_frames(kernel, symbols, sorted, FUTEX_CHAIN)?;
+    /* The futex strip home is a per-image fact: a build may inline `do_futex`
+     * into the 64-bit wrapper (6.1.134), where the fixed chain would
+     * over-count its 0x60 frame. `futex_strip_home` follows the wrapper's own
+     * call path. */
+    let waiter_depth = futex_strip_home(kernel, symbols, sorted, pi_tree_entry)?;
     let ip = disassemble_symbol(kernel, symbols, sorted, copy_fn, OBJDUMP_CAP)?;
     let greqs = greqs_offset_from_dis(&ip, buffer_size)
         .ok_or_else(|| ExtractError::new(format!("{copy_fn} multicast copy window not found")))?;
-    let fw = disassemble_symbol(
-        kernel,
-        symbols,
-        sorted,
-        "futex_wait_requeue_pi",
-        OBJDUMP_CAP,
-    )?;
-    let waiter_local = waiter_local_from_dis(&fw, pi_tree_entry)
-        .ok_or_else(|| ExtractError::new("futex_wait_requeue_pi waiter local not found"))?;
     let numbers = |waiter_off: i64, setsockopt_depth: u64, waiter_depth: u64| {
         [
             ("waiter_off", waiter_off),
@@ -603,17 +597,7 @@ pub(crate) fn multicast_waiter_off_at(
     let setsockopt_depth = setsockopt_frames.checked_sub(greqs).ok_or_else(|| {
         ExtractError::infeasible_with(
             "greqs offset exceeds setsockopt frames",
-            numbers(0, setsockopt_frames, futex_frames.saturating_sub(waiter_local)),
-        )
-    })?;
-    let waiter_depth = futex_frames.checked_sub(waiter_local).ok_or_else(|| {
-        ExtractError::infeasible_with(
-            "waiter local exceeds futex frames",
-            numbers(
-                setsockopt_depth as i64,
-                setsockopt_depth,
-                futex_frames.saturating_sub(waiter_local),
-            ),
+            numbers(0, setsockopt_frames, waiter_depth),
         )
     })?;
     let waiter_off = setsockopt_depth
@@ -906,6 +890,50 @@ mod tests {
         assert_eq!(off(0x370, 0x18, 0x390, 0x98), 0x60);
         // PD2361 5.15.178 (static candidate = 0x50).
         assert_eq!(off(0x370, 0x18, 0x330, 0x28), 0x50);
+    }
+
+    #[test]
+    fn the_compat_multicast_copy_is_found_by_the_tif32_branch() {
+        /* A synthetic handler: a TIF_32BIT branch at +0x00 targets +0x40, the
+         * compat block. The block's memset uses w2 (ignored); the copy uses
+         * w3 and a stack destination. The 64-bit sibling is later in the
+         * function at sp+0x18 with the larger 0x108 size. */
+        let mut lines: Vec<String> = Vec::new();
+        lines.push("tbnz w8, #0x16, 0x1040".to_string()); // +0x00
+        for _ in 1..16 {
+            lines.push("mov x0, x1".to_string()); // +0x04..0x3c
+        }
+        for line in [
+            "add x0, sp, #0x120", // +0x40, the branch target
+            "mov w1, wzr",
+            "mov w2, #0x104",
+            "bl 0x900", // memset: the size is in w2 and must not match
+            "cmp w20, #0x104",
+            "b.ne 0x9999",
+            "add x0, sp, #0x120",
+            "mov x1, x22",
+            "mov x2, x21",
+            "mov w3, #0x104",
+            "bl 0x1001", // the compat copy
+            "b 0x9998",
+        ] {
+            lines.push(line.to_string());
+        }
+        for line in [
+            "add x0, sp, #0x18",
+            "mov x1, x22",
+            "mov x2, x21",
+            "mov w3, #0x108",
+            "bl 0x1001", // the 64-bit sibling
+        ] {
+            lines.push(line.to_string());
+        }
+        assert_eq!(
+            super::compat_multicast_copies(&lines, 0x1000, Some(0x108)),
+            Ok((0x120, 0x104))
+        );
+        // Without the sibling the case is not proven.
+        assert!(super::compat_multicast_copies(&lines[..28], 0x1000, Some(0x108)).is_err());
     }
 
     #[test]
@@ -1724,6 +1752,353 @@ pub fn derive_compat_carrier_layout(
         "compat carrier: {}",
         refused.join("; ")
     )))
+}
+
+/// The AArch32 compat `MCAST_BLOCK_SOURCE` carrier's per-image geometry.
+///
+/// The option's 64-bit path copies the `group_source_req` to a fixed stack
+/// local. A `CONFIG_COMPAT` build carries a second, `is_compat_task()`-gated
+/// copy of the 32-bit struct to a *different* local; that local is the one
+/// that can land on the futex waiter. Both copies are required here: the
+/// larger one proves the case, the smaller one is the carrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompatMulticastLayout {
+    /// The compat copy destination's depth below the setsockopt entry sp.
+    pub copy_depth: u64,
+    /// The futex waiter strip home for the chosen ABI.
+    pub waiter_home: u64,
+    /// `copy_depth - waiter_home`: where the eleven-word strip is packed.
+    pub waiter_off: u64,
+    /// The compat struct size, from the image's own copy immediate.
+    pub buffer_size: u64,
+    /// `futex_time32` or `futex_time64`.
+    pub abi: &'static str,
+    /// 0 = time32 (240), 1 = time64 (422); the wire value.
+    pub futex_abi: u8,
+    /// Whether the strip overlaps the source sockaddr header in the struct.
+    pub source_overlap: bool,
+}
+
+impl CompatMulticastLayout {
+    /// The compat `group_source_req` is a `u32 gsr_interface` followed by the
+    /// group and source `sockaddr_storage`s (128 bytes each), so `gsr_source`
+    /// starts at `buffer_size - 128`.
+    pub fn source_offset(&self) -> u64 {
+        self.buffer_size.saturating_sub(128)
+    }
+}
+
+/// The first stack copy in the block that starts at `start`. The copy helper's
+/// fourth argument (the size) is `w3`; the preceding `memset` uses `w2`, so
+/// tracking only `mov w3, #size` separates the two calls without resolving
+/// the callee (the kernel can carry more than one `copy_from_sockptr`
+/// instance, so its symbol is not a reliable anchor).
+fn copy_in_block(lines: &[String], start: usize) -> Option<(u64, u64)> {
+    let add = Regex::new(r"(?i)^x0,\s*sp,\s*#0x([0-9a-f]+)$").unwrap();
+    let size = Regex::new(r"(?i)^w3,\s*#0x([0-9a-f]+)$").unwrap();
+    let end = (start + 24).min(lines.len());
+    let mut local = None;
+    let mut size_value = None;
+    for line in &lines[start..end] {
+        let (mnemonic, operands) = split_line(line);
+        let mnemonic = mnemonic.to_ascii_lowercase();
+        if mnemonic == "add" {
+            if let Some(caps) = add.captures(&operands) {
+                local = u64::from_str_radix(&caps[1], 16).ok();
+            }
+        } else if mnemonic == "mov" {
+            if operands.eq_ignore_ascii_case("x0, sp") {
+                local = Some(0);
+            } else if let Some(caps) = size.captures(&operands) {
+                size_value = u64::from_str_radix(&caps[1], 16).ok();
+            }
+        } else if mnemonic == "bl" {
+            if let (Some(local), Some(size_value)) = (local, size_value) {
+                return Some((local, size_value));
+            }
+        } else if mnemonic == "b" || mnemonic == "ret" {
+            break;
+        }
+    }
+    None
+}
+
+/// Every `copy_from_sockptr`-shaped call in the function that writes a stack
+/// local, as (local offset, size immediate). The nearest preceding
+/// `add x0, sp` and `mov w3, #size` are the call's arguments; a `memset` with
+/// the same size uses `w2` and is not collected.
+fn copy_sites(lines: &[String]) -> Vec<(u64, u64)> {
+    let add = Regex::new(r"(?i)^x0,\s*sp,\s*#0x([0-9a-f]+)$").unwrap();
+    let size = Regex::new(r"(?i)^w3,\s*#0x([0-9a-f]+)$").unwrap();
+    let mut out = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let (mnemonic, _) = split_line(line);
+        if !mnemonic.eq_ignore_ascii_case("bl") {
+            continue;
+        }
+        let lo = index.saturating_sub(12);
+        let mut local = None;
+        let mut size_value = None;
+        for previous in lines[lo..index].iter().rev() {
+            let (mnemonic, operands) = split_line(previous);
+            let mnemonic = mnemonic.to_ascii_lowercase();
+            if local.is_none() {
+                if mnemonic == "add" {
+                    if let Some(caps) = add.captures(&operands) {
+                        local = u64::from_str_radix(&caps[1], 16).ok();
+                    }
+                } else if mnemonic == "mov" && operands.eq_ignore_ascii_case("x0, sp") {
+                    local = Some(0);
+                }
+            }
+            if size_value.is_none() && mnemonic == "mov" {
+                if let Some(caps) = size.captures(&operands) {
+                    size_value = u64::from_str_radix(&caps[1], 16).ok();
+                }
+            }
+            if local.is_some() && size_value.is_some() {
+                break;
+            }
+        }
+        if let (Some(local), Some(size_value)) = (local, size_value) {
+            out.push((local, size_value));
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Find the `MCAST_BLOCK_SOURCE` case's two copies in the setsockopt handler.
+///
+/// The compat copy is found from the handler's own `TIF_32BIT` branch
+/// (`tbnz w8, #0x16`): the branch target is the compat block, which copies the
+/// 32-bit struct from the user pointer to a stack local. The 64-bit sibling is
+/// any other `copy_from_sockptr` stack copy of a larger struct in the same
+/// function (BTF names its size when it is present). Both being present is the
+/// evidence that the case is the group-request option; a missing, ambiguous or
+/// overlaid site is an error, never a guess.
+fn compat_multicast_copies(
+    lines: &[String],
+    function_addr: u64,
+    sibling_size: Option<u64>,
+) -> std::result::Result<(u64, u64), String> {
+    let tif = Regex::new(r"(?i)\btbnz\s+w8,\s*#0x16,\s*0x([0-9a-f]+)\b").unwrap();
+    let mut compat: BTreeSet<(u64, u64)> = BTreeSet::new();
+    for line in lines {
+        let Some(caps) = tif.captures(line) else { continue };
+        let Ok(target) = u64::from_str_radix(&caps[1], 16) else { continue };
+        let Some(relative) = target.checked_sub(function_addr) else { continue };
+        if relative % 4 != 0 {
+            continue;
+        }
+        let start = (relative / 4) as usize;
+        if start >= lines.len() {
+            continue;
+        }
+        if let Some(copy) = copy_in_block(lines, start) {
+            compat.insert(copy);
+        }
+    }
+    if compat.len() != 1 {
+        let sites: Vec<String> = compat
+            .iter()
+            .map(|(local, size)| format!("sp+0x{local:x}/0x{size:x}"))
+            .collect();
+        return Err(format!(
+            "compat MCAST_BLOCK_SOURCE copy is not unique: {sites:?} from the TIF_32BIT branches"
+        ));
+    }
+    let (local, size) = *compat.iter().next().unwrap();
+    if size == 0 || local % 8 != 0 {
+        return Err(format!(
+            "compat MCAST_BLOCK_SOURCE copy is not usable: sp+0x{local:x}/0x{size:x}"
+        ));
+    }
+    let sites = copy_sites(lines);
+    let sibling = sites
+        .iter()
+        .filter(|(site, site_size)| *site != local && *site_size > size)
+        .filter(|(_, site_size)| sibling_size.map_or(true, |expected| expected == *site_size))
+        .map(|(_, site_size)| *site_size)
+        .collect::<BTreeSet<u64>>();
+    if sibling.len() != 1 {
+        let sizes: Vec<String> = sibling.iter().map(|size| format!("0x{size:x}")).collect();
+        return Err(format!(
+            "the 64-bit group_source_req sibling copy is not unique: {sizes:?} next to \
+             the compat copy sp+0x{local:x}/0x{size:x}"
+        ));
+    }
+    Ok((local, size))
+}
+
+/// Derive the AArch32 compat `MCAST_BLOCK_SOURCE` carrier's geometry from the
+/// image. The 64-bit path's copy is the sibling; the compat branch's copy is
+/// the carrier. The waiter must be the compact eleven-word strip (the route's
+/// stamp), and both futex homes are derived per image because a build may
+/// inline `do_futex` into the 64-bit wrapper.
+pub fn derive_compat_multicast_layout(
+    kernel: &[u8],
+    symbols: &RelSymbols,
+    sorted_offsets: &[u64],
+    btf: Option<&Btf>,
+    kernel_major: Option<u32>,
+) -> Result<CompatMulticastLayout> {
+    let waiter = match btf {
+        Some(btf) => WaiterLayout::from_btf(btf)?,
+        None if kernel_major == Some(5) => crate::family::waiter_layout_5_10(),
+        None => {
+            return Err(ExtractError::new(
+                "compat multicast: no BTF and the no-BTF waiter template is 5.10-only",
+            ))
+        }
+    };
+    let compact = match btf {
+        Some(btf) => crate::layout::waiter_is_compact(btf),
+        None => Some(true),
+    };
+    if compact != Some(true) {
+        return Err(ExtractError::new(
+            "compat multicast: the waiter is not the compact eleven-word strip",
+        ));
+    }
+    let lock_offset = waiter
+        .lock
+        .ok_or_else(|| ExtractError::new("compat multicast: rt_mutex_waiter.lock missing"))?;
+
+    /* 6.x splits the option handlers out of ip_setsockopt; 5.x keeps them in. */
+    let copy_fn = if unique_offset_optional(symbols, "do_ip_setsockopt").is_some() {
+        "do_ip_setsockopt"
+    } else if unique_offset_optional(symbols, "ip_setsockopt").is_some() {
+        "ip_setsockopt"
+    } else {
+        return Err(ExtractError::new(
+            "compat multicast: neither do_ip_setsockopt nor ip_setsockopt is present",
+        ));
+    };
+    let copy_fn_addr = unique_offset(symbols, copy_fn)?;
+    let lines = disassemble_symbol(kernel, symbols, sorted_offsets, copy_fn, OBJDUMP_CAP)?;
+
+    let sibling_size = btf
+        .and_then(|btf| btf.size("group_source_req"))
+        .map(u64::from);
+    let (compat_local, compat_size) =
+        compat_multicast_copies(&lines, copy_fn_addr, sibling_size).map_err(ExtractError::new)?;
+
+    /* The setsockopt chain. The wrapper's link to __sys_setsockopt is proven
+     * per image; the middle links are the indirect CFI dispatchers
+     * (sock_common_setsockopt -> udp_setsockopt -> ip_setsockopt), named
+     * rather than walked. */
+    let wrapper_name = "__arm64_sys_setsockopt";
+    let wrapper = disassemble_symbol(kernel, symbols, sorted_offsets, wrapper_name, OBJDUMP_CAP)?;
+    let sys_name = "__sys_setsockopt";
+    let sys_addr = unique_offset(symbols, sys_name)?;
+    if !has_direct_call(&wrapper, sys_addr) {
+        return Err(ExtractError::new(
+            "__arm64_sys_setsockopt does not directly call __sys_setsockopt",
+        ));
+    }
+    let mut chain: Vec<&str> = vec![
+        wrapper_name,
+        sys_name,
+        "sock_common_setsockopt",
+        "udp_setsockopt",
+        "ip_setsockopt",
+    ];
+    if copy_fn == "do_ip_setsockopt" {
+        chain.push("do_ip_setsockopt");
+    }
+    let chain_sum = sum_chain_frames(kernel, symbols, sorted_offsets, &chain)?;
+    let copy_depth = chain_sum.checked_sub(compat_local).ok_or_else(|| {
+        ExtractError::new(format!(
+            "compat multicast: the copy local sp+0x{compat_local:x} exceeds the chain sum \
+             0x{chain_sum:x}"
+        ))
+    })?;
+
+    let wait_name = "futex_wait_requeue_pi";
+    let wait_dis = disassemble_symbol(kernel, symbols, sorted_offsets, wait_name, OBJDUMP_CAP)?;
+    let wait_addr = unique_offset(symbols, wait_name)?;
+    let waiter_local = waiter_local_from_dis(&wait_dis, waiter.pi_tree_entry)
+        .ok_or_else(|| ExtractError::new("compat multicast: futex waiter local not found"))?;
+    let time32_home = futex_chain_home(
+        kernel,
+        symbols,
+        sorted_offsets,
+        "__arm64_sys_futex_time32",
+        &wait_dis,
+        wait_addr,
+        waiter_local,
+    )?;
+    let time64_home = futex_chain_home(
+        kernel,
+        symbols,
+        sorted_offsets,
+        "__arm64_sys_futex",
+        &wait_dis,
+        wait_addr,
+        waiter_local,
+    )?;
+
+    let mut candidates: Vec<(bool, u64, CompatMulticastLayout)> = Vec::new();
+    for (abi, futex_abi, home) in [
+        ("futex_time64", 1u8, time64_home),
+        ("futex_time32", 0u8, time32_home),
+    ] {
+        let Some(off) = copy_depth.checked_sub(home) else { continue };
+        if off == 0 || off % 8 != 0 {
+            continue;
+        }
+        if off + lock_offset + 8 > compat_size || off + WAITER_STRIP_BYTES > compat_size {
+            continue;
+        }
+        let source_offset = compat_size.saturating_sub(128);
+        let overlap = off < source_offset + 8 && off + WAITER_STRIP_BYTES > source_offset;
+        let margin = compat_size - (off + WAITER_STRIP_BYTES);
+        candidates.push((
+            overlap,
+            margin,
+            CompatMulticastLayout {
+                copy_depth,
+                waiter_home: home,
+                waiter_off: off,
+                buffer_size: compat_size,
+                abi,
+                futex_abi,
+                source_overlap: overlap,
+            },
+        ));
+    }
+    /* Prefer a placement that leaves the kernel-read sockaddr header alone,
+     * then the larger remaining margin, then the time64 entry. */
+    candidates.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| b.2.futex_abi.cmp(&a.2.futex_abi))
+    });
+    candidates
+        .into_iter()
+        .next()
+        .map(|(_, _, layout)| layout)
+        .ok_or_else(|| {
+            ExtractError::infeasible_with(
+                format!(
+                    "compat multicast: the compat copy depth 0x{copy_depth:x} cannot cover \
+                     the waiter strip (time32 home 0x{time32_home:x}, time64 home \
+                     0x{time64_home:x}, buffer 0x{compat_size:x}, lock 0x{lock_offset:x})"
+                ),
+                [
+                    ("copy_depth", copy_depth as i64),
+                    ("time32_home", time32_home as i64),
+                    ("time64_home", time64_home as i64),
+                    ("buffer_size", compat_size as i64),
+                    ("lock_offset", lock_offset as i64),
+                ]
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect::<BTreeMap<String, i64>>(),
+            )
+        })
 }
 
 /// Derive the sigreturn route's per-image geometry:

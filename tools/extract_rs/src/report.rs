@@ -288,6 +288,36 @@ pub fn conf_multicast_route_geometry(
     geometry
 }
 
+/// The AArch32 compat multicast carrier's route block, from the image-derived
+/// geometry: the compat strip offset, the compat buffer size and the futex
+/// ABI. The task/lock offsets are the same per-image BTF values the 64-bit
+/// block uses; the anchor trio is added by the caller's policy plan.
+pub fn conf_compat_multicast_route_geometry(
+    numbers: &BTreeMap<String, i64>,
+    structs: &BTreeMap<String, Option<u32>>,
+) -> Vec<(&'static str, i64)> {
+    let fallback = crate::derive::multicast_geometry_corroborated(structs);
+    let mut geometry: Vec<(&'static str, i64)> = vec![("compat_carrier", 1)];
+    for key in ["compat_futex_abi", "compat_waiter_off", "compat_buffer_size"] {
+        if let Some(value) = numbers.get(key) {
+            geometry.push((key, *value));
+        }
+    }
+    for key in ["task_offset", "lock_offset"] {
+        let value = numbers.get(key).copied().or_else(|| {
+            fallback
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| *value)
+        });
+        if let Some(value) = value {
+            geometry.push((key, value));
+        }
+    }
+    geometry.push(("compact_waiter", crate::derive::MULTICAST_COMPACT_WAITER));
+    geometry
+}
+
 /// The route's branch geometry, with the sigreturn offsets the extractor
 /// derived for this image and the image's waiter shape. `None` falls back to
 /// the patch-range constants (a labelled heuristic in the caller's log).

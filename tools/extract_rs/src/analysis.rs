@@ -86,6 +86,16 @@ impl RouteVerdict {
             && self.verdict == Feasibility::Feasible
             && self.numbers.get("compat_carrier") == Some(&1)
     }
+
+    /// A `multicast_waiter` verdict that is feasible through the AArch32
+    /// compat `MCAST_BLOCK_SOURCE` carrier rather than the 64-bit copy. The
+    /// marker is distinct from the select carrier's: the same `compat_carrier`
+    /// key, scoped by the route.
+    pub fn is_compat_multicast(&self) -> bool {
+        self.route == "multicast_waiter"
+            && self.verdict == Feasibility::Feasible
+            && self.numbers.get("compat_carrier") == Some(&1)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -432,6 +442,12 @@ pub fn route_verdicts(
      * needs sigreturn as its delivery fallback, so the pairing is the
      * condition. Nothing here reads the release family. */
     apply_compat_select(&mut routes, kernel, rel_symbols, sorted_offsets, btf, release);
+    /* The same substitution for the multicast route: the 64-bit copy is too
+     * deep on some images, while the handler's `is_compat_task()` branch
+     * copies the 32-bit `group_source_req` to a different, shallower local
+     * (derive_compat_multicast_layout). Pair it with sigreturn like the
+     * compat select carrier. */
+    apply_compat_multicast(&mut routes, kernel, rel_symbols, sorted_offsets, btf, release);
     routes
 }
 
@@ -500,6 +516,88 @@ fn compat_select_verdict(
              0x{:x} _newselect buffer (packed at 0x{:x})",
             layout.abi, infeasible.reason, layout.waiter_home, layout.select_dst_depth,
             layout.offset
+        ),
+        numbers,
+    }
+}
+
+/// Replace an infeasible 64-bit `multicast_waiter` with the compat variant when
+/// this image's compat copy covers the waiter and sigreturn can deliver. A
+/// derivation that cannot run leaves the verdict infeasible and says why.
+fn apply_compat_multicast(
+    routes: &mut [RouteVerdict],
+    kernel: &[u8],
+    rel_symbols: &RelSymbols,
+    sorted_offsets: &[u64],
+    btf: Option<&Btf>,
+    release: Option<&str>,
+) {
+    let sigreturn_feasible = routes
+        .iter()
+        .any(|verdict| verdict.route == "sigreturn" && verdict.verdict == Feasibility::Feasible);
+    if !sigreturn_feasible {
+        return;
+    }
+    let Some(multicast) = routes
+        .iter_mut()
+        .find(|verdict| verdict.route == "multicast_waiter" && verdict.verdict == Feasibility::Infeasible)
+    else {
+        return;
+    };
+    let kernel_major = release
+        .and_then(|text| text.split('.').next())
+        .and_then(|part| part.parse::<u32>().ok());
+    match crate::derive::derive_compat_multicast_layout(
+        kernel,
+        rel_symbols,
+        sorted_offsets,
+        btf,
+        kernel_major,
+    ) {
+        Ok(layout) => *multicast = compat_multicast_verdict(multicast, &layout),
+        /* A geometry that was derived and does not fit is worth reporting on
+         * top of the 64-bit verdict. An image without the compat copy at all
+         * (the 5.x trains and any build that inlines it) is not a derivation
+         * failure the reader needs; leave the 64-bit verdict's own reason. */
+        Err(crate::error::ExtractError::Infeasible { message, .. }) => {
+            multicast.reason = format!(
+                "{}; compat multicast not feasible: {message}",
+                multicast.reason
+            );
+        }
+        Err(_) => {}
+    }
+}
+
+/// Turn an infeasible 64-bit multicast verdict into the compat-carrier
+/// variant, carrying the geometry this image's compat copy produced.
+fn compat_multicast_verdict(
+    infeasible: &RouteVerdict,
+    layout: &crate::derive::CompatMulticastLayout,
+) -> RouteVerdict {
+    let mut numbers = infeasible.numbers.clone();
+    numbers.insert("compat_carrier".to_string(), 1);
+    numbers.insert("compat_waiter_off".to_string(), layout.waiter_off as i64);
+    numbers.insert("compat_buffer_size".to_string(), layout.buffer_size as i64);
+    numbers.insert("compat_futex_abi".to_string(), layout.futex_abi as i64);
+    numbers.insert("waiter_home".to_string(), layout.waiter_home as i64);
+    numbers.insert("copy_depth".to_string(), layout.copy_depth as i64);
+    numbers.insert("source_overlap".to_string(), layout.source_overlap as i64);
+    RouteVerdict {
+        route: "multicast_waiter",
+        verdict: Feasibility::Feasible,
+        reason: format!(
+            "AArch32 compat MCAST_BLOCK_SOURCE ({}): the 64-bit copy cannot cover the \
+             waiter strip ({}); the compat group_source_req copy at depth 0x{:x} puts \
+             the strip at 0x{:x} under the 0x{:x} buffer (strip end 0x{:x}, source \
+             header {})",
+            layout.abi,
+            infeasible.reason,
+            layout.copy_depth,
+            layout.waiter_off,
+            layout.buffer_size,
+            layout.waiter_off + crate::derive::WAITER_STRIP_BYTES,
+            if layout.source_overlap { "overlapped" } else { "clear" }
         ),
         numbers,
     }

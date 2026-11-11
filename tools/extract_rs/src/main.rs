@@ -1167,6 +1167,19 @@ fn run(cli: &Cli) -> Result<i32> {
             .and_then(|name| route_verdicts.iter().find(|verdict| verdict.route == name))
             .and_then(compat_geometry_for);
         let compat_select = chosen_compat.is_some();
+        /* The compat multicast variant has no 64-bit `waiter_off`/`buffer_size`;
+         * it is placed from the compat copy's own offset and ABI. Keying on
+         * the verdict's marker keeps the render and the superset consistent. */
+        let chosen_compat_multicast = route
+            .as_deref()
+            .and_then(|name| route_verdicts.iter().find(|verdict| verdict.route == name))
+            .filter(|verdict| verdict.is_compat_multicast())
+            .map(|verdict| {
+                report::conf_compat_multicast_route_geometry(
+                    &verdict.numbers,
+                    &struct_offsets,
+                )
+            });
         let route_shift = if compat_select {
             None
         } else if route.as_deref() == Some("select_stack") {
@@ -1221,6 +1234,8 @@ fn run(cli: &Cli) -> Result<i32> {
          * both take it from the same layout derivation. */
         let layouts = layout::derive(btf.as_ref(), release_text);
         let mut geometry = if let Some(compat) = chosen_compat.clone() {
+            compat
+        } else if let Some(compat) = chosen_compat_multicast.clone() {
             compat
         } else if let Some(numbers) = multicast_numbers {
             report::conf_multicast_route_geometry(numbers, &struct_offsets)
