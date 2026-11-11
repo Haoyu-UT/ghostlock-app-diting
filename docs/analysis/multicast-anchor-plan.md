@@ -315,7 +315,12 @@ carrier.
    window rule (0x48 in the address view), so the anchored multicast cannot run there either; its
    shipped tcp/select routes are unaffected, and the 6.1 anchor search found no safe candidate
    (`dump_skip.zeroes` absent; the large candidates live). The host gate is possible; the device
-   gate is the 246.
+   gate is the 246. **2026-11-11:** the 6.6/6.12 handler shape was derived and measured — the
+   0x108 copy lives in its own `do_mcast_group_source` (not `do_ip_setsockopt`), the 6.12 waiter
+   local is `x26`, and the image-derived geometry on every 6.6/6.12 store entry is
+   `waiter_off 0x198`, `window_end 0x1f8` against buffer `0x108` — **short by 0xf0**. The route
+   is a 5.x-only shape in practice (5.10.236/6.1.138 are short by 0x88). Evidence:
+   `external/port/multicast-6x-2026-11-11/`.
 6. **Profile-schema risk.** The anchor trio is per-route, per-build data; a wrong value is a kernel
    crash. The decoder must not fall back to the diting's defaults for a 246 profile.
 7. **The route's weak success signal** (`setsockopt == 0 || consumer_success > 0`) means a clean

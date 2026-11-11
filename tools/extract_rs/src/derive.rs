@@ -351,9 +351,11 @@ pub fn multicast_copy_candidates(
     sorted: &[u64],
 ) -> Result<Vec<(&'static str, u64)>> {
     let mut out = Vec::new();
-    // 5.x keeps the copy in `ip_setsockopt`; 6.x splits the option handlers
-    // into `do_ip_setsockopt`, which then owns the copy. Try both per image.
-    for name in ["ip_setsockopt", "do_ip_setsockopt"] {
+    // The copy's home is compiler- and release-dependent: 5.10/5.15 inline the
+    // option handlers into `ip_setsockopt`, 6.1 splits out `do_ip_setsockopt`,
+    // and 6.6/6.12 keep `do_mcast_group_source` as its own symbol. A name an
+    // image does not carry is skipped.
+    for name in ["ip_setsockopt", "do_ip_setsockopt", "do_mcast_group_source"] {
         let Ok(lines) = disassemble_symbol(kernel, symbols, sorted, name, OBJDUMP_CAP) else {
             continue;
         };
@@ -408,8 +410,11 @@ fn greqs_offset_from_dis(lines: &[String], buffer_size: u64) -> Option<u64> {
     None
 }
 
-/// The `add x27, sp, #off` waiter local in `futex_wait_requeue_pi`, proven by
-/// the `add xN, x27, #<pi_tree_entry>` that indexes it.
+/// The waiter local in `futex_wait_requeue_pi`, proven by the
+/// `add xN, <base>, #<pi_tree_entry>` that indexes it. The 5.10/5.15/6.1 builds
+/// materialize it in x27; a 6.12 build may pick another register (x26 on the
+/// A16), so the fallback proves any `add xN, sp, #imm` the same way and
+/// requires a unique offset with a live frame at the anchor.
 fn waiter_local_from_dis(lines: &[String], pi_tree_entry: u64) -> Option<u64> {
     let set = Regex::new(r"(?i)\badd\s+x27,\s*sp,\s*#0x([0-9a-f]+)").unwrap();
     let idx = Regex::new(&format!(
@@ -424,7 +429,24 @@ fn waiter_local_from_dis(lines: &[String], pi_tree_entry: u64) -> Option<u64> {
             }
         }
     }
-    None
+
+    let mut candidates: Vec<(String, u64)> = Vec::new();
+    for (reg, imm) in add_sp_immediates(lines) {
+        let index =
+            Regex::new(&format!(r"(?i)\badd\s+x\d+,\s*{reg},\s*#0x{pi_tree_entry:x}\b")).unwrap();
+        if lines.iter().any(|line| index.is_match(line)) {
+            candidates.push((reg, imm));
+        }
+    }
+    let mut seen = BTreeSet::new();
+    candidates.retain(|(_, imm)| seen.insert(*imm));
+    if candidates.len() != 1 {
+        return None;
+    }
+    let (reg, imm) = &candidates[0];
+    let anchor = Regex::new(&format!(r"(?i)\badd\s+{reg},\s*sp,\s*#0x{imm:x}\b")).unwrap();
+    validate_frame_live_at(lines, &anchor, "futex_wait_requeue_pi").ok()?;
+    Some(*imm)
 }
 
 /// Static one-shot multicast `waiter_off` for the target image:
@@ -467,6 +489,15 @@ pub(crate) fn multicast_waiter_off_at(
 ) -> Result<McastWaiterGeometry> {
     let mut chain = SETSOCKOPT_CHAIN.to_vec();
     if copy_fn != "ip_setsockopt" {
+        /* 6.x splits the handler: `ip_setsockopt` wraps `do_ip_setsockopt`,
+         * which owns the option cases and, from 6.6, calls the copy helper as
+         * a separate function. Sum every layer the image actually carries;
+         * 5.10/5.15 inline them all and add nothing here. */
+        if copy_fn != "do_ip_setsockopt"
+            && unique_offset_optional(symbols, "do_ip_setsockopt").is_some()
+        {
+            chain.push("do_ip_setsockopt");
+        }
         chain.push(copy_fn);
     }
     let setsockopt_frames = sum_chain_frames(kernel, symbols, sorted, &chain)?;
@@ -774,6 +805,20 @@ mod tests {
             "0124: add x9, x27, #0x18".to_string(),
         ];
         assert_eq!(super::waiter_local_from_dis(&fw, 0x18), Some(0x98));
+    }
+
+    #[test]
+    fn a_non_x27_waiter_local_is_proven_by_the_pi_tree_index() {
+        /* 6.12.23 (A16): the waiter local is x26 and pi_tree is reached as
+         * `add x27, x26, #0x28`; the later `add x27, sp, #0x80` is a different
+         * local and must not become a candidate. */
+        let fw: Vec<String> = vec![
+            "0000: stp x29, x30, [sp, #-0x1c0]!".to_string(),
+            "0040: add x26, sp, #0xa0".to_string(),
+            "0050: add x27, x26, #0x28".to_string(),
+            "0070: add x27, sp, #0x80".to_string(),
+        ];
+        assert_eq!(super::waiter_local_from_dis(&fw, 0x28), Some(0xa0));
     }
 
     #[test]

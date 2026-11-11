@@ -161,8 +161,10 @@ entries put `dirtyfrag` first; everything else is `["ghostlock"]`). Design:
 
 ## 5. Risks / open questions
 
-- The multicast copy length on 6.x may not be a simple immediate at the call site; when it cannot
-  be read the verdict must be `Unknown`, not the 5.x constant.
+- The multicast copy length on 6.x is not an immediate in `do_ip_setsockopt`: 6.6/6.12 keep the
+  handler in its own `do_mcast_group_source`, where the 0x108 copy is a `mov w3` before
+  `copy_from_sockptr` (2026-11-11: derived; every 6.6/6.12 store entry is `infeasible`, short by
+  0xf0). When the copy cannot be found the verdict stays `Unknown`, never the 5.x constant.
 - The 6.5+ marking site for the send half needs its own pattern; the two known images (6.6.66,
   6.12.23) are the gate for the matcher.
 - The bundling switch changes what the default bundle ships for eligible kernels; the A/B
