@@ -94,9 +94,17 @@ route. It also emits the pipeline feasibility verdicts:
 
 The implementation accepts **any feasible route** for W1 (the old `select_stack` proxy is gone,
 2026-11-10); the profile's selected route is feasible by construction, including page-based
-`tcp_zerocopy`. The remaining send-path precision (the direct-call scan's negative `copy`
-inference) is the pipeline-selection item in `PORT-PLAN.md`; the static verdict is a conservative
-capability class, and the app's pre-W1 probe is the behavioural check.
+`tcp_zerocopy`. The send-path scan was made positive-evidence-only on 2026-11-11: it follows
+`bl` **and** tail branches (`b`), inspects the immediate append wrappers and the IPv6 twin
+(an LTO build may inline the inner append function), reports `copy` only when every
+page-attaching candidate was inspected and none calls its helper, and reports `unknown` (never
+`copy`) when a candidate exists with no inspectable caller. The `--no-disasm` control reports the
+two disassembly-derived facts unknown and refuses with "could not be measured", never "copies".
+The whole option-superset corpus is unchanged (evidence:
+`external/port/send-path-precision-2026-11-11/`). Residual limit: a 6.5+ LTO kernel whose
+`skb_splice_from_iter` is inlined and whose `ip_append_page` is absent has no call to find and is
+reported `unknown` — the static scan cannot prove a capability that left no symbol; the app's
+pre-W1 probe remains the behavioural check where the static verdict is feasible.
 
 The extractor derives the **default order** from the verdicts; it does not ask:
 

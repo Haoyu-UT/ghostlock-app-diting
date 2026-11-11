@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::analysis::{Feasibility, RouteVerdict};
 use crate::derive::{RelSymbols, disassemble_symbol, unique_offset_optional};
-use crate::disasm::has_direct_call;
+use crate::disasm::{has_call_or_tail_branch, has_direct_call};
 use crate::ikconfig::KernelConfig;
 
 /// Presence of the ESP shared-frag half of upstream `f4c50a4034e6`
@@ -346,38 +346,67 @@ fn shared_frag_test_line(line: &str) -> bool {
     test.is_match(line)
 }
 
-/// A qualifying send path is proved by a direct call from the UDP splice
-/// entry point. `Copy` is reported when the callers exist and none calls the
-/// splice helper; `Unknown` when there is no caller to inspect.
+/// The functions the 6.5+ splice helper is called from, or could be after
+/// inlining. `__ip_append_data`/`__ip6_append_data` carry the call upstream;
+/// the wrappers and `udp_sendmsg` cover an LTO build that inlines the inner
+/// append function. A name a kernel does not carry is skipped, so this is a
+/// superset of the call sites, not a requirement.
+const SPLICE_CALLERS: &[&str] = &[
+    "__ip_append_data",
+    "__ip6_append_data",
+    "ip_append_data",
+    "ip6_append_data",
+    "ip_make_skb",
+    "ip6_make_skb",
+    "ip_push_pending_frames",
+    "ip6_push_pending_frames",
+    "udp_sendpage",
+    "inet_sendpage",
+    "ip_append_page",
+    "udp_sendmsg",
+];
+
+/// The functions the 5.10 page path is called from. `udp_sendpage` is the
+/// measured caller; the rest cover a vendor shape that moved the call.
+const APPEND_PAGE_CALLERS: &[&str] = &["udp_sendpage", "inet_sendpage", "udp_sendmsg"];
+
+/// A qualifying send path is proved by a call or tail branch from the UDP
+/// splice entry point. `Copy` is reported only when every page-attaching
+/// candidate was inspected and none calls the helper; `Unknown` when a
+/// candidate exists but has no caller to inspect — an unexamined path is not
+/// evidence that the page is copied.
 fn send_path(kernel: &[u8], rel_symbols: &RelSymbols, sorted_offsets: &[u64]) -> SendPath {
-    let mut caller_seen = false;
-    if let Some(splice) = unique_offset_optional(rel_symbols, "skb_splice_from_iter") {
-        for caller in ["__ip_append_data", "udp_sendpage", "ip_append_page"] {
-            let Ok(dis) =
-                disassemble_symbol(kernel, rel_symbols, sorted_offsets, caller, 0x2000)
+    let mut inspected = 0u32;
+    let mut unexamined = 0u32;
+    for (symbol, callers, path) in [
+        (
+            "skb_splice_from_iter",
+            SPLICE_CALLERS,
+            SendPath::SkbSpliceFromIter,
+        ),
+        ("ip_append_page", APPEND_PAGE_CALLERS, SendPath::IpAppendPage),
+    ] {
+        let Some(target) = unique_offset_optional(rel_symbols, symbol) else {
+            continue;
+        };
+        let mut caller_seen = false;
+        for caller in callers {
+            let Ok(dis) = disassemble_symbol(kernel, rel_symbols, sorted_offsets, caller, 0x2000)
             else {
                 continue;
             };
             caller_seen = true;
-            if has_direct_call(&dis, splice) {
-                return SendPath::SkbSpliceFromIter;
+            if has_call_or_tail_branch(&dis, target) {
+                return path;
             }
         }
-    }
-    if let Some(append) = unique_offset_optional(rel_symbols, "ip_append_page") {
-        for caller in ["udp_sendpage", "inet_sendpage"] {
-            let Ok(dis) =
-                disassemble_symbol(kernel, rel_symbols, sorted_offsets, caller, 0x2000)
-            else {
-                continue;
-            };
-            caller_seen = true;
-            if has_direct_call(&dis, append) {
-                return SendPath::IpAppendPage;
-            }
+        if caller_seen {
+            inspected += 1;
+        } else {
+            unexamined += 1;
         }
     }
-    if caller_seen {
+    if inspected > 0 && unexamined == 0 {
         SendPath::Copy
     } else {
         SendPath::Unknown
@@ -544,6 +573,68 @@ mod tests {
     }
 
     #[test]
+    fn the_page_based_tcp_route_alone_carries_w1() {
+        /* tcp_zerocopy is page-based, not page-free; W1 is a zero write and
+         * the route's crafted page lock performs it (measured on the 6.1
+         * POCO's page-based control). A profile that selects it must still
+         * get the DirtyFrag option. */
+        let routes = vec![
+            route("select_stack", Feasibility::Infeasible),
+            route("multicast_waiter", Feasibility::Infeasible),
+            route("sigreturn", Feasibility::Infeasible),
+            route("tcp_zerocopy", Feasibility::Feasible),
+        ];
+        let verdicts = verdicts(
+            &facts(Some(false), EspFix::Absent, SendPath::IpAppendPage),
+            &routes,
+        );
+        assert_eq!(verdicts[1].verdict, "feasible");
+        assert!(verdicts[1].reason.contains("tcp_zerocopy"));
+    }
+
+    #[test]
+    fn an_unknown_w1_route_is_not_a_vehicle() {
+        /* A route whose verdict is unknown was not measured; it cannot
+         * stand in for a feasible W1 vehicle. */
+        let routes = vec![
+            route("select_stack", Feasibility::Unknown),
+            route("sigreturn", Feasibility::Infeasible),
+        ];
+        let verdicts = verdicts(
+            &facts(Some(false), EspFix::Absent, SendPath::IpAppendPage),
+            &routes,
+        );
+        assert_eq!(verdicts[1].verdict, "infeasible");
+        assert!(verdicts[1].reason.contains("no route"));
+    }
+
+    #[test]
+    fn an_unmeasured_send_path_is_not_a_proven_copy() {
+        /* --no-disasm leaves the fact unknown. The verdict stays
+         * conservative (infeasible), and the reason says it was not
+         * measured rather than claiming the path copies. */
+        let routes = vec![route("select_stack", Feasibility::Feasible)];
+        let verdicts = verdicts(&facts(Some(false), EspFix::Absent, SendPath::Unknown), &routes);
+        assert_eq!(verdicts[1].verdict, "infeasible");
+        assert!(verdicts[1].reason.contains("could not be measured"));
+    }
+
+    #[test]
+    fn without_disassembly_every_send_fact_is_unknown_not_copy() {
+        /* The measure entry point under --no-disasm: nothing is reported as
+         * absent or copied, and the verdict refuses with "not measured". */
+        let symbols = BTreeMap::new();
+        let rel = RelSymbols::new();
+        let measured = measure(&[], &symbols, &rel, &[], None, false);
+        assert_eq!(measured.send_path, SendPath::Unknown);
+        assert_eq!(measured.esp_fix, EspFix::Unknown);
+        assert_eq!(measured.kdp, None);
+        let verdicts = verdicts(&measured, &[]);
+        assert_eq!(verdicts[1].verdict, "infeasible");
+        assert!(verdicts[1].reason.contains("could not be measured"));
+    }
+
+    #[test]
     fn no_w1_route_blocks_dirtyfrag() {
         let routes = vec![
             route("select_stack", Feasibility::Infeasible),
@@ -570,3 +661,4 @@ mod tests {
         );
     }
 }
+

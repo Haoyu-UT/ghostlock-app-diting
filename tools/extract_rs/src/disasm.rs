@@ -92,6 +92,15 @@ pub fn has_direct_call(lines: &[String], target: u64) -> bool {
     lines.iter().any(|line| re.is_match(line))
 }
 
+/// A call or a tail branch to `target` (`bl`/`b`). A caller that proves a
+/// capability may end with `return helper(...)`, which `-Os`/LTO compiles to
+/// a `b`; control still reaches the callee and the capability is exercised.
+/// Not a substitute for `has_direct_call` where the call's *result* matters.
+pub fn has_call_or_tail_branch(lines: &[String], target: u64) -> bool {
+    let re = Regex::new(&format!(r"(?i)\b(?:bl|b)\s+0x{target:x}\b")).unwrap();
+    lines.iter().any(|line| re.is_match(line))
+}
+
 fn is_sp_sub_imm(line: &str) -> bool {
     Regex::new(r"(?i)\bsub\s+sp,\s*sp,\s*#0x[0-9a-f]+")
         .unwrap()
@@ -266,3 +275,29 @@ pub fn is_mov_w0_wzr(line: &str) -> bool {
 
 /// Alias for ARMv8 decoder used by callers that need a decoder type.
 pub type Armv8 = ARMv8;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_call_or_a_tail_branch_reaches_the_target() {
+        let lines: Vec<String> = ["bl 0x1234", "b 0x5678", "ret"]
+            .iter()
+            .map(|line| line.to_string())
+            .collect();
+        assert!(has_call_or_tail_branch(&lines, 0x1234));
+        assert!(has_call_or_tail_branch(&lines, 0x5678));
+        assert!(!has_call_or_tail_branch(&lines, 0x9abc));
+    }
+
+    #[test]
+    fn conditional_branches_and_longer_targets_do_not_match() {
+        let lines: Vec<String> = ["b.eq 0x1234", "cbz x0, 0x1234", "tbz w0, #5, 0x1234", "bl 0x12345"]
+            .iter()
+            .map(|line| line.to_string())
+            .collect();
+        assert!(!has_call_or_tail_branch(&lines, 0x1234));
+        assert!(has_call_or_tail_branch(&lines, 0x12345));
+    }
+}
