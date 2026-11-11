@@ -24,9 +24,11 @@
 namespace ghostlock::compat {
     inline constexpr uint32_t kCommandMagic = 0x31434c47U; /* "GLC1" */
     inline constexpr uint32_t kResultMagic = 0x31524c47U;  /* "GLR1" */
-    /* 2: the smoke result carries nine slots (futex_time64 joined the G2
-     * delivery gate; a stale helper must refuse rather than misread). */
-    inline constexpr uint32_t kProtocolVersion = 2U;
+    /* 3: the multicast mode. The command carries the 0x104-byte compat
+     * group_source_req stamp and its option; the result carries the
+     * setsockopt return and two new smoke slots (socket, setsockopt). A
+     * stale helper refuses rather than misread. */
+    inline constexpr uint32_t kProtocolVersion = 3U;
 
     /* nfds is fixed at 320: it keeps the kernel's six bitmaps on the 256-byte
      * stack path (6 * FDS_BYTES(320) = 240 bytes) and gives the measured
@@ -34,10 +36,17 @@ namespace ghostlock::compat {
     inline constexpr uint32_t kCarrierNfds = 320U;
     inline constexpr uint32_t kCarrierWordsPerSet = kCarrierNfds / 32U;
     inline constexpr uint32_t kCarrierBitmapBytes = 3U * kCarrierWordsPerSet * 4U;
+    /* The compat MCAST_BLOCK_SOURCE argument: a 32-bit `group_source_req`
+     * (u32 interface, then two sockaddr_storage's). Its size is derived from
+     * the image (`compat_buffer_size`) and must fit this buffer. */
+    inline constexpr uint32_t kCarrierStampBytes = 0x104U;
 
     enum class CarrierMode : uint32_t {
         Smoke = 0,
         Run = 1,
+        /* The waiter thread parks in setsockopt(MCAST_BLOCK_SOURCE) instead
+         * of _newselect; the stamp is command.stamp. */
+        Multicast = 2,
     };
 
     /* Which futex entry the waiter calls. The ABI follows the strip home the
@@ -69,6 +78,13 @@ namespace ghostlock::compat {
         /* in/out/ex, each kCarrierWordsPerSet little-endian 32-bit words. */
         uint8_t bitmap[kCarrierBitmapBytes] = {};
         uint8_t pad[8] = {};
+        /* Multicast mode: the native-built 32-bit `group_source_req` with the
+         * eleven-word waiter strip already placed at compat_waiter_off, and
+         * the IP option number (MCAST_BLOCK_SOURCE). The helper never
+         * interprets the stamp. */
+        uint32_t stamp_bytes = 0;
+        uint32_t option = 0;
+        uint8_t stamp[kCarrierStampBytes] = {};
     };
 
     /* The helper reports the same five RouteStatus fields the 64-bit route
@@ -87,12 +103,17 @@ namespace ghostlock::compat {
         int32_t drain_ms = 0;
         uint32_t userspace_clean = 0;
         uint32_t kernel_disarmed = 0;
+        /* Multicast mode: the setsockopt return and errno (the route accepts a
+         * failed call when the consumer's walk succeeded). */
+        int32_t route_result = 0;
+        int32_t route_errno = 0;
         /* Smoke mode only: futex, timerfd_create, _newselect, sched_setattr,
-         * dup2_high, pipe2, fcntl_high, prctl, futex_time64. A SIGSYS-killed
-         * syscall never fills its slot; the native sees the helper die
-         * instead. The time64 entry (422) is a separate syscall number in the
-         * arm-app seccomp policy, so it gets its own slot. */
-        int32_t smoke[9] = {};
+         * dup2_high, pipe2, fcntl_high, prctl, futex_time64, socket,
+         * setsockopt. A SIGSYS-killed syscall never fills its slot; the native
+         * sees the helper die instead. The time64 entry (422) and the two
+         * multicast entries are separate numbers in the arm-app seccomp
+         * policy, so each gets its own slot. */
+        int32_t smoke[11] = {};
         uint32_t reserved = 0;
     };
 
@@ -101,12 +122,18 @@ namespace ghostlock::compat {
     static_assert(offsetof(CarrierCommand, futex_abi) == sizeof(uint32_t) * 3);
     static_assert(offsetof(CarrierCommand, bitmap) == sizeof(uint32_t) * 16);
     static_assert(offsetof(CarrierCommand, pad) == sizeof(uint32_t) * 16 + kCarrierBitmapBytes);
-    static_assert(sizeof(CarrierCommand) == sizeof(uint32_t) * 16 + kCarrierBitmapBytes + 8);
+    static_assert(offsetof(CarrierCommand, stamp_bytes) ==
+                  sizeof(uint32_t) * 16 + kCarrierBitmapBytes + 8);
+    static_assert(offsetof(CarrierCommand, stamp) ==
+                  sizeof(uint32_t) * 16 + kCarrierBitmapBytes + 16);
+    static_assert(sizeof(CarrierCommand) ==
+                  sizeof(uint32_t) * 16 + kCarrierBitmapBytes + 16 + kCarrierStampBytes);
 
     static_assert(std::is_standard_layout_v<CarrierResult>);
     static_assert(std::is_trivially_copyable_v<CarrierResult>);
-    static_assert(offsetof(CarrierResult, smoke) == sizeof(uint32_t) * 12);
-    static_assert(sizeof(CarrierResult) == sizeof(uint32_t) * 22);
+    static_assert(offsetof(CarrierResult, route_result) == sizeof(uint32_t) * 12);
+    static_assert(offsetof(CarrierResult, smoke) == sizeof(uint32_t) * 14);
+    static_assert(sizeof(CarrierResult) == sizeof(uint32_t) * 26);
 } // namespace ghostlock::compat
 
 #endif

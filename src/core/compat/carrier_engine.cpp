@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/futex.h>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <atomic>
 #include <cstdio>
@@ -25,6 +26,7 @@
 #include <signal.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/timerfd.h>
@@ -43,6 +45,15 @@
 #ifndef __NR_sched_setattr
 #define __NR_sched_setattr 380
 #endif
+/* arm EABI numbers: the arm64 compat table aliases 294 to
+ * __arm64_sys_setsockopt, which is what makes the handler's
+ * is_compat_task() branch reachable from this process. */
+#ifndef __NR_socket
+#define __NR_socket 281
+#endif
+#ifndef __NR_setsockopt
+#define __NR_setsockopt 294
+#endif
 
 namespace {
     using ghostlock::compat::CarrierCommand;
@@ -55,6 +66,10 @@ namespace {
     constexpr int kRouteRetryable = 1;
     constexpr int kRouteDirty = 3;
     constexpr int32_t kDrainMs = 1000;
+    /* The multicast mode's post-copy consumer drive: a pure userspace spin (a
+     * clock read could be a syscall on some bionic paths, so the bound is a
+     * counter). The select path gets its window from the blocking syscall. */
+    constexpr uint64_t kDriveSpins = 200000000ULL;
     constexpr int32_t kFdCount = 320;
     constexpr int32_t kSetBytes = 0x28;
     constexpr int32_t kBackupBase = 384;
@@ -114,6 +129,8 @@ namespace {
         uint32_t chain_futex = 0;
         int32_t select_result = 0;
         int32_t select_errno = 0;
+        int32_t route_result = 0;
+        int32_t route_errno = 0;
         int32_t drain_ms = 0;
         int32_t step = 0;
         int32_t error_number = 0;
@@ -324,21 +341,62 @@ namespace {
                                        &engine->target_futex, 0);
         log_value("compat-engine: waiter futex ret", wait_ret);
         log_value("compat-engine: waiter futex errno", errno);
-        log_line("compat-engine: waiter woke; entering _newselect");
-        engine->consumer_go.store(1);
-        struct timeval tv {};
-        tv.tv_sec = static_cast<time_t>(command.select_timeout_us / 1000000U);
-        tv.tv_usec = static_cast<suseconds_t>(command.select_timeout_us % 1000000U);
-        errno = 0;
-        const long selected = syscall(
-            __NR__newselect, static_cast<int>(command.nfds),
-            const_cast<uint8_t *>(command.bitmap),
-            const_cast<uint8_t *>(command.bitmap) + kSetBytes,
-            const_cast<uint8_t *>(command.bitmap) + 2 * kSetBytes, &tv);
-        engine->select_result = static_cast<int32_t>(selected);
-        engine->select_errno = errno;
-        log_value("compat-engine: _newselect ret", selected);
+        log_line("compat-engine: waiter woke; entering the route park");
+        int32_t route_fd = -1;
+        if (command.mode == static_cast<uint32_t>(ghostlock::compat::CarrierMode::Multicast)) {
+            /* The compat MCAST_BLOCK_SOURCE copy: the waiter's only syscall
+             * between the futex return and the consumer's walk. The kernel's
+             * is_compat_task() branch copies command.stamp over the stale
+             * waiter; the walk is triggered after the copy, as the 64-bit
+             * multicast route does. */
+            errno = 0;
+            route_fd = static_cast<int32_t>(
+                syscall(__NR_socket, AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0));
+            if (route_fd >= 0) {
+                errno = 0;
+                const long set = syscall(
+                    __NR_setsockopt, route_fd, IPPROTO_IP,
+                    static_cast<int>(command.option), command.stamp,
+                    static_cast<unsigned int>(command.stamp_bytes));
+                engine->route_result = static_cast<int32_t>(set);
+                engine->route_errno = set == 0 ? 0 : errno;
+                /* No syscall between the copy and the walk -- not even a log
+                 * write or close(fd): every syscall reuses this stack and
+                 * overwrites the stamped strip. The trigger and the wait are
+                 * userspace only (vDSO clock, yield). */
+                engine->consumer_go.store(1);
+                for (uint64_t spin = 0;
+                     spin < kDriveSpins && engine->consumer_calls.load() == 0;
+                     spin++) {
+                    relax();
+                }
+            } else {
+                engine->route_result = -1;
+                engine->route_errno = errno;
+            }
+        } else {
+            log_line("compat-engine: waiter woke; entering _newselect");
+            engine->consumer_go.store(1);
+            struct timeval tv {};
+            tv.tv_sec = static_cast<time_t>(command.select_timeout_us / 1000000U);
+            tv.tv_usec = static_cast<suseconds_t>(command.select_timeout_us % 1000000U);
+            errno = 0;
+            const long selected = syscall(
+                __NR__newselect, static_cast<int>(command.nfds),
+                const_cast<uint8_t *>(command.bitmap),
+                const_cast<uint8_t *>(command.bitmap) + kSetBytes,
+                const_cast<uint8_t *>(command.bitmap) + 2 * kSetBytes, &tv);
+            engine->select_result = static_cast<int32_t>(selected);
+            engine->select_errno = errno;
+            log_value("compat-engine: _newselect ret", selected);
+        }
         engine->drain_ms = wait_consumer_idle(engine, kDrainMs);
+        if (command.mode == static_cast<uint32_t>(ghostlock::compat::CarrierMode::Multicast)) {
+            /* The walk is over; the waiter may syscall again. */
+            log_value("compat-engine: setsockopt ret", engine->route_result);
+            log_value("compat-engine: setsockopt errno", engine->route_errno);
+            if (route_fd >= 0) (void) close(route_fd);
+        }
         log_value("compat-engine: drain ms", engine->drain_ms);
         FutexTimeout expired {};
         const uint32_t dummy = 0x80000000U | static_cast<uint32_t>(getpid());
@@ -543,6 +601,8 @@ namespace ghostlock::compat {
         const int32_t successes = engine.consumer_success.load();
         result->select_result = engine.select_result;
         result->select_errno = engine.select_errno;
+        result->route_result = engine.route_result;
+        result->route_errno = engine.route_errno;
         result->calls = calls;
         result->successes = successes;
         result->drain_ms = engine.drain_ms;
@@ -557,7 +617,11 @@ namespace ghostlock::compat {
         } else {
             result->status = static_cast<uint32_t>(kRouteRetryable);
             result->step = 33;
-            result->error_number = engine.select_errno;
+            result->error_number =
+                command.mode ==
+                        static_cast<uint32_t>(ghostlock::compat::CarrierMode::Multicast)
+                    ? engine.route_errno
+                    : engine.select_errno;
         }
         log_value("compat-engine: status", static_cast<long>(result->status));
         log_value("compat-engine: calls", calls);
