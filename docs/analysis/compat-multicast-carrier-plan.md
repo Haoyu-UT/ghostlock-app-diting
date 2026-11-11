@@ -357,6 +357,68 @@ pair must differ (a same-CPU EL0 preemption over the spinning waiter writes its 
 the strip). Remaining: the duchamp G2 (app seccomp/SELinux) and G3 (device series). No
 device run yet.
 
+## Implementation status (G2, 2026-11-12)
+
+G2 on the **duchamp** (POCO X6 Pro 5G, HyperOS `OS3.0.9.0.WNLMX`, Android 16, kernel
+`6.1.138-android14-11-g44bda9e8f6e9-ab13792638`) with the debug build (versionCode 737) and
+an external SAF profile rendered by the extractor for that Image
+(`--route multicast_waiter --anchor --device duchamp`: `compat_carrier=1`,
+`compat_futex_abi=1`, `compat_waiter_off=72`, `compat_buffer_size=260`, anchor
+`+0x2224cd0`/4096/32, the measured `mm_struct_sz=1024`).
+
+**Pass.** The native starts under `untrusted_app` with the app's single filter
+(`Seccomp=2 Seccomp_filters=1`) and the extended smoke returns **0 for all eleven calls**:
+`futex timerfd_create _newselect sched_setattr pipe2 fcntl_high dup2_319 prctl
+futex_time64 socket setsockopt` (helper exit 0, signal 0). The two new entries are the ARM
+EABI 281/294 calls from the armv7 helper — the Android 14+ seccomp branch allows them.
+
+**The route also ran on the device.** On the first boot's run the compat multicast carrier
+carried W1 (SELinux enforcing → permissive), W1p (init_cred usage pin) and W2 (the cred
+write): each `compat multicast attempt=1/4 status=0 step=0 calls=1 success=1 clean=1/1`, the
+write verified by the stage (`SELinux permissive`; `W1p`/`W2` accepted). The consumer walk
+used the anchor slot (slot 0/1/3) and `drain=0ms`. The run then failed in W2b, see below.
+
+Three defects the device run exposed, all fixed in this change:
+
+1. **The app validator required the 64-bit geometry.** `validateProfileFields` demanded
+   `waiter_off`/`buffer_size` and the 5.x cred slots (`cred.ref_count`, `copy_size ≥ 0xa0`)
+   for every `multicast_waiter` profile, so the compat profile loaded but the home showed
+   `配置需要修正` and the run button was hidden. The multicast branch is now compat-aware
+   (`AndroidProfileConfigController.validateMulticastGeometry`), and
+   `ProfileResolver.validateCompatCarrierGroup` refuses a compat switch without its group.
+   Tests: `ProfileLayerPolicyTest` (a compat profile validates and applies; a truncated one
+   is refused). App 233 / profile-core 60.
+2. **The W2b fast repair bypassed the route middleware.** `MulticastPolicy::w2_fast_repair_activate`
+   called `race::run_main_route_threads` directly, which is the native 64-bit multicast
+   route — it refused the compat profile (`multicast geometry incomplete`). It now calls
+   `route::middleware::run_middleware_route`, so the repair takes the same compat
+   dispatch as every other write.
+3. **The select carrier's delay ladder was applied after the copy.** The multicast branch
+   reused the select carrier's `delay_us` ladder (attempt 1 = 50 ms), but here the trigger
+   is stored *after* the setsockopt copy has returned and the waiter spins on the stamped
+   stack; the ladder is pure strip-clobber window (the `+0x188` class). On a busy fresh
+   boot one run panicked during its first attempt (`kernel_panic` boot reason; the run log
+   stops after the waiter's futex return). The multicast mode now passes `delay_us = 0`.
+
+**G3 (5 fresh boots, `g3-series/`): the route carries the whole chain, 1/5 runs.** Run 2
+completed the exploit through the compat carrier — 8 clean calls (W1, W1p, W2, the W2b
+repair, W3-0, both W3 writes, the seccomp-mode write), `exploit complete` at T+13.9 s,
+`native exited code=0`, `KernelSU ready`, store `completed`. Runs 1, 3, 4 and 5 panicked
+(the ROM sets `kernel.panic_on_oops=1`): the same strip-clobber class the select/sigreturn
+routes have, fatal per oops on this device, at ≈ 20 % per route call (15 successful calls,
+4 deaths). The **same-build select control read 3/3 completed, 24/24 clean calls** — the
+select waiter blocks inside `_newselect` with the stamped fd-set in a live frame, while the
+compat multicast's waiter spins in EL0 on its own stack during the walk, so the multicast
+carrier is the structurally weaker one on this ROM. The carrier is **not bundled** — the
+store's route priority keeps `sigreturn` for 6.1.134 and `select_stack` for 6.1.138 — and a
+follow-up hardening (deferring the pre-copy diagnostic writes on the helper, which reuse
+the stack the kernel's `pi_blocked_on` still points at) is in the tree for the next build.
+
+A later pass also deferred the multicast engine's two pre-copy diagnostic writes (they were
+in the window between the futex timeout and the stamp copy, where the kernel's
+`pi_blocked_on` still references the waiter on that stack); the select carrier's log order
+is unchanged.
+
 ## Approval
 
 **Requested:** approve the **compat multicast carrier (AArch32 `MCAST_BLOCK_SOURCE`)**
