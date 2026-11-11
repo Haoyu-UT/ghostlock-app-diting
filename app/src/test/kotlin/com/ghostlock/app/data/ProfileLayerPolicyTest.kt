@@ -206,6 +206,117 @@ class ProfileLayerPolicyTest {
             .replace("route_wait_ms = null", "route_wait_ms = $routeWaitMs")
     }
 
+    @Test
+    fun `a compat multicast external profile validates and applies`() = runBlocking {
+        val release = "6.1.138-android14-11-g44bda9e8f6e9-ab13792638"
+        val uri = external.add("content://profiles/compat.conf", compatMulticastDocument(release))
+
+        assertNotNull(controller.selectExternalProfile(uri, release, pair))
+        val config = controller.load(release, pair)
+
+        assertTrue(config.hasProfile)
+        assertTrue(config.layers!!.externalApplied)
+        /* The 64-bit pair and the 5.x cred reference slots are legitimately
+         * absent; the compat geometry replaces them. Nothing may be flagged. */
+        assertTrue(config.invalidPaths.toString(), config.invalidPaths.isEmpty())
+        assertEquals("multicast_waiter", config.route)
+    }
+
+    @Test
+    fun `a compat multicast switch without its geometry is refused`() = runBlocking {
+        val release = "6.1.138-android14-11-g44bda9e8f6e9-ab13792638"
+        val text = compatMulticastDocument(release)
+            .replace("compat_waiter_off = 72\n", "")
+        val uri = external.add("content://profiles/compat-truncated.conf", text)
+
+        assertNotNull(controller.selectExternalProfile(uri, release, pair))
+        val config = controller.load(release, pair)
+
+        assertTrue(config.hasProfile)
+        assertTrue(
+            "route.multicast_waiter.compat_waiter_off" in config.invalidPaths,
+        )
+    }
+
+    /**
+     * A compat-carrier profile as the extractor renders it: the 64-bit pair
+     * absent, the compat geometry present, the 6.x cred template (no 5.x
+     * reference slots) and the measured slab stride.
+     */
+    private fun compatMulticastDocument(release: String): String = """
+        include "credential-6_1.conf"
+        include "kernelsnitch-6x.conf"
+        release = "$release"
+        schema_version = 2
+        kernel_major = 6
+        pipeline = [ "ghostlock" ]
+        route {
+          multicast_waiter {
+            waiter_off = null
+            buffer_size = null
+            task_offset = 48
+            lock_offset = 56
+            compact_waiter = 1
+            compat_carrier = 1
+            compat_futex_abi = 1
+            compat_waiter_off = 72
+            compat_buffer_size = 260
+            lock_anchor_image = 35802320
+            lock_anchor_bytes = 4096
+            lock_anchor_stride = 32
+          }
+        }
+        fallback {
+          to = "none"
+        }
+        selinux {
+          enforcing = 0
+          initialized = 2
+        }
+        w1_scratch {
+          image = 35459072
+        }
+        kernelsnitch {
+          mm_struct_sz = 1024
+        }
+        task_struct {
+          prio = 132
+          normal_prio = 140
+          sched_task_group = 840
+          pi_lock = 2340
+          pi_waiters = 2360
+          pi_top_task = 2376
+          pi_blocked_on = 2384
+          pid = 1584
+          tgid = 1588
+          atomic_flags = 1520
+          real_cred = 2096
+          cred = 2104
+          comm = 2120
+          tasks = 1360
+          seccomp = 2304
+        }
+        waiter_layout {
+          compact = 1
+          pi_tree = 24
+          task = 48
+          lock = 56
+          wake_state = 64
+        }
+        offset {
+          init_task = 33486336
+          init_cred = 33561192
+          empty_zero_page = 35454976
+          root_task_group = 35485056
+          selinux_enforcing = 35820496
+          selinux_blob_sizes = 22768872
+          security_hook_heads = 22767064
+          slide_nfulnl_logger = 33434056
+          slide_loggers_0_1 = 33433880
+          slide_boot_id = 35955800
+        }
+    """.trimIndent()
+
     private companion object {
         const val TestBuild = "test-build"
     }

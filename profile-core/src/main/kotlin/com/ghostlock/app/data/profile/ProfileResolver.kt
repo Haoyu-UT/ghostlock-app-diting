@@ -177,6 +177,50 @@ object ProfileResolver {
         errors += validateLayoutGroups(profile, route, fallbackTo)
         errors += validateStage1Blocks(profile, route, fallbackTo)
         errors += validateRouteWaiterShape(profile, route, fallbackTo)
+        errors += validateCompatCarrierGroup(profile, route, fallbackTo)
+        return errors
+    }
+
+    /**
+     * A compat multicast profile states its geometry through the extractor's
+     * `compat_*` derivation rather than the 64-bit `waiter_off`/`buffer_size`
+     * pair (docs/analysis/compat-multicast-carrier-plan.md). A switch without
+     * the rest of the group is a truncation the native would refuse at run
+     * time; refused here so the exporter and the run agree.
+     */
+    private fun validateCompatCarrierGroup(
+        profile: Map<String, Any?>,
+        route: String?,
+        fallbackTo: String?,
+    ): List<ConfigError> {
+        val errors = mutableListOf<ConfigError>()
+        for ((path, name) in listOf(
+            "route" to route,
+            "fallback.route" to fallbackTo?.takeIf { it != "none" },
+        )) {
+            if (name != "multicast_waiter") continue
+            val prefix = "$path.$name"
+            if (profile.getLongAt("$prefix.compat_carrier") != 1L) continue
+            for (field in listOf(
+                "compat_waiter_off", "compat_buffer_size", "compat_futex_abi",
+                "task_offset", "lock_offset", "compact_waiter",
+            )) {
+                val current = profile.getLongAt("$prefix.$field")
+                if (current == null || current == 0L) {
+                    errors += ConfigError("$prefix.$field", "the compat carrier requires it")
+                }
+            }
+            val abi = profile.getLongAt("$prefix.compat_futex_abi")
+            if (abi != null && abi !in 0L..1L) {
+                errors += ConfigError("$prefix.compat_futex_abi", "must be 0 (time32) or 1 (time64)")
+            }
+            val off = profile.getLongAt("$prefix.compat_waiter_off")
+            val bytes = profile.getLongAt("$prefix.compat_buffer_size")
+            val lock = profile.getLongAt("$prefix.lock_offset")
+            if (off != null && bytes != null && lock != null && off > 0 && off + lock + 8 > bytes) {
+                errors += ConfigError("$prefix.compat_waiter_off", "the strip does not fit the compat buffer")
+            }
+        }
         return errors
     }
 

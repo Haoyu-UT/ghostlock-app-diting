@@ -233,42 +233,7 @@ internal class AndroidProfileConfigController(
                 }
             }
 
-            "multicast_waiter" -> {
-                for (field in RouteMulticastFields) {
-                    val current = value("$routePrefix.$field")
-                    if (current == null || current == 0L) {
-                        invalid += "$routePrefix.$field"
-                    } else if (current < 0L || current > UInt.MAX_VALUE.toLong()) {
-                        invalid += "$routePrefix.$field"
-                    }
-                }
-                val compact = value("$routePrefix.compact_waiter")
-                if (compact == null || compact == 0L) {
-                    invalid += "$routePrefix.compact_waiter"
-                } else if (compact < 0L || compact > 0xffL) {
-                    invalid += "$routePrefix.compact_waiter"
-                }
-                requireNonZero(
-                    "offset.empty_zero_page",
-                    "cred.ref_count",
-                )
-                if (copySize != null && copySize < 0xa0L) invalid += "cred.copy_size"
-                val waiterOff = value("$routePrefix.waiter_off")
-                if (waiterOff == null || waiterOff <= 0L || waiterOff > Int.MAX_VALUE.toLong()) {
-                    invalid += "$routePrefix.waiter_off"
-                }
-                val bufferSize = value("$routePrefix.buffer_size")
-                val lockOffset = value("$routePrefix.lock_offset")
-                if (waiterOff != null && waiterOff > 0L && waiterOff <= Int.MAX_VALUE.toLong() &&
-                    bufferSize != null && bufferSize in 0L..UInt.MAX_VALUE.toLong() &&
-                    lockOffset != null && lockOffset in 0L..UInt.MAX_VALUE.toLong() &&
-                    waiterOff + lockOffset + SizeofU64 > bufferSize
-                ) {
-                    invalid += "$routePrefix.waiter_off"
-                    invalid += "$routePrefix.lock_offset"
-                    invalid += "$routePrefix.buffer_size"
-                }
-            }
+            "multicast_waiter" -> invalid += validateMulticastGeometry(routePrefix, ::value)
         }
         if (fallbackTo != null && fallbackTo != "none" && fallbackTo !in ProfileConfig.Routes) {
             invalid += "fallback.to"
@@ -292,17 +257,98 @@ internal class AndroidProfileConfigController(
                     }
                 }
 
-                "multicast_waiter" -> {
-                    for (field in RouteMulticastFields) {
-                        val current = value("$fallbackPrefix.$field")
-                        if (current == null || current == 0L) {
-                            invalid += "$fallbackPrefix.$field"
-                        } else if (current < 0L || current > UInt.MAX_VALUE.toLong()) {
-                            invalid += "$fallbackPrefix.$field"
-                        }
-                    }
-                }
+                "multicast_waiter" -> invalid += validateMulticastGeometry(fallbackPrefix, ::value)
             }
+        }
+        return invalid
+    }
+
+    /**
+     * `route.multicast_waiter`'s geometry, in either carrier form. The 64-bit
+     * form (`waiter_off`/`buffer_size`) is the 5.x-6.1 `group_source_req`
+     * copy and carries the 5.x cred reference slots; the compat form
+     * (`compat_carrier` + the three `compat_*` keys, docs/analysis/
+     * compat-multicast-carrier-plan.md) is the armv7 helper's 32-bit copy at
+     * the extractor's derived depth. A compat profile states that geometry
+     * instead and, on 6.x, legitimately omits the 5.x cred slots (the native
+     * treats absent references as zero and uses `usage_size`/`uid_offset`).
+     */
+    private fun validateMulticastGeometry(
+        prefix: String,
+        value: (String) -> Long?,
+    ): Set<String> {
+        val invalid = mutableSetOf<String>()
+        val compat = value("$prefix.compat_carrier") ?: 0L
+        for (field in listOf("task_offset", "lock_offset")) {
+            val current = value("$prefix.$field")
+            if (current == null || current == 0L) {
+                invalid += "$prefix.$field"
+            } else if (current < 0L || current > UInt.MAX_VALUE.toLong()) {
+                invalid += "$prefix.$field"
+            }
+        }
+        val compact = value("$prefix.compact_waiter")
+        if (compact == null || compact == 0L) {
+            invalid += "$prefix.compact_waiter"
+        } else if (compact < 0L || compact > 0xffL) {
+            invalid += "$prefix.compact_waiter"
+        }
+        if (value("offset.empty_zero_page") == null || value("offset.empty_zero_page") == 0L) {
+            invalid += "offset.empty_zero_page"
+        }
+        val lockOffset = value("$prefix.lock_offset")
+        if (compat != 0L) {
+            val compatOff = value("$prefix.compat_waiter_off")
+            if (compatOff == null || compatOff <= 0L || compatOff > Int.MAX_VALUE.toLong()) {
+                invalid += "$prefix.compat_waiter_off"
+            }
+            val compatBuffer = value("$prefix.compat_buffer_size")
+            if (compatBuffer == null || compatBuffer <= 0L ||
+                compatBuffer > UInt.MAX_VALUE.toLong()
+            ) {
+                invalid += "$prefix.compat_buffer_size"
+            }
+            val compatAbi = value("$prefix.compat_futex_abi")
+            if (compatAbi == null || compatAbi < 0L || compatAbi > 1L) {
+                invalid += "$prefix.compat_futex_abi"
+            }
+            if (compatOff != null && compatOff > 0L && compatOff <= Int.MAX_VALUE.toLong() &&
+                compatBuffer != null && compatBuffer in 0L..UInt.MAX_VALUE.toLong() &&
+                lockOffset != null && lockOffset in 0L..UInt.MAX_VALUE.toLong() &&
+                compatOff + lockOffset + SizeofU64 > compatBuffer
+            ) {
+                invalid += "$prefix.compat_waiter_off"
+                invalid += "$prefix.lock_offset"
+                invalid += "$prefix.compat_buffer_size"
+            }
+            return invalid
+        }
+        for (field in RouteMulticastFields) {
+            val current = value("$prefix.$field")
+            if (current == null || current == 0L) {
+                invalid += "$prefix.$field"
+            } else if (current < 0L || current > UInt.MAX_VALUE.toLong()) {
+                invalid += "$prefix.$field"
+            }
+        }
+        if (value("cred.ref_count") == null || value("cred.ref_count") == 0L) {
+            invalid += "cred.ref_count"
+        }
+        val copySize = value("cred.copy_size")
+        if (copySize != null && copySize < 0xa0L) invalid += "cred.copy_size"
+        val waiterOff = value("$prefix.waiter_off")
+        if (waiterOff == null || waiterOff <= 0L || waiterOff > Int.MAX_VALUE.toLong()) {
+            invalid += "$prefix.waiter_off"
+        }
+        val bufferSize = value("$prefix.buffer_size")
+        if (waiterOff != null && waiterOff > 0L && waiterOff <= Int.MAX_VALUE.toLong() &&
+            bufferSize != null && bufferSize in 0L..UInt.MAX_VALUE.toLong() &&
+            lockOffset != null && lockOffset in 0L..UInt.MAX_VALUE.toLong() &&
+            waiterOff + lockOffset + SizeofU64 > bufferSize
+        ) {
+            invalid += "$prefix.waiter_off"
+            invalid += "$prefix.lock_offset"
+            invalid += "$prefix.buffer_size"
         }
         return invalid
     }
