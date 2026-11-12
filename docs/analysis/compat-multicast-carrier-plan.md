@@ -419,6 +419,42 @@ in the window between the futex timeout and the stamp copy, where the kernel's
 `pi_blocked_on` still references the waiter on that stack); the select carrier's log order
 is unchanged.
 
+## Reliability study (2026-11-12): no parked carrier for 6.1.134
+
+The G3 losses are the strip's residence, not the trigger path. A host-side
+derivation over both Images asked whether any syscall can park the waiter in a
+frame over the futex strip **without writing it** — the `_newselect` trick that
+makes the select carrier immune:
+
+- Futex homes: 6.1.134 time32 `0x1e8` / time64 `0x198`; 6.1.138 both `0x1e8`.
+  The eleven-word waiter strip spans `[home-0x58, home]`.
+- The compat `_newselect` (`compat_core_sys_select`) puts its fd-set buffer at
+  `0x1f0` on 6.1.138 — offset 8, the whole strip inside the 0x78-byte user
+  copy — but at `0x1e0` on 6.1.134, 8 bytes *shallower* than the `0x1e8` home;
+  against the time64 home the offset is `0x48`, past the `0x20` the bitmap
+  allows. `do_compat_pselect`'s chain lands at `0x250` (too deep).
+- The other raw-copy candidates fail too: ppoll's pollfd words cannot be
+  kernel pointers (fd must be negative to avoid the revents write), the
+  iovec carriers are `access_ok`-checked and clamped by `__import_iovec`,
+  connect's sockaddr copy is at depth `0xd8`, plain `futex_wait`'s `futex_q`
+  init writes over the strip, and a self-trigger (`sched_setattr` on the
+  waiter itself) puts the walk's own frames at `0x2f0`, over the strip.
+
+So the compat multicast is intrinsically exposed on 6.1.134 and stays
+unbundled; on 6.1.138 the compat select would fit, but the 64-bit select is
+feasible there (the shipped route) and the native's bitmap packer accepts only
+the 5.x homes (`0x1b0`/`0x1c0`) — a test surface, not a route. The one
+unmeasured candidate is the Realme's deeper time32 layout (home `0x1e8`,
+`waiter_off 0x58`): derivable, and its source-header overlap is benign (the
+source family byte lands in the zero `pi_left` word, so the handler returns
+`EADDRNOTAVAIL` immediately after the copy), but it needs a 6.1.134 unit to
+decide.
+
+The port repo's series driver now captures the losses automatically: a run
+that ends in a crash reboot re-roots the fresh boot with one select-profile
+run, pulls `/sys/fs/pstore`, and restores the series' selected document
+byte-for-byte.
+
 ## Approval
 
 **Requested:** approve the **compat multicast carrier (AArch32 `MCAST_BLOCK_SOURCE`)**
