@@ -475,8 +475,13 @@ namespace {
                         engine->consumer_go.load() != sequence) {
                         break;
                     }
-                    engine->consumer_calls.fetch_add(1);
+                    /* inflight BEFORE calls: the waiter's drain spins on
+                     * consumer_calls and then waits for consumer_inflight;
+                     * calls-first let it see a started call before inflight
+                     * was set, run close(fd) (a syscall on the waiter's
+                     * stack) and clobber the stamp under the walk. */
                     engine->consumer_inflight.store(1);
+                    engine->consumer_calls.fetch_add(1);
                     SchedAttr attr {};
                     attr.size = sizeof(attr);
                     attr.sched_policy = 3; /* SCHED_BATCH */
