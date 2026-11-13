@@ -42,6 +42,7 @@ CXX_SRCS := \
   core/support/util.cpp \
   core/session/exploit_session.cpp \
   core/session/root_child_frontend.cpp \
+  core/session/dirtyfrag_stage.cpp \
   core/session/backend/cve_2026_43499_backend.cpp \
   core/session/handoff_probe.cpp \
   core/session/victim_process.cpp \
@@ -103,11 +104,25 @@ HOST_BUILD_DIR := $(BUILD_ROOT)/host-test
 # Every generated artifact stays under build/ so nothing lands in the repo root.
 GHOSTLOCK_BIN := $(NATIVE_BUILD_DIR)/ghostlock
 
-.PHONY: all ghostlock clean product
+# --- DirtyFrag viability probe (JNI) ---------------------------------------
+# A small in-process library loaded by DirtyfragProbe; it sends one ESP-in-UDP
+# packet whose payload is spliced from a file page. The transform is created
+# Java-side (IpSecManager). See docs/analysis/dirtyfrag-viability-probe-plan.md.
+DFPROBE_BIN := $(NATIVE_BUILD_DIR)/libdfprobe.so
+DFPROBE_SRC := core/probe/dfprobe.c
+
+.PHONY: all ghostlock dfprobe clean product
 
 all: ghostlock
 
 ghostlock: $(GHOSTLOCK_BIN)
+
+dfprobe: $(DFPROBE_BIN)
+
+$(DFPROBE_BIN): $(DFPROBE_SRC) Makefile
+	@echo "Using NDK compiler: $(NDK_CC)"
+	@mkdir -p $(dir $@)
+	$(NDK_CC) -O2 -shared -fPIC -Wall -Wextra -Icore $(DFPROBE_SRC) -o $@
 
 $(GHOSTLOCK_BIN): $(OBJS) Makefile
 	@echo "Using NDK compiler: $(NDK_CC)"
@@ -155,7 +170,8 @@ NATIVE_HOST_TESTS := \
   target_constants_test native_resource_test \
   profile_binary_test futex_hash_test scan_grid_test stride_verify_test \
   number_parse_test runtime_paths_test runtime_config_test handoff_probe_test victim_context_test \
-  run_state_test address_space_test cpp_link_probe_test compat_bitmap_test
+  run_state_test address_space_test cpp_link_probe_test compat_bitmap_test dirtyfrag_verdict_test \
+  anchor_align_test
 
 native-host-tests: $(addprefix $(HOST_BUILD_DIR)/,$(NATIVE_HOST_TESTS))
 	@status=0; for test in $^; do $$test || status=1; done; exit $$status
@@ -177,6 +193,7 @@ HOST_ATTACK_DATAFLOW_SOURCES := \
   core/tests/host/glue_stub.cpp \
   core/session/backend/cve_2026_43499_backend.cpp \
   core/session/root_child_frontend.cpp \
+  core/session/dirtyfrag_stage.cpp \
   core/session/exploit_session.cpp \
   core/session/runtime_config.cpp \
   core/memory/heap_context.cpp \
@@ -273,7 +290,7 @@ $(HOST_BUILD_DIR)/profile_test: core/tests/profile_test.cpp core/profile/model.h
 	@mkdir -p $(HOST_BUILD_DIR)
 	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore $< -o $@
 
-$(HOST_BUILD_DIR)/profile_binary_test: core/tests/profile_binary_test.cpp core/profile/binary.cpp core/profile/binary.h core/profile/model.h
+$(HOST_BUILD_DIR)/profile_binary_test: core/tests/profile_binary_test.cpp core/profile/binary.cpp core/profile/binary.h core/profile/model.h core/profile/pipeline_check.h
 	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore core/tests/profile_binary_test.cpp core/profile/binary.cpp -o $@
 
 $(HOST_BUILD_DIR)/payload_builder_test: core/tests/payload_builder_test.cpp core/memory/payload_builder.cpp core/memory/payload_builder.h
@@ -339,6 +356,14 @@ $(HOST_BUILD_DIR)/handoff_probe_test: core/tests/handoff_probe_test.cpp core/ses
 $(HOST_BUILD_DIR)/victim_context_test: core/tests/victim_context_test.cpp core/session/victim_context.cpp core/session/victim_context.hpp core/support/native_resource.cpp core/support/native_resource.hpp
 	@mkdir -p $(HOST_BUILD_DIR)
 	$(HOST_CXX) $(HOST_CXXFLAGS) -pthread -Icore core/tests/victim_context_test.cpp core/session/victim_context.cpp core/support/native_resource.cpp -o $@
+
+$(HOST_BUILD_DIR)/dirtyfrag_verdict_test: core/tests/dirtyfrag_verdict_test.cpp core/session/dirtyfrag_verdict.hpp
+	@mkdir -p $(HOST_BUILD_DIR)
+	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore $< -o $@
+
+$(HOST_BUILD_DIR)/anchor_align_test: core/tests/anchor_align_test.cpp core/route/lock_anchor.h
+	@mkdir -p $(HOST_BUILD_DIR)
+	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore $< -o $@
 
 product: ghostlock
 	@echo "=== ghostlock binary ready: $(GHOSTLOCK_BIN) ==="

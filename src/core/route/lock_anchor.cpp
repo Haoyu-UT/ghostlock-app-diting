@@ -347,6 +347,18 @@ namespace ghostlock::route::anchor {
         *slot_out = 0;
         Geometry geom = {};
         if (!geometry_from(bytes, stride, &geom)) return 0;
+        if (!geometry_aligned(image, geom.stride)) {
+            /* The image base is page-aligned in the virtual address, so a
+             * misaligned profile base misaligns every slot in the grid; the
+             * walk's acquire load faults on the first one. 5.10.43's
+             * dump_skip.zeroes is 4-aligned (measured under QEMU). */
+            pr_error("[route] anchor image 0x%llx / stride 0x%llx is not 8-byte aligned: "
+                     "the walk's acquire load (ldar) faults on a misaligned anchor; "
+                     "refusing the route\n",
+                     static_cast<unsigned long long>(image),
+                     static_cast<unsigned long long>(geom.stride));
+            return 0;
+        }
         /* Page-free Stage 1: reserve the slot(s) W1's scratch collateral
          * touches. The scratch is stated as an image offset; the value written
          * is alias(scratch) + 0x100, and the 0x18-byte window around it is what

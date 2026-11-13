@@ -18,12 +18,14 @@ import java.util.concurrent.TimeUnit
  *     almost nothing;
  *  3. token-scan only those candidates (`late-load`, `allow_shell`, capsule /
  *     bootstrap markers, `kernelsu.ko`);
- *  4. execute `--version` only for ksud-like candidates, then
- *     `late-load --help` to confirm the exact interface this app calls
- *     (`--kmi` and `--allow-shell`).
+ *  4. execute `late-load --help` for ksud-like candidates and require the
+ *     exact interface this app calls (`--kmi` and `--allow-shell`).
  *
- * Suitability: a confirmed interface wins; a candidate whose probe cannot run
- * (SELinux denies exec, timeout) falls back to the static late-load tokens.
+ * The `--version` banner is deliberately not used: forks print release names
+ * (`ksud samsung-v2.2 (uapi: 5)`), and the interface probe is the contract
+ * that matters. Suitability: a confirmed interface wins; a candidate whose
+ * probe cannot run (SELinux denies exec, timeout) falls back to the static
+ * late-load tokens.
  * There is deliberately no persistent cache — the whole pipeline is ~0.2 s
  * warm on a regular phone, and a stale "capable" verdict is the one failure
  * mode worth avoiding.
@@ -34,7 +36,6 @@ object ManagerScanner {
     private const val PROBE_TIMEOUT_MS = 2000L
     private const val MAX_PROBE_OUTPUT = 8192
     private const val MAX_SCAN_BYTES = 64L * 1024 * 1024
-    private val KSUD_VERSION = Regex("(?m)^ksud\\s+\\d")
 
     /** Built-in KernelSU-family managers, priority order. */
     val BUILTIN = listOf(
@@ -54,14 +55,11 @@ object ManagerScanner {
         val lateLoadToken: Boolean,
         val allowShellToken: Boolean,
         /** null = the probe could not run (exec denied, timeout, crash). */
-        val identity: Boolean?,
-        /** null = not attempted because identity failed/unavailable. */
         val interfaceOk: Boolean?,
     ) {
         val suitable: Boolean
             get() = when {
                 interfaceOk == true -> true
-                identity == false -> false
                 interfaceOk == false -> false
                 else -> lateLoadToken && allowShellToken
             }
@@ -69,10 +67,8 @@ object ManagerScanner {
         val verdict: String
             get() = when {
                 interfaceOk == true -> "late-load interface confirmed"
-                identity == false -> "not ksud"
                 interfaceOk == false -> "late-load interface missing"
                 lateLoadToken && allowShellToken -> "static late-load candidate (probe unavailable)"
-                identity == true -> "ksud, late-load not confirmed"
                 else -> "not suitable"
             }
 
@@ -100,14 +96,11 @@ object ManagerScanner {
                 if (!isExecutableShaped(file)) continue
                 val tokens = scanTokens(file)
                 if (!tokens.ksudLike) continue
-                val version = run(file, "--version")
-                val identity = if (version.unavailable) null else KSUD_VERSION.containsMatchIn(version.output)
-                val iface = if (identity == true) {
-                    val probe = run(file, "late-load", "--help")
-                    if (probe.unavailable) null
-                    else probe.exit == 0 && probe.output.contains("--allow-shell") && probe.output.contains("--kmi")
-                } else {
+                val probe = run(file, "late-load", "--help")
+                val iface = if (probe.unavailable) {
                     null
+                } else {
+                    probe.exit == 0 && probe.output.contains("--allow-shell") && probe.output.contains("--kmi")
                 }
                 found += Candidate(
                     packageName = info.packageName,
@@ -116,7 +109,6 @@ object ManagerScanner {
                     builtin = info.packageName in BUILTIN,
                     lateLoadToken = tokens.lateLoad,
                     allowShellToken = tokens.allowShell,
-                    identity = identity,
                     interfaceOk = iface,
                 )
             }

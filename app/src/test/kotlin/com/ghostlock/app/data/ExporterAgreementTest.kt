@@ -54,6 +54,9 @@ class ExporterAgreementTest {
                 externalProfiles = FakeExternalProfileStore(),
                 preferences = context.getSharedPreferences("exporter-agreement", 0)
                     .also { it.edit().clear().commit() },
+                /* The exporter's .bin is device-neutral (the physical maps
+                 * resolve to the native default), so the app side must be too. */
+                deviceCodename = null,
             )
             for (release in expected) {
                 val appBytes = controller.nativeDocument(controller.load(release, pair))

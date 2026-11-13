@@ -6,6 +6,7 @@ import com.ghostlock.app.data.profile.PerDevicePhys
 import com.ghostlock.app.domain.model.CpuPair
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -60,27 +61,15 @@ class EditorPhysMapTest {
     }
 
     @Test
-    fun `editing a device absent from the map adds both entries`() = runBlocking {
+    fun `a device absent from the map cannot load the profile to edit`() = runBlocking {
+        /* The 5.10.101 map names yunluo/matisse; a diting may not run or edit
+         * it (PerDevicePhys refuses an unlisted device), so the editor never
+         * invents an entry for it. */
         val release = "5.10.101-android12-9-00001-gf4c0e37dbcde-ab8596533"
         val pair = CpuPair(0, 1)
         val controller = controller(release, "diting")
-        controller.updateAdvanced(
-            release,
-            pair,
-            mapOf(
-                "kernel_phys_load" to 0x55667788L,
-                "kernel_phys_offset" to 0x99aabbccL,
-            ),
-        )
-
-        val document = entry(controller.renderResolved(release, pair) ?: error("no render"))
-        assertEquals(2, (document["schema_version"] as Number).toInt())
-        val diting = PerDevicePhys.resolveFor(document, listOf("diting")).document
-        assertEquals(0x55667788L, diting["kernel_phys_load"])
-        assertEquals(0x99aabbccL, diting["kernel_phys_offset"])
-        val yunluo = PerDevicePhys.resolveFor(document, listOf("yunluo")).document
-        assertEquals(0x40000000L, yunluo["kernel_phys_load"])
-        assertEquals(0x40000000L, yunluo["kernel_phys_offset"])
+        assertFalse(controller.load(release, pair).hasProfile)
+        assertNull(controller.renderResolved(release, pair))
     }
 
     @Test

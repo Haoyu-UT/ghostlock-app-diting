@@ -123,8 +123,14 @@ namespace ghostlock::race {
                     if (race->consumer_stop.load() ||
                         race->consumer_go.load() != seq)
                         break;
-                    race->consumer_calls.fetch_add(1);
+                    /* inflight BEFORE calls: the route's drain spins on
+                     * consumer_calls to learn a call started and then waits
+                     * for consumer_inflight. Calls-first let the route see a
+                     * started call before inflight was set, run close(fd) (a
+                     * syscall on the waiter's stack) and clobber the stamp
+                     * under the walk -- the G1n gate caught it. */
                     race->consumer_inflight.store(1);
+                    race->consumer_calls.fetch_add(1);
                     errno = 0;
                     /* rotate the nice every call; (calls%19)+1 is what makes
                  * sched_setattr succeed on 6.1 compact */

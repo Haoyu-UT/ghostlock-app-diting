@@ -58,9 +58,9 @@ object ProfileExporter {
             /* Reference templates are not device profiles and are not exported. */
             if (release.endsWith("-template")) continue
             val parsed = parseFile(File(srcDir, file), srcDir) ?: error("cannot parse $file")
-            /* The exporter is device-neutral: a schema-v2 physical map resolves
-             * to null here, exactly as it does on a device that is not listed. */
-            val resolved = PerDevicePhys.resolve(parsed, null)
+            /* The exporter is device-neutral: the schema-v2 physical map is
+             * validated and left null (the native default). */
+            val resolved = PerDevicePhys.resolveNeutral(parsed)
             val actualRelease = resolved["release"] as? String ?: error("$file has no release")
             require(actualRelease == release) { "index/file release mismatch for $file" }
             val route = routeNameOf(resolved, routes)

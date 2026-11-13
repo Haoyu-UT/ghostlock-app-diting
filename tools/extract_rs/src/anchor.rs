@@ -553,12 +553,19 @@ pub fn clean_prefix(a: &Assessment, stride: u64) -> u64 {
 }
 
 /// The profile triple an assessment can support: `(image offset, bytes, stride)`.
-/// `bytes` is the safe prefix rounded down to whole slots; `None` when the
-/// prefix cannot hold one.
+///
+/// The walk reads the anchor word with an acquire load (`ldar`), which faults
+/// on arm64 unless the address is 8-byte aligned. `dump_skip.zeroes` is a
+/// `char[]` with no alignment guarantee (5.10.43 lands it at `...953c` and the
+/// walk data-aborts at `rt_mutex_adjust_prio_chain+0x3a0`), so the base is
+/// rounded **up** to 8 and the usable prefix shrinks by that delta. `None`
+/// when the shrunken prefix cannot hold one slot.
 pub fn profile_triple(a: &Assessment) -> Option<(u64, u64, u64)> {
     let stride = crate::family::ANCHOR_STRIDE;
-    let bytes = aligned_bytes(a.safe_len, stride);
-    (bytes >= stride).then_some((a.candidate.offset, bytes, stride))
+    let image = (a.candidate.offset + 7) & !7;
+    let safe_len = a.safe_len.checked_sub(image - a.candidate.offset)?;
+    let bytes = aligned_bytes(safe_len, stride);
+    (bytes >= stride).then_some((image, bytes, stride))
 }
 
 /// Where a W1 scratch placement came from, for the fact row.
@@ -888,6 +895,31 @@ mod tests {
     #[test]
     fn profile_triple_refuses_a_prefix_shorter_than_one_slot() {
         let a = assessment(0x1f, Verdict::Unsafe);
+        assert_eq!(profile_triple(&a), None);
+    }
+
+    #[test]
+    fn profile_triple_aligns_a_four_aligned_base() {
+        /* 5.10.43's dump_skip.zeroes is at ...953c: the walk's ldar faults on a
+         * 4-aligned anchor, so the base rounds up and the prefix shrinks. */
+        let mut a = assessment(0x810, Verdict::Unsafe);
+        a.candidate.offset = 0x2eac80c;
+        assert_eq!(profile_triple(&a), Some((0x2eac810, 0x800, 0x20)));
+    }
+
+    #[test]
+    fn profile_triple_alignment_can_cost_a_slot() {
+        /* 0x801 usable bytes at a +4-aligned base: 0x7fd remain, one slot short
+         * of the unaligned triple's 0x800. */
+        let mut a = assessment(0x801, Verdict::Unsafe);
+        a.candidate.offset = 0x2eac80c;
+        assert_eq!(profile_triple(&a), Some((0x2eac810, 0x7e0, 0x20)));
+    }
+
+    #[test]
+    fn profile_triple_refuses_when_alignment_leaves_no_slot() {
+        let mut a = assessment(0x1f, Verdict::Unsafe);
+        a.candidate.offset = 0x2eac80c;
         assert_eq!(profile_triple(&a), None);
     }
 

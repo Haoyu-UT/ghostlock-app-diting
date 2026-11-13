@@ -23,8 +23,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::anchor::{self, W1Scratch};
 use crate::analysis::RouteVerdict;
+use crate::pipeline::{PipelineFacts, PipelineOption};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 impl Superset {
     /// Deserialize a stored golden for a cut (the tests and the app).
@@ -54,6 +55,20 @@ pub struct Superset {
     /// so the app can show the same advice without a second run.
     pub phys_source: String,
     pub routes: Vec<RouteOption>,
+    /// The image-side pipeline facts. They are recorded here and never written
+    /// into the profile; the profile carries the chosen `pipeline`.
+    #[serde(default)]
+    pub pipeline_facts: PipelineFacts,
+    /// `ghostlock` and `dirtyfrag`, in stable order. No `chosen_pipeline`:
+    /// the choice belongs to the profile author, not the extractor.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pipelines: Vec<PipelineOption>,
+    /// The default pipeline order (highest precedence first), derived from
+    /// `pipelines[]` or the operator's `--pipeline-order` override. The cut
+    /// writes it into the profile's `pipeline` list; the app resolves it
+    /// before W1.
+    #[serde(default)]
+    pub pipeline_order: Vec<String>,
     pub candidates: Vec<CandidateOption>,
     pub plans: Vec<RoutePlans>,
     /// The common profile blocks rendered once (route-less). A cut selects a
@@ -220,6 +235,11 @@ pub struct Input<'a> {
     pub device: Option<&'a str>,
     /// Route verdicts, in the extractor's stable order.
     pub verdicts: &'a [RouteVerdict],
+    /// The measured pipeline facts and verdicts (recorded, not cut).
+    pub pipeline_facts: &'a PipelineFacts,
+    pub pipelines: &'a [PipelineOption],
+    /// The order the cut writes into the profile.
+    pub pipeline_order: &'a [String],
     /// Full geometry per feasible route (the cut needs all of them).
     pub geometry: &'a BTreeMap<String, BTreeMap<String, i64>>,
     /// `selinux_state.initialized`; `None` fails the scratch arithmetic closed.
@@ -285,6 +305,9 @@ pub fn build(input: &Input<'_>) -> Superset {
         kernel_phys_offset: input.phys_offset,
         phys_source: input.phys_source.to_string(),
         routes,
+        pipeline_facts: input.pipeline_facts.clone(),
+        pipelines: input.pipelines.to_vec(),
+        pipeline_order: input.pipeline_order.to_vec(),
         candidates,
         plans,
         devices,
@@ -890,6 +913,9 @@ mod tests {
                     ("compact_waiter".to_string(), 1),
                 ]),
             }],
+            pipeline_facts: PipelineFacts::default(),
+            pipelines: Vec::new(),
+            pipeline_order: Vec::new(),
             candidates: Vec::new(),
             plans: vec![RoutePlans {
                 route: "select_stack".to_string(),

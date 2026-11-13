@@ -112,9 +112,23 @@ Per kernel `uname -r`, a fact is `key -> value, source, evidence, measured_at`.
   as `evidence`.
 - **Never a precedence layer.** The run reads only the applied profile. The DB feeds the
   read-only measurements screen and the explicit merge (below). The native in-run leak probe
-  stays the safety for an unmerged or stale profile.
+  stays the safety for an unmerged or stale profile. **One scoped exception (2026-11-10):** the
+  DirtyFrag viability probe's clear result (`dirtyfrag.probe` with `dirtyfrag.probe_rom` and
+  `dirtyfrag.probe_protocol`) is read by the execution-time pipeline resolver's viability step —
+  never by the profile/route resolution and never as a value replacement. See
+  [`dirtyfrag-viability-probe-plan.md`](dirtyfrag-viability-probe-plan.md) §5.1.
+- **Probe facts (2026-11-10).** A **clear** DirtyFrag probe result is recorded per kernel
+  (`uname -r`): `dirtyfrag.probe = 1|0`, `source=dirtyfrag-probe`, with the evidence line
+  (`control=pass block=… rom=… protocol=1`), plus `dirtyfrag.probe_rom` (a 63-bit hash of
+  `Build.FINGERPRINT`) and `dirtyfrag.probe_protocol = 1`. Only a `Pass` (positive ESP control +
+  file control) or a `PrimitiveFailed` (positive control passed, both blocks unchanged) is
+  written; `SetupFailed`/`Crashed`/`NotRun` are not. The write is app-side, before W1; a write
+  failure is logged, not fatal. The resolver reuses a matching pass (same kernel, protocol and
+  ROM hash) or any protocol-matching primitive fail; a different ROM re-probes. Schema v1 is
+  unchanged (multiple keys per kernel; the value field is already `Long`).
 - **Unprivileged probe candidates never enter the DB.** `--probe-stride` output is evidence for
-  the generator UI, not a fact.
+  the generator UI, not a fact. The DirtyFrag probe is not a voting probe: it is a deterministic
+  controlled test whose clear result is a fact (above).
 - Store: `filesDir/measured_profiles.conf`, HOCON, `schema_version = 1` (below). Read-only UI.
 
 ### 3. Merge

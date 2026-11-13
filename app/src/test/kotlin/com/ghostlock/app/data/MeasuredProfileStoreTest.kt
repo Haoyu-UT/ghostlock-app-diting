@@ -117,6 +117,71 @@ class MeasuredProfileStoreTest {
     }
 
     @Test
+    fun `records a clear probe with rom and protocol and reuses it`() {
+        val store = newStore()
+        val rom = "Redmi/diting/diting:15/AQ3A.250226.002/OS3.0.3.0.VLFCNXM:user/release-keys"
+        assertTrue(
+            store.recordDirtyfragProbe(
+                release, DirtyfragProbe.Outcome.Pass, rom, "control=pass block=...", now = 5L,
+            ),
+        )
+        val kernel = store.kernel(release)!!
+        assertEquals(3, kernel.facts.size)
+        assertEquals(1L, kernel.fact(MeasuredProfileStore.KeyDirtyfragProbe)!!.value)
+        assertEquals(
+            MeasuredProfileStore.romHash(rom),
+            kernel.fact(MeasuredProfileStore.KeyDirtyfragProbeRom)!!.value,
+        )
+        assertEquals(
+            DirtyfragProbe.ProtocolVersion,
+            kernel.fact(MeasuredProfileStore.KeyDirtyfragProbeProtocol)!!.value,
+        )
+        assertEquals(ProbeReuse.Pass, store.probeReuse(release, rom))
+        assertEquals(ProbeReuse.None, store.probeReuse(release, "another-rom"))
+        assertEquals(ProbeReuse.None, store.probeReuse(release, rom, protocol = 2L))
+    }
+
+    @Test
+    fun `a primitive fail is reused without the rom match`() {
+        val store = newStore()
+        store.recordDirtyfragProbe(
+            release, DirtyfragProbe.Outcome.PrimitiveFailed, "rom-a", "control=pass", now = 1L,
+        )
+        assertEquals(ProbeReuse.PrimitiveFailed, store.probeReuse(release, "rom-b"))
+    }
+
+    @Test
+    fun `setup failures and crashes are not recorded`() {
+        val store = newStore()
+        assertFalse(
+            store.recordDirtyfragProbe(
+                release, DirtyfragProbe.Outcome.SetupFailed, "rom", "", now = 1L,
+            ),
+        )
+        assertFalse(
+            store.recordDirtyfragProbe(
+                release, DirtyfragProbe.Outcome.Crashed, "rom", "", now = 1L,
+            ),
+        )
+        assertNull(store.kernel(release))
+    }
+
+    @Test
+    fun `the probe facts coexist with the slabinfo fact`() {
+        val store = newStore()
+        store.record(release, MeasuredProfileStore.parseSlabinfo(release, capture(), now = 1L)!!)
+        store.recordDirtyfragProbe(
+            release, DirtyfragProbe.Outcome.Pass, "rom", "control=pass", now = 2L,
+        )
+        val kernel = store.kernel(release)!!
+        assertEquals(4, kernel.facts.size)
+        assertEquals(
+            960L,
+            kernel.fact(MeasuredProfileStore.KeyMmStructSz)!!.value,
+        )
+    }
+
+    @Test
     fun `an unreadable file is not silently replaced`() {
         val file = File(temporaryFolder.root, "measured_profiles.conf")
         file.writeText("this is not hocon {{{")

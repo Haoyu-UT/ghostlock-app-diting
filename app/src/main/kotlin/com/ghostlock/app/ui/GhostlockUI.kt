@@ -119,12 +119,15 @@ data class GhostlockUiState(
     /** Root-manager choice (package name); null means Auto. */
     val selectedManagerPackage: String? = null,
     val running: Boolean = false,
+    /** The last run's terminal status, shown in the sheet footer. */
+    val runStatus: RunStatus = RunStatus.Idle,
     val cpuPairLabels: List<String> = emptyList(),
     val cpuPairIndex: Int = 0,
     /** CPU pair from the resolved profile when it differs from the device pick. */
     val customCpuPair: CpuPair? = null,
     val safeModeEnabled: Boolean = false,
     val forceAttackTestEnabled: Boolean = false,
+    val secondWayEnabled: Boolean = false,
     val vrKoTagClear: VrKoMode = VrKoMode.AUTO,
     val vrKoSelinuxBlock: VrKoMode = VrKoMode.AUTO,
     val tcpRouteEnabled: Boolean = true,
@@ -221,7 +224,10 @@ data class GhostlockUiState(
     val legacyCleanupConfirm: Boolean = false,
 )
 
-enum class DialogType { NONE, LIST, INPUT, CONFIRM, NOTICE }
+enum class DialogType { NONE, LIST, INPUT, CONFIRM, NOTICE, NOTIFICATION_PERMISSION }
+
+/** The last attack run's state; the run-status notification mirrors it. */
+enum class RunStatus { Idle, Running, Success, Failure }
 
 /**
  * One line per layer that is present but deliberately not applied. Shared by
@@ -263,10 +269,12 @@ interface GhostlockActions {
     fun onCpuPairSelected(index: Int)
     fun onSafeModeChanged(enabled: Boolean)
     fun onForceAttackTestChanged(enabled: Boolean)
+    fun onSecondWayChanged(enabled: Boolean)
     fun onVrKoTagClearChanged(mode: VrKoMode)
     fun onVrKoSelinuxBlockChanged(mode: VrKoMode)
     fun onShizukuChanged(enabled: Boolean)
     fun onOpenManagerPicker()
+    fun onOpenManager()
     fun onDialogItemSelected(index: Int)
     fun onDialogInputChange(value: String)
     fun onDialogConfirm(value: String)
@@ -579,6 +587,35 @@ private fun GhostlockExecutionSheet(
                     .heightIn(min = 240.dp, max = 520.dp)
                     .navigationBarsPadding(),
             )
+            /* The run's visible verdict, and the explicit way into the
+             * KernelSU manager once the run is over. The manager itself is
+             * never auto-launched by the app: on a late-load ROM its own
+             * restart is what takes the foreground mid-handoff. */
+            if (state.executionSheetDismissible && state.runStatus != RunStatus.Idle) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = stringResource(
+                            if (state.runStatus == RunStatus.Success) {
+                                R.string.run_status_root_active
+                            } else {
+                                R.string.run_status_failed
+                            },
+                        ),
+                        modifier = Modifier.weight(1f),
+                        style = MiuixTheme.textStyles.body2,
+                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                    )
+                    TextButton(
+                        text = stringResource(R.string.run_notif_open_manager),
+                        onClick = actions::onOpenManager,
+                    )
+                }
+            }
         },
     )
 }
@@ -764,6 +801,33 @@ private fun GhostlockDialog(
                             text = stringResource(R.string.dialog_dismiss),
                             colors = ButtonDefaults.textButtonColorsPrimary(),
                             onClick = actions::onDialogDismiss,
+                        )
+                    }
+                }
+
+                DialogType.NOTIFICATION_PERMISSION -> {
+                    Text(
+                        text = stringResource(state.dialogMessageRes),
+                        modifier = Modifier.fillMaxWidth(),
+                        style = MiuixTheme.textStyles.body2,
+                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 16.dp),
+                    ) {
+                        TextButton(
+                            modifier = Modifier.weight(1f),
+                            text = stringResource(R.string.run_notif_permission_later),
+                            onClick = actions::onDialogDismiss,
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
+                        TextButton(
+                            modifier = Modifier.weight(1f),
+                            text = stringResource(R.string.run_notif_permission_allow),
+                            colors = ButtonDefaults.textButtonColorsPrimary(),
+                            onClick = { actions.onDialogConfirm("") },
                         )
                     }
                 }

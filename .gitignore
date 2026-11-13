@@ -9,6 +9,7 @@ app/build/
 libghostlock.so
 libghostlock32.so
 libextract.so
+libdfprobe.so
 build/
 /.build/
 .DS_Store

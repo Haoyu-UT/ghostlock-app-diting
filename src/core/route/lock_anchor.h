@@ -22,6 +22,18 @@
 #include <optional>
 
 namespace ghostlock::route::anchor {
+    /* The walk reads the anchor word with an acquire load (`ldar`), which faults
+     * on arm64 unless the address is 8-byte aligned: both the region base and
+     * the slot stride must keep every slot aligned. `dump_skip.zeroes` is a
+     * `char[]` with no alignment guarantee -- 5.10.43 lands it at `...953c` and
+     * the walk data-aborts in `rt_mutex_adjust_prio_chain`. The extractor
+     * rounds the emitted base up; this is the runtime refusal for a hand-edited
+     * or imported profile. */
+    [[nodiscard]] constexpr bool geometry_aligned(
+        std::uint64_t image, std::uintptr_t stride) noexcept {
+        return (image & 7U) == 0 && (stride & 7U) == 0;
+    }
+
     /* The grid one kernel build describes: `bytes` of usable region at `stride`
      * per slot. `slots == bytes / stride`. */
     struct Geometry final {

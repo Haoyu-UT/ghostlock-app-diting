@@ -1,14 +1,17 @@
 package com.ghostlock.app.ui
 
+import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.DocumentsContract
 import android.view.WindowInsetsController
 import android.view.WindowManager
 import android.widget.Toast
+import java.io.File
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -21,6 +24,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.ghostlock.app.GhostlockApplication
+import com.ghostlock.app.BuildConfig
 import com.ghostlock.app.R
 import com.ghostlock.app.domain.model.VrKoMode
 
@@ -57,10 +61,41 @@ class MainActivity : ComponentActivity() {
             viewModel.onExportProfileDocumentPicked(uri?.toString())
         }
 
+    /* The run-status notification is the run's visible proof and the reason the
+     * app keeps running when the KSU manager takes the foreground. */
+    private val notificationPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            viewModel.onNotificationPermissionResult(granted)
+        }
+
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         viewModel.initialize()
+        /* Debug-only test hook: `am start --ez second_way true` turns the second
+         * way on and persists it, so a harness restart keeps the setting. */
+        if (BuildConfig.DEBUG && intent?.hasExtra("second_way") == true) {
+            viewModel.toggleSecondWay(intent.getBooleanExtra("second_way", false))
+        }
+        /* Debug-only: `am start --ez probe_check true` runs the DirtyFrag
+         * viability probe without an attack and records a clear result. */
+        if (BuildConfig.DEBUG && intent?.hasExtra("probe_check") == true) {
+            if (intent.getBooleanExtra("probe_marker", false)) {
+                /* Seeds the watchdog marker a killed probe would leave. */
+                File(filesDir, ".df-probe-in-progress").writeText("seeded by probe_marker")
+            }
+            viewModel.runDirtyfragProbeCheck()
+        }
+        /* Debug-only: `am start --ez preflight_check true` runs the ROM
+         * preflight (the stage's cave/hook analysis) without an attack. */
+        if (BuildConfig.DEBUG && intent?.hasExtra("preflight_check") == true) {
+            viewModel.runDirtyfragPreflightCheck()
+        }
+        /* Debug-only: `am start --ez fallback_test true` arms the one-shot
+         * pre-W1 fallback gate (two-entry order + a forced DirtyFrag failure). */
+        if (BuildConfig.DEBUG && intent?.hasExtra("fallback_test") == true) {
+            viewModel.setFallbackTest(intent.getBooleanExtra("fallback_test", false))
+        }
         setContent {
             GhostlockRoute(viewModel, ::handleEffect)
         }
@@ -103,6 +138,21 @@ class MainActivity : ComponentActivity() {
             GhostlockEffect.OpenShizuku -> packageManager
                 .getLaunchIntentForPackage(SHIZUKU_PACKAGE)
                 ?.let(::startActivity)
+
+            GhostlockEffect.RequestNotificationPermission -> if (Build.VERSION.SDK_INT >=
+                Build.VERSION_CODES.TIRAMISU
+            ) {
+                notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+
+            is GhostlockEffect.OpenManager -> {
+                val launch = packageManager.getLaunchIntentForPackage(effect.packageName)
+                if (launch != null) {
+                    startActivity(launch)
+                } else {
+                    Toast.makeText(this, R.string.run_notif_manager_missing, Toast.LENGTH_SHORT).show()
+                }
+            }
         }
     }
 
@@ -164,6 +214,9 @@ private fun GhostlockRoute(
             override fun onForceAttackTestChanged(enabled: Boolean) =
                 viewModel.toggleForceAttackTest(enabled)
 
+            override fun onSecondWayChanged(enabled: Boolean) =
+                viewModel.toggleSecondWay(enabled)
+
             override fun onVrKoTagClearChanged(mode: VrKoMode) =
                 viewModel.setVrKoTagClear(mode)
 
@@ -172,6 +225,7 @@ private fun GhostlockRoute(
 
             override fun onShizukuChanged(enabled: Boolean) = viewModel.toggleShizuku(enabled)
             override fun onOpenManagerPicker() = viewModel.onOpenManagerPicker()
+            override fun onOpenManager() = viewModel.onOpenManager()
             override fun onDialogItemSelected(index: Int) = viewModel.onDialogItemSelected(index)
             override fun onDialogInputChange(value: String) = viewModel.onDialogInputChange(value)
             override fun onDialogConfirm(value: String) = viewModel.onDialogConfirm(value)

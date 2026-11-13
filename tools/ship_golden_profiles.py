@@ -10,7 +10,10 @@ non-null physical pairs (a single HOCON map cannot carry both) are exempt.
 The bundle asset is the CLI's default anchored cut (``--format conf --route
 <best> --anchor --device <primary>``) rendered from the store Image with that
 device's sidecars; the physical maps are then written from the superset's
-``devices[]`` entries so every device in the set resolves. A kernel whose
+``devices[]`` entries so every device in the set resolves. The profile's
+``pipeline`` line is the superset's derived ``pipeline_order`` (highest
+precedence first), overridable per entry by ``pipeline = ...`` in ``meta.txt``.
+A kernel whose
 64-bit ``select_stack`` is infeasible (the superset's own verdict) is
 ``sigreturn``-only; for those the route block is replaced with the AArch32
 compat select carrier (docs/analysis/compat-select-carrier-plan.md; G1 QEMU on
@@ -42,13 +45,11 @@ DEFAULT_EXTRACT = os.path.join(APP, "build", "extract", "release", "ghostlock-ex
 
 SKIP_CORPUS = {"btf-only", "codegen", "excluded"}
 ROUTE_PRIORITY = ["select_stack", "sigreturn", "tcp_zerocopy", "multicast_waiter"]
-# The AArch32 compat select carrier (docs/analysis/compat-select-carrier-plan.md)
-# is the substitute for a kernel whose 64-bit select_stack is infeasible -- the
-# sigreturn-only set, determined from the superset's own route verdicts rather
-# than a version prefix. Its geometry is the measured 5.10 pre-136 family:
-# futex_time32 strip 0x1b0 / futex_time64 0x1c0, _newselect buffer 0x1e0.
-COMPAT_WAITER_HOME = 0x1B0
-COMPAT_SELECT_DST_DEPTH = 0x1E0
+# The AArch32 compat select carrier's route block and geometry are the
+# extractor's own now (analysis::apply_compat_select + report::
+# conf_compat_route_geometry): a 5.10 pre-136 image whose 64-bit select is
+# infeasible reports select_stack feasible with the measured family geometry,
+# and the tool just renders the chosen route.
 # Same order as the Rust store harness (tests/common/mod.rs sidecar_args).
 SIDECARS = [
     ("vendor_boot.img", "--vendor-boot"),
@@ -144,17 +145,110 @@ def choose_route(options):
     return feasible[0]
 
 
-def sigreturn_only(options):
-    """The 64-bit select_stack is infeasible and sigreturn is feasible.
+PIPELINES = ["ghostlock", "dirtyfrag"]
 
-    That is the set the AArch32 compat select carrier exists for. Derived from
-    the superset's own verdicts, not from a kernel-version prefix.
+
+class PipelineChoiceRequired(Exception):
+    """Both pipelines are feasible and the entry records no choice."""
+
+
+def feasible_pipelines(options):
+    return [
+        entry.get("pipeline")
+        for entry in options.get("pipelines", [])
+        if entry.get("verdict") == "feasible"
+        and entry.get("pipeline") in PIPELINES
+    ]
+
+
+def pipeline_reason(options, name):
+    for entry in options.get("pipelines", []):
+        if entry.get("pipeline") == name:
+            return entry.get("reason", "")
+    return ""
+
+
+def choose_pipeline_order(options, meta):
+    """The entry's curation override, or the superset's derived order.
+
+    The superset carries the extractor's `pipeline_order` (highest precedence
+    first, only statically feasible entries). `meta.txt` may override it with
+    one name or a comma-separated order; every entry of the result must be
+    feasible on this kernel.
     """
-    verdicts = {r.get("route"): r.get("verdict") for r in options.get("routes", [])}
-    return (
-        verdicts.get("select_stack") == "infeasible"
-        and verdicts.get("sigreturn") == "feasible"
-    )
+    feasible = feasible_pipelines(options)
+    if not feasible:
+        reasons = "; ".join(
+            f"{entry.get('pipeline')}: {entry.get('reason', '')}"
+            for entry in options.get("pipelines", [])
+        )
+        raise NotShippable(f"no feasible pipeline ({reasons})")
+    raw = (meta.get("pipeline") or "").strip().strip('"').lower()
+    order = [name.strip() for name in raw.split(",") if name.strip()]
+    if not order:
+        order = [
+            str(name).strip().lower()
+            for name in options.get("pipeline_order", [])
+            if str(name).strip()
+        ]
+    if not order:
+        # A superset written before the ordered list carried only verdicts;
+        # use the extractor's default ranking.
+        order = (
+            ["dirtyfrag", "ghostlock"]
+            if "dirtyfrag" in feasible and "ghostlock" in feasible
+            else feasible[:1]
+        )
+    seen = set()
+    for name in order:
+        if name not in PIPELINES:
+            raise PipelineChoiceRequired(f"unknown pipeline {name}")
+        if name not in feasible:
+            raise PipelineChoiceRequired(
+                f"pipeline {name} is not feasible: {pipeline_reason(options, name)}"
+            )
+        if name in seen:
+            raise PipelineChoiceRequired(f"duplicate pipeline {name}")
+        seen.add(name)
+    return order
+
+
+def asset_pipeline_order(path):
+    """The asset's `pipeline` order (list form, or a legacy scalar), or None."""
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError:
+        return None
+    match = re.search(r'(?m)^\s*pipeline\s*=\s*\[([^\]]*)\]', text)
+    if match:
+        names = re.findall(r'"([^"]+)"', match.group(1))
+        return [name.strip().lower() for name in names] if names else None
+    match = re.search(r'(?m)^\s*pipeline\s*=\s*"?([A-Za-z0-9_-]+)"?', text)
+    return [match.group(1).strip().lower()] if match else None
+
+
+def asset_has_stride(path):
+    """Whether the rendered asset carries a `kernelsnitch.mm_struct_sz` value.
+
+    Hand-finished assets are HOCON with `include "kernelsnitch-6x.conf"`, whose
+    block carries the 1280 stride; follow one level of include so the check
+    tests the effective document, not just the asset's own text.
+    """
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError:
+        return False
+    if "mm_struct_sz" in text:
+        return True
+    base = os.path.dirname(path)
+    for name in re.findall(r'(?m)^\s*include\s+"([^"]+)"', text):
+        try:
+            included = open(os.path.join(base, name), encoding="utf-8").read()
+        except OSError:
+            continue
+        if "mm_struct_sz" in included:
+            return True
+    return False
 
 
 def phys_map_lines(options):
@@ -189,23 +283,14 @@ def phys_map_lines(options):
     )
 
 
-def compat_anchor(options):
-    """The dump_skip.zeroes anchor triple, 8-byte aligned (the 5.10.43 fix)."""
-    for candidate in options.get("candidates", []):
-        name = candidate.get("name") or ""
-        anchor = candidate.get("anchor")
-        if anchor and "dump_skip" in name:
-            image = int(anchor["image"])
-            aligned = (image + 7) & ~7
-            return aligned, int(anchor.get("bytes", 4096)), int(anchor.get("stride", 32))
-    raise NotShippable("compat carrier: no dump_skip anchor candidate")
 
 
-def mm_struct_stride(directory):
-    """The QEMU runtime dump's /proc/slabinfo mm_struct objsize, or None.
+def mm_struct_stride(directory, meta=None):
+    """The measured /proc/slabinfo mm_struct objsize, or None.
 
     The extractor deliberately emits no stride (a generated profile should
-    measure it, not seed it); the store's runtime dump is the measurement.
+    measure it, not seed it); the store's QEMU runtime dump is the usual
+    measurement, and a device-only entry records it in meta.txt (`stride`).
     """
     for path in sorted(glob.glob(os.path.join(directory, "runtime-*.txt"))):
         for line in open(path, encoding="utf-8", errors="replace"):
@@ -215,13 +300,17 @@ def mm_struct_stride(directory):
                     return int(parts[4])
                 except ValueError:
                     return None
+    if meta:
+        value = (meta.get("stride") or "").strip()
+        if value.isdigit():
+            return int(value)
     return None
 
 
 def set_mm_struct_stride(text, stride):
     """Write the measured slab stride into the kernelsnitch block."""
     line = (
-        f"  # measured /proc/slabinfo mm_struct objsize {stride} (QEMU).\n"
+        f"  # measured /proc/slabinfo mm_struct objsize {stride}.\n"
         f"  mm_struct_sz = {stride}\n"
     )
     existing = re.compile(r"^  mm_struct_sz\s*=\s*\d+\s*$", re.MULTILINE)
@@ -231,36 +320,6 @@ def set_mm_struct_stride(text, stride):
     if block:
         return text[: block.end()] + line + text[block.end():]
     return text + f"\nkernelsnitch {{\n{line}}}\n"
-
-
-def replace_route_block(text, block):
-    lines = text.splitlines()
-    start = next(
-        index for index, line in enumerate(lines) if line.strip() == "route {"
-    )
-    end = next(
-        index for index in range(start + 1, len(lines)) if lines[index].rstrip() == "}"
-    )
-    lines[start:end + 1] = block.splitlines()
-    return "\n".join(lines) + "\n"
-
-
-def compat_route_block(image, anchor_bytes, anchor_stride):
-    return "\n".join(
-        [
-            "route {",
-            "  select_stack {",
-            "    compact_waiter = 1",
-            "    compat_carrier = 1",
-            f"    waiter_home = {COMPAT_WAITER_HOME}",
-            f"    select_dst_depth = {COMPAT_SELECT_DST_DEPTH}",
-            f"    lock_anchor_image = {image}",
-            f"    lock_anchor_bytes = {anchor_bytes}",
-            f"    lock_anchor_stride = {anchor_stride}",
-            "  }",
-            "}",
-        ]
-    )
 
 
 def replace_line(text, key, line):
@@ -292,13 +351,6 @@ def validate(entry):
     devices = entry_devices(entry["meta"], entry["directory"])
     if not devices:
         raise NotShippable("no device sidecar set")
-    compat = None
-    if sigreturn_only(options):
-        try:
-            compat = compat_anchor(options)
-        except NotShippable:
-            # No dump_skip candidate: the profile still ships, on sigreturn.
-            compat = None
     entry.update(
         options=options,
         image=entry_image(entry["meta"], entry["directory"]),
@@ -306,9 +358,9 @@ def validate(entry):
         primary=devices[0],
         route=choose_route(options),
         maps=phys_map_lines(options),
-        stride=mm_struct_stride(entry["directory"]),
-        compat=compat,
+        stride=mm_struct_stride(entry["directory"], entry["meta"]),
     )
+    entry["feasible_pipelines"] = feasible_pipelines(options)
     return entry
 
 
@@ -346,6 +398,7 @@ def render(extract, entry, out_path):
         "--route", entry["route"],
         "--anchor",
         "--device", entry["primary"],
+        "--pipeline-order", ",".join(entry["choice_pipeline_order"]),
         "--out", out_path,
     ]
     result = subprocess.run(command, capture_output=True, text=True)
@@ -364,17 +417,7 @@ def asset_text(entry, rendered):
         text = replace_line(text, "kernel_phys_offset", entry["maps"][1])
     if entry.get("stride"):
         text = set_mm_struct_stride(text, entry["stride"])
-    if entry.get("compat"):
-        image, anchor_bytes, anchor_stride = entry["compat"]
-        text = replace_route_block(
-            text, compat_route_block(image, anchor_bytes, anchor_stride)
-        )
-        route_label = (
-            f"select_stack (compat carrier: waiter_home 0x{COMPAT_WAITER_HOME:x}, "
-            f"select_dst_depth 0x{COMPAT_SELECT_DST_DEPTH:x}, anchor {image})"
-        )
-    else:
-        route_label = entry["route"]
+    route_label = entry["route"]
     header = (
         "# SHIPPED GOLDEN -- test-kernels golden (QEMU tier); generated, do not edit.\n"
         f"# store: {entry['release']}; route: {route_label}; "
@@ -386,8 +429,9 @@ def asset_text(entry, rendered):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true", help="report only, exit 1 on a missing golden")
+    parser.add_argument("--check", action="store_true", help="report only, exit 1 on a missing or mismatched golden")
     parser.add_argument("--apply", action="store_true", help="render and index the missing goldens")
+    parser.add_argument("--refresh", action="store_true", help="rewrite existing SHIPPED GOLDEN assets whose pipeline line or measured mm_struct_sz is missing/infeasible")
     parser.add_argument("--store", default=DEFAULT_STORE)
     parser.add_argument("--assets", default=DEFAULT_ASSETS)
     parser.add_argument("--extract", default=DEFAULT_EXTRACT)
@@ -396,9 +440,10 @@ def main():
         help="limit to releases matching any given substring (debugging)",
     )
     args = parser.parse_args()
-    if args.check and args.apply:
-        parser.error("--check and --apply are mutually exclusive")
-    apply = not args.check
+    if args.check and (args.apply or args.refresh):
+        parser.error("--check is mutually exclusive with --apply/--refresh")
+    if args.apply and args.refresh:
+        parser.error("--apply and --refresh are mutually exclusive")
 
     found, exempt = candidates(args.store)
     index = index_releases(args.assets)
@@ -413,20 +458,81 @@ def main():
         release = entry["release"]
         if args.only and not any(needle in release for needle in args.only):
             continue
-        if release in index and release in assets:
+        asset_path = os.path.join(args.assets, release + ".conf")
+        has_asset = os.path.isfile(asset_path)
+        try:
+            validate(entry)
+        except NotShippable as error:
+            reason = str(error)
+            # A hand-finished asset is the documented exception when the store
+            # entry has no superset / no sidecar set / mixed physical pairs.
+            # A stale asset on a kernel with no feasible route or pipeline is
+            # a real content failure.
+            hand_finished = has_asset and not any(
+                phrase in reason
+                for phrase in ("no feasible route", "no feasible pipeline")
+            )
+            if hand_finished:
+                bundled += 1
+            elif has_asset:
+                entry["reasons"] = [f"asset present but entry is not shippable: {reason}"]
+                missing.append(entry)
+            else:
+                exempt.append((release, reason))
+            continue
+        feasible = entry["feasible_pipelines"]
+        if has_asset:
+            if not feasible:
+                entry["reasons"] = ["asset present but no feasible pipeline"]
+                missing.append(entry)
+                continue
+            try:
+                expected = choose_pipeline_order(entry["options"], entry["meta"])
+            except PipelineChoiceRequired as error:
+                entry["reasons"] = [str(error)]
+                missing.append(entry)
+                continue
+            chosen = asset_pipeline_order(asset_path)
+            if chosen is None:
+                entry["reasons"] = [
+                    f"asset has no pipeline line (expected {', '.join(expected)})"
+                ]
+                missing.append(entry)
+                continue
+            if chosen != expected:
+                entry["reasons"] = [
+                    f"asset pipeline {chosen} != derived order {expected}"
+                ]
+                missing.append(entry)
+                continue
+            if release not in index:
+                entry["reasons"] = ["asset present but not in index.conf"]
+                missing.append(entry)
+                continue
+            if entry.get("stride") and not asset_has_stride(asset_path):
+                entry["reasons"] = [
+                    f"asset has no mm_struct_sz (entry stride {entry['stride']}); "
+                    "use --refresh"
+                ]
+                missing.append(entry)
+                continue
             bundled += 1
             continue
-        if release not in assets:
-            try:
-                validate(entry)
-            except NotShippable as error:
-                exempt.append((release, str(error)))
-                continue
+        try:
+            entry["choice_pipeline_order"] = choose_pipeline_order(
+                entry["options"], entry["meta"]
+            )
+        except PipelineChoiceRequired as error:
+            entry["reasons"] = [str(error)]
+            missing.append(entry)
+            continue
+        except NotShippable as error:
+            exempt.append((release, str(error)))
+            continue
         entry["reasons"] = []
         if release not in index:
             entry["reasons"].append("not in index.conf")
-        if release not in assets:
-            entry["reasons"].append("no asset file")
+        entry["reasons"].append("no asset file")
         missing.append(entry)
 
     if args.check:
@@ -445,30 +551,47 @@ def main():
         parser.error(f"extractor not found: {args.extract} (build tools/extract_rs)")
 
     shipped = []
-    index_only = []
+    refreshed = []
     failures = []
     index_path = os.path.join(args.assets, "index.conf")
     for entry in missing:
         asset_path = os.path.join(args.assets, entry["release"] + ".conf")
-        if not os.path.isfile(asset_path):
-            with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as handle:
-                temp_path = handle.name
+        exists = os.path.isfile(asset_path)
+        if exists and not args.refresh:
+            failures.append((entry["release"], "asset exists; use --refresh to rewrite it"))
+            continue
+        if exists:
+            first = open(asset_path, encoding="utf-8").readline()
+            if not first.startswith("# SHIPPED GOLDEN"):
+                failures.append((entry["release"], "asset is hand-finished; not overwritten"))
+                continue
+        if "choice_pipeline_order" not in entry:
             try:
-                render(args.extract, entry, temp_path)
-                rendered = open(temp_path, encoding="utf-8").read()
-            except Exception as error:  # noqa: BLE001 - report each entry, keep going
+                entry["choice_pipeline_order"] = choose_pipeline_order(
+                    entry["options"], entry["meta"]
+                )
+            except (PipelineChoiceRequired, NotShippable) as error:
                 failures.append((entry["release"], str(error)))
                 continue
-            finally:
-                if os.path.exists(temp_path):
-                    os.unlink(temp_path)
-            with open(asset_path, "w", encoding="utf-8") as handle:
-                handle.write(asset_text(entry, rendered))
-            shipped.append(entry["release"])
+        with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as handle:
+            temp_path = handle.name
+        try:
+            render(args.extract, entry, temp_path)
+            rendered = open(temp_path, encoding="utf-8").read()
+        except Exception as error:  # noqa: BLE001 - report each entry, keep going
+            failures.append((entry["release"], str(error)))
+            continue
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+        with open(asset_path, "w", encoding="utf-8") as handle:
+            handle.write(asset_text(entry, rendered))
+        if exists:
+            refreshed.append(entry["release"])
         else:
-            index_only.append(entry["release"])
+            shipped.append(entry["release"])
 
-    new_index = [release for release in sorted(shipped + index_only) if release not in index]
+    new_index = [release for release in sorted(shipped) if release not in index]
     if new_index:
         text = open(index_path, encoding="utf-8").read()
         text = add_index_entries(text, new_index)
@@ -477,14 +600,14 @@ def main():
 
     for release in shipped:
         print(f"shipped {release}")
-    for release in index_only:
-        print(f"indexed {release} (asset already present)")
+    for release in refreshed:
+        print(f"refreshed {release}")
     for release, reason in exempt:
         print(f"exempt  {release}: {reason}")
     for release, error in failures:
         print(f"FAILED  {release}: {error}", file=sys.stderr)
     print(
-        f"shipped {len(shipped)}, indexed {len(index_only)}, exempt {len(exempt)}, "
+        f"shipped {len(shipped)}, refreshed {len(refreshed)}, exempt {len(exempt)}, "
         f"failed {len(failures)}, already bundled {bundled}"
     )
     return 1 if failures else 0

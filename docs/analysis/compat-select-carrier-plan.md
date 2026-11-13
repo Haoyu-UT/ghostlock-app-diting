@@ -286,6 +286,33 @@ now carry `select_stack` with `compat_carrier = 1`. 5.10.66 joined the store aft
 sweep and rides the class rule; its own G1 re-run and the 5.10.101 device gate (G5)
 remain open.
 
+**2026-11-10 — the two leftovers are closed in code and gated.** The anchor rule is now three
+layers: `anchor::profile_triple()` rounds the emitted base up to 8 and shrinks the usable region
+by the delta; `lock_anchor.cpp::acquire_lock_word()` refuses a misaligned base or stride
+(`geometry_aligned`); `ship_golden_profiles.py::compat_anchor()` applies the same rule to the
+bundled assets (5.10.43: image `…9540`, bytes 4096 → 4064 — the aligned value G1 proved). Device
+gates on the diting (no flash): a crafted `+4` anchor profile was refused by the route with no
+oops, and the final build's control run completed. The delivery smoke now calls `futex_time64`
+(422; carrier protocol v2) and the 236 compat probe reads `futex_time64=0` under the app's real
+seccomp filter, so the time64 ABI has no seccomp blocker; its 0x1c0 geometry series (era rig)
+remains the only open time64 item. Evidence: `external/port/anchor-align-2026-11-10/`.
+
+**2026-11-10 (later) — the extractor owns the compat verdict and the parse flow offers it.** The
+ship-time family rule is gone: `derive::derive_compat_carrier_layout()` derives the compat
+`_newselect` buffer depth (`__arm64_compat_sys_select → do_compat_select →
+compat_core_sys_select`) and the two candidate strip homes (`__arm64_sys_futex_time32`, and
+`__arm64_sys_futex` for the time64 entry) from each image's own code, then applies the packer's
+coverage rules (time32 nine words + the `res_*` zero tail, or the time64 full strip) and the
+capability refusals (the helper's two ABI homes, the 5.x flat waiter shape). `route_verdicts`
+turns an infeasible 64-bit `select_stack` into the feasible compat variant with the derived
+`waiter_home`/`select_dst_depth`; `conf_compat_route_geometry` renders them. The ship script's
+`sigreturn_only`/`compat_anchor`/`compat_route_block` are removed (the seven assets re-render
+value-identical), and the store supersets are regenerated. The app parses `pipelines[]` and the
+parse flow shows the pipeline picker when both are feasible, passes `--pipeline`, and the cut
+writes the selector. Device-verified on the diting (5.10.81 Image → compat row →
+`pipeline = "dirtyfrag"`, `compat_carrier = 1`, home 432, dst 480; 236 boot image → normal select,
+`pipeline = "ghostlock"`): `external/port/extractor-compat-2026-11-10/`.
+
 **G6 — evidence.** `external/port/compat-carrier-<date>/` with the QEMU logs, run stores
 and excerpts; plan-doc result; PORT-PLAN.
 

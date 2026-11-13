@@ -9,9 +9,14 @@ import com.ghostlock.app.data.copyValue
  *
  * A v2 document may write `kernel_phys_load` / `kernel_phys_offset` as maps
  * keyed by a device identity (`{ diting = 2818572288 }`). This selects the
- * entry for the running device, leaving a number (or null when no candidate is
- * listed) in place of each map. The rest of the pipeline therefore sees the
- * same scalar/null shape it always did.
+ * entry for the running device, leaving a number in place of each map. The
+ * rest of the pipeline therefore sees the same scalar/null shape it always
+ * did.
+ *
+ * A map that names no identity of the running device is a **refusal**, not a
+ * null pair: the v2 pair is per-device by construction, and falling back to
+ * the native default would run a profile that was never authored for this
+ * device. A whole-null field (both keys absent) stays the native default.
  *
  * The caller passes the device identities in priority order. `Build.DEVICE`
  * is normally first, but it is not always the unique codename: on MediaTek
@@ -38,7 +43,20 @@ object PerDevicePhys {
     fun resolve(document: ValueMap, device: String?): ValueMap =
         resolveFor(document, listOfNotNull(device)).document
 
-    fun resolveFor(document: ValueMap, devices: List<String>): PhysResolution {
+    /**
+     * Device-neutral resolution for exporters and model tools: the map is
+     * validated and left empty (the native default), never refused. The run
+     * path uses [resolveFor], which refuses a map that does not name the
+     * running device.
+     */
+    fun resolveNeutral(document: ValueMap): ValueMap =
+        resolveFor(document, emptyList(), requireMatch = false).document
+
+    fun resolveFor(
+        document: ValueMap,
+        devices: List<String>,
+        requireMatch: Boolean = true,
+    ): PhysResolution {
         val schema = (document["schema_version"] as? Number)?.toInt()
         if (schema != null && schema !in 1..2) {
             throw IllegalArgumentException("unsupported profile schema $schema")
@@ -93,6 +111,20 @@ object PerDevicePhys {
                     entries.keys.firstOrNull { it.equals(candidate, ignoreCase = true) }
                 }
                 .firstOrNull()
+        }
+        /* A v2 map is per-device by construction: when none of this device's
+         * identities is named, the profile was not authored for it, and a null
+         * pair would silently fall back to the native default. Refuse instead —
+         * the merge reports the reason and the run never starts on a guessed
+         * pair. */
+        if (matched == null) {
+            if (requireMatch) {
+                val names = devices.map { it.trim() }.filter { it.isNotEmpty() }
+                    .distinct().joinToString("/").ifEmpty { "this device" }
+                throw IllegalArgumentException(
+                    "the profile's kernel_phys_* map does not name $names",
+                )
+            }
         }
         for ((key, entries) in entriesByKey) {
             val selected = matched?.let { name ->

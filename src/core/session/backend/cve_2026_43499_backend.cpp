@@ -943,6 +943,15 @@ namespace ghostlock::session::backend {
                 break;
         }
 
+        /* Second way: W1 (SELinux permissive plus the middleware repair) is the
+         * whole backend. Returning Done makes the pipeline stop with
+         * DiagnosticStop and skip the frontend handoff; the app then runs the
+         * DirtyFrag page-cache stage. Never reached by the normal route. */
+        if (session.w1_only) {
+            pr_success("W1-only: SELinux permissive; credential stages and handoff skipped\n");
+            return StageResult::Done;
+        }
+
         /* Before the first root of this run: make the cred it points at
          * immortal. See cred_pin(). Best-effort on purpose -- a missed write is
          * the ordinary case every other stage retries, and aborting the run

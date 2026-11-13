@@ -68,14 +68,24 @@ fn first_word(value: &str) -> &str {
     value.split_whitespace().next().unwrap_or("")
 }
 
-fn run(binary: &str, image: &Path, route: &str, no_disasm: bool) -> (i32, String, String) {
+fn run(
+    binary: &str,
+    image: &Path,
+    route: &str,
+    pipeline: &str,
+    no_disasm: bool,
+) -> (i32, String, String) {
     let mut command = Command::new(binary);
     command
         .arg(image)
         .arg("--format")
         .arg("conf")
         .arg("--route")
-        .arg(route);
+        .arg(route)
+        /* These images are codegen probes, not runnable profiles: both
+         * pipelines can be feasible, so the test picks the legacy one. */
+        .arg("--pipeline")
+        .arg(pipeline);
     if no_disasm {
         command.arg("--no-disasm");
     }
@@ -154,7 +164,7 @@ fn codegen_variants_derive_soundly_and_never_guess() {
             .and_then(|name| name.to_str())
             .unwrap_or("image");
 
-        let (exit, stdout, stderr) = run(binary, image, route, false);
+        let (exit, stdout, stderr) = run(binary, image, route, "ghostlock", false);
         assert_eq!(exit, 0, "{label}: extractor failed\n{stderr}");
 
         let sources = field_sources(&stderr);
@@ -224,7 +234,7 @@ fn codegen_variants_derive_soundly_and_never_guess() {
 
         /* Same rule on the no-disassembly path, where the derivation cannot
          * run at all and the 5.10 constant is the only source. */
-        let (exit, _stdout, stderr) = run(binary, image, route, true);
+        let (exit, _stdout, stderr) = run(binary, image, route, "ghostlock", true);
         assert_eq!(exit, 0, "{label}: --no-disasm failed\n{stderr}");
         assert!(
             stderr.contains("heuristic"),

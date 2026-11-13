@@ -20,10 +20,12 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/futex.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/timerfd.h>
 #include <sys/time.h>
@@ -44,6 +46,20 @@
 #endif
 #ifndef __NR_pipe2
 #define __NR_pipe2 359
+#endif
+#ifndef __NR_futex_time64
+#define __NR_futex_time64 422
+#endif
+/* arm EABI: the arm64 compat table aliases 294 to __arm64_sys_setsockopt,
+ * which is what makes do_ip_setsockopt's is_compat_task() branch reachable. */
+#ifndef __NR_socket
+#define __NR_socket 281
+#endif
+#ifndef __NR_setsockopt
+#define __NR_setsockopt 294
+#endif
+#ifndef MCAST_BLOCK_SOURCE
+#define MCAST_BLOCK_SOURCE 43
 #endif
 
 namespace {
@@ -223,7 +239,62 @@ namespace {
         }
         say_int("smoke: prctl", slot[7]);
 
-        for (int i = 0; i < 8; i++) {
+        /* The time64 futex entry is a distinct syscall number (422), and the
+         * arm-app seccomp policy allowlists it independently of 240. A profile
+         * placed at 0x1c0 runs the whole carrier through this entry. */
+        say("smoke: calling futex_time64");
+        {
+            uint32_t word = 0;
+            errno = 0;
+            const long ret =
+                syscall(__NR_futex_time64, &word, FUTEX_WAKE, 1, nullptr, nullptr, 0);
+            slot[8] = ret == 0 ? 0 : -errno;
+        }
+        say_int("smoke: futex_time64", slot[8]);
+
+        /* The compat multicast carrier's two entries. The socket slot only
+         * proves socket(2) is permitted; the setsockopt slot proves the
+         * MCAST_BLOCK_SOURCE syscall reaches the handler. A zeroed
+         * group_source_req is semantically invalid, so the kernel returns
+         * EINVAL after the copy -- that is the success shape here (a seccomp
+         * or SELinux refusal is a different errno, and a SIGSYS kills the
+         * helper before it can report at all). */
+        say("smoke: calling socket");
+        int32_t smoke_socket = -1;
+        {
+            errno = 0;
+            const long fd = syscall(__NR_socket, AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+            smoke_socket = fd >= 0 ? static_cast<int32_t>(fd) : -1;
+            slot[9] = fd >= 0 ? 0 : -errno;
+        }
+        say_int("smoke: socket", slot[9]);
+
+        say("smoke: calling setsockopt");
+        {
+            uint8_t stamp[ghostlock::compat::kCarrierStampBytes];
+            memset(stamp, 0, sizeof(stamp));
+            errno = 0;
+            long ret = -1;
+            if (smoke_socket >= 0) {
+                ret = syscall(__NR_setsockopt, smoke_socket, IPPROTO_IP,
+                              MCAST_BLOCK_SOURCE, stamp,
+                              static_cast<unsigned int>(sizeof(stamp)));
+            }
+            const int error = ret == 0 ? 0 : errno;
+            /* The zeroed group_source_req is semantically invalid, so the
+             * kernel returns one of these after the copy. They mean the
+             * handler ran; a security refusal (EACCES/EPERM) or a missing
+             * syscall (ENOSYS) still fails the gate. Measured on 6.1.134:
+             * EADDRNOTAVAIL. */
+            const bool ran = ret == 0 || error == EINVAL || error == EADDRNOTAVAIL ||
+                             error == ENOPROTOOPT || error == EOPNOTSUPP ||
+                             error == ENODEV;
+            slot[10] = smoke_socket >= 0 && ran ? 0 : -error;
+        }
+        say_int("smoke: setsockopt", slot[10]);
+        if (smoke_socket >= 0) (void) close(smoke_socket);
+
+        for (int i = 0; i < 11; i++) {
             if (slot[i] != 0) result->status = 1;
         }
         if (pipe_fds[0] >= 0) (void) close(pipe_fds[0]);

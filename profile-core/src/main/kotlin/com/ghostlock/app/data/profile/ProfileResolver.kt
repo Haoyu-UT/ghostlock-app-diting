@@ -11,6 +11,9 @@ import com.ghostlock.app.data.route.RouteKind
 object ProfileResolver {
     private val KnownTopLevel = setOf(
         "release", "schema_version", "kernel_major", "recommend_shizuku",
+        /* The execution chain this profile selects. The extractor measures the
+         * feasible set; the author records the choice. */
+        "pipeline",
         "route", "fallback", "kernelsnitch", "task_struct", "cred", "offset",
         "kernel_phys_load", "kernel_phys_offset", "execution",
         /* Stage 3: optional per-image waiter layout, carried by the wire. */
@@ -18,6 +21,10 @@ object ProfileResolver {
         /* Page-free Stage 1: selinux_state field offsets and W1's scratch
          * region. Optional; absence keeps the release layout / the page path. */
         "selinux", "w1_scratch",
+        /* The extractor's CONFIG_KDP fact. The second way does not forge
+         * credentials, so this branch carries it as an informational value
+         * only (the Samsung run needs the DirtyFrag stage, not a cred write). */
+        "kdp",
     )
     private val RequiredTopLevel = setOf(
         "release", "schema_version", "kernel_major", "route", "task_struct", "cred", "offset",
@@ -111,6 +118,26 @@ object ProfileResolver {
         if (fallbackTo != null && fallbackTo != "none" && fallbackTo !in RouteNames) {
             errors += ConfigError("fallback.to", "unknown fallback route")
         }
+        /* A KDP image may only take the DirtyFrag second way: the credential
+         * forging chain is fatal there, and the legacy ghostlock default (a
+         * missing pipeline) must not run. The order must be the strict
+         * `["dirtyfrag"]`: an infeasible GhostLock fallback is a defect. */
+        val pipelineOrder = when (val raw = profile["pipeline"]) {
+            is String -> listOf(raw.trim().lowercase()).filter { it.isNotEmpty() }
+            is List<*> -> raw.mapNotNull {
+                (it as? String)?.trim()?.lowercase()?.takeIf(String::isNotEmpty)
+            }
+            else -> emptyList()
+        }
+        val unknownPipelines = pipelineOrder.filter { it !in PipelineNames }
+        if (unknownPipelines.isNotEmpty()) {
+            errors += ConfigError("pipeline", "unknown pipeline ${unknownPipelines.first()}")
+        }
+        if ((profile["kdp"] as? Number)?.toLong() == 1L &&
+            ("dirtyfrag" !in pipelineOrder || "ghostlock" in pipelineOrder)
+        ) {
+            errors += ConfigError("pipeline", "a KDP image requires the strict dirtyfrag pipeline")
+        }
         val task = profile["task_struct"] as? Map<*, *>
         if (task == null) {
             errors += ConfigError("task_struct", "not an object")
@@ -149,7 +176,97 @@ object ProfileResolver {
         }
         errors += validateLayoutGroups(profile, route, fallbackTo)
         errors += validateStage1Blocks(profile, route, fallbackTo)
+        errors += validateRouteWaiterShape(profile, route, fallbackTo)
+        errors += validateCompatCarrierGroup(profile, route, fallbackTo)
         return errors
+    }
+
+    /**
+     * A compat multicast profile states its geometry through the extractor's
+     * `compat_*` derivation rather than the 64-bit `waiter_off`/`buffer_size`
+     * pair (docs/analysis/compat-multicast-carrier-plan.md). A switch without
+     * the rest of the group is a truncation the native would refuse at run
+     * time; refused here so the exporter and the run agree.
+     */
+    private fun validateCompatCarrierGroup(
+        profile: Map<String, Any?>,
+        route: String?,
+        fallbackTo: String?,
+    ): List<ConfigError> {
+        val errors = mutableListOf<ConfigError>()
+        for ((path, name) in listOf(
+            "route" to route,
+            "fallback.route" to fallbackTo?.takeIf { it != "none" },
+        )) {
+            if (name != "multicast_waiter") continue
+            val prefix = "$path.$name"
+            if (profile.getLongAt("$prefix.compat_carrier") != 1L) continue
+            for (field in listOf(
+                "compat_waiter_off", "compat_buffer_size", "compat_futex_abi",
+                "task_offset", "lock_offset", "compact_waiter",
+            )) {
+                val current = profile.getLongAt("$prefix.$field")
+                if (current == null || current == 0L) {
+                    errors += ConfigError("$prefix.$field", "the compat carrier requires it")
+                }
+            }
+            val abi = profile.getLongAt("$prefix.compat_futex_abi")
+            if (abi != null && abi !in 0L..1L) {
+                errors += ConfigError("$prefix.compat_futex_abi", "must be 0 (time32) or 1 (time64)")
+            }
+            val off = profile.getLongAt("$prefix.compat_waiter_off")
+            val bytes = profile.getLongAt("$prefix.compat_buffer_size")
+            val lock = profile.getLongAt("$prefix.lock_offset")
+            if (off != null && bytes != null && lock != null && off > 0 && off + lock + 8 > bytes) {
+                errors += ConfigError("$prefix.compat_waiter_off", "the strip does not fit the compat buffer")
+            }
+        }
+        return errors
+    }
+
+    /**
+     * The multicast and sigreturn routes stamp the compact eleven-word
+     * `rt_mutex_waiter` strip. A 6.6+ image's `rt_waiter_node` shape is a
+     * different object (the walk would read `pi_tree.rb_left` as `lock`), so a
+     * profile that selects either route on such a device is refused here and
+     * again by the native at profile load. `waiter_layout.compact` is
+     * authoritative; the release family is the fallback for profiles that
+     * predate it (5.x and 6.1 compact, 6.6+ non-compact; an unparsable release
+     * fails closed).
+     */
+    private fun validateRouteWaiterShape(
+        profile: Map<String, Any?>,
+        route: String?,
+        fallbackTo: String?,
+    ): List<ConfigError> {
+        val compact = profile.getLongAt("waiter_layout.compact")
+        val nonCompact = if (compact != null) {
+            compact == 0L
+        } else {
+            !releaseIsCompactWaiter(profile["release"] as? String)
+        }
+        if (!nonCompact) return emptyList()
+        val errors = mutableListOf<ConfigError>()
+        for ((path, name) in listOf(
+            "route" to route,
+            "fallback.route" to fallbackTo?.takeIf { it != "none" },
+        )) {
+            if (name == "multicast_waiter" || name == "sigreturn") {
+                errors += ConfigError(
+                    "$path.$name",
+                    "needs the compact rt_mutex_waiter strip; this profile's " +
+                        "waiter is the 6.6+ rt_waiter_node shape",
+                )
+            }
+        }
+        return errors
+    }
+
+    private fun releaseIsCompactWaiter(release: String?): Boolean {
+        val parts = release?.split('.') ?: return false
+        val major = parts.getOrNull(0)?.toIntOrNull() ?: return false
+        val minor = parts.getOrNull(1)?.takeWhile(Char::isDigit)?.toIntOrNull() ?: return false
+        return major == 5 || (major == 6 && minor == 1)
     }
 
     /**
@@ -358,4 +475,5 @@ object ProfileResolver {
     }
 
     private val RouteNames = RouteKind.entries.map { it.token }
+    private val PipelineNames = setOf("ghostlock", "dirtyfrag")
 }

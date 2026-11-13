@@ -147,6 +147,8 @@
     <string name="safe_mode_summary">Disable all modules</string>
     <string name="force_attack_test_label">Force attack test</string>
     <string name="force_attack_test_summary">Ignore an existing KernelSU root and run the exploit anyway; the rooted child is discarded at the end</string>
+    <string name="second_way_label">DirtyFrag second way (experimental)</string>
+    <string name="second_way_summary">Stop after SELinux permissive and deliver root through the libc++ page-cache stub; the init shell runs the root script</string>
     <string name="vr_ko_entry_label">vr.ko anti-root countermeasures</string>
     <string name="vr_ko_entry_summary">tags %1$s · SELinux %2$s</string>
     <string name="vr_ko_scope">These options only clear the module\'s per-task tags and block its /proc/vrp SELinux 0/1 enforce write. The module itself stays active; its other hooks, mounts and checks continue to run.</string>
@@ -402,4 +404,23 @@
     <string name="preflight_anchor_grid">The anchor state file does not match this profile\'s slot grid. Reboot the phone, then run.</string>
     <string name="preflight_cpu_title">CPU pair unavailable</string>
     <string name="preflight_cpu_message">The selected CPU pair is currently unavailable (the system may have paused one of its cores). Choose another pair, or reboot and try again.</string>
+    <!-- Run-status notification: the foreground service keeps the attack out of
+         the cached (freezable) state while the KernelSU manager is in front. -->
+    <string name="run_notif_channel_name">Run status</string>
+    <string name="run_notif_channel_description">Attack progress and result</string>
+    <string name="run_notif_running_title">GhostLock is running</string>
+    <string name="run_notif_running_text">Attack in progress. Keep the app open; the KernelSU manager may come to the front.</string>
+    <string name="run_notif_success_title">Root active</string>
+    <string name="run_notif_success_text_ghostlock">KernelSU loaded and SELinux restored.</string>
+    <string name="run_notif_success_text_dirtyfrag">Root shell obtained; page cache restored.</string>
+    <string name="run_notif_failure_title">Run finished</string>
+    <string name="run_notif_failure_text">Root was not obtained. Open the app for the log.</string>
+    <string name="run_notif_permission_title">Allow notifications?</string>
+    <string name="run_notif_permission_message">GhostLock shows the run status in a notification, and keeps the attack running when another app (such as the KernelSU manager) comes to the front. Without this permission the run still works, but its status is only visible inside the app.</string>
+    <string name="run_notif_permission_allow">Allow</string>
+    <string name="run_notif_permission_later">Not now</string>
+    <string name="run_status_root_active">Root active</string>
+    <string name="run_status_failed">Root not obtained</string>
+    <string name="run_notif_open_manager">Open KernelSU manager</string>
+    <string name="run_notif_manager_missing">KernelSU manager is not installed or has no launch screen.</string>
 </resources>

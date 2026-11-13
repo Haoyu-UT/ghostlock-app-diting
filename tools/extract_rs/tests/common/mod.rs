@@ -26,6 +26,11 @@ pub struct Meta {
     /// Empty on a legacy root-sidecar entry.
     pub devices: Vec<String>,
     pub image: Option<PathBuf>,
+    /// The entry's recorded pipeline choice (`meta.txt` `pipeline = ...`).
+    /// The extractor requires `--pipeline` when both are feasible, so every
+    /// maximal invocation passes the entry's own choice, as the ship script
+    /// does.
+    pub pipeline: Option<String>,
 }
 
 impl Meta {
@@ -55,6 +60,7 @@ pub fn parse_meta(dir: &Path) -> Option<Meta> {
     let mut device = None;
     let mut devices: Vec<String> = Vec::new();
     let mut image = None;
+    let mut pipeline = None;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -67,6 +73,7 @@ pub fn parse_meta(dir: &Path) -> Option<Meta> {
         match key.trim() {
             "release" => release = Some(value.trim_matches('"').to_string()),
             "corpus" => corpus = Some(value.to_string()),
+            "pipeline" => pipeline = Some(value.trim_matches('"').to_string()),
             "phys" => phys = parse_phys(value),
             "device" => device = Some(value.trim_matches('"').to_string()),
             "devices" => devices.extend(
@@ -126,6 +133,7 @@ pub fn parse_meta(dir: &Path) -> Option<Meta> {
         device,
         devices,
         image,
+        pipeline,
     })
 }
 
@@ -265,7 +273,13 @@ pub fn run_options(bin: &str, meta: &Meta, out: &Path) -> Run {
         match &base {
             None => base = Some(value),
             Some(base_value) => {
-                for key in ["release", "kernel_major", "routes"] {
+                for key in [
+                    "release",
+                    "kernel_major",
+                    "routes",
+                    "pipeline_facts",
+                    "pipelines",
+                ] {
                     assert_eq!(
                         base_value.get(key),
                         value.get(key),
@@ -348,6 +362,9 @@ pub fn run_auto_conf_for(bin: &str, meta: &Meta, route: &str, device: Option<&st
         .arg("--route")
         .arg(route)
         .arg("--anchor");
+    if let Some(pipeline) = &meta.pipeline {
+        command.arg("--pipeline").arg(pipeline);
+    }
     if let Some(device) = device {
         command.arg("--device").arg(device);
     }

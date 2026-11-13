@@ -42,20 +42,37 @@ class BuiltinProfilesTest {
             .filterNot { it.release.endsWith("-template") }
     }
 
+    /**
+     * A controller whose device identity is one the profile's own physical map
+     * names — a v2 map that names no identity of the running device is refused
+     * by PerDevicePhys. A profile without a map resolves device-neutrally.
+     */
+    private fun controllerFor(file: String): AndroidProfileConfigController {
+        val document = HoconSupport.parseValue(
+            AssetConfigLoader(context).load("kernel_profiles/$file"),
+        ).asValueMap()
+        val device = document?.let {
+            listOf("kernel_phys_load", "kernel_phys_offset").firstNotNullOfOrNull { key ->
+                (it[key] as? Map<*, *>)?.keys?.firstOrNull()?.toString()
+            }
+        }
+        return AndroidProfileConfigController(
+            context = context,
+            externalProfiles = FakeExternalProfileStore(),
+            preferences = context.getSharedPreferences("builtin-profiles-$file", 0)
+                .also { it.edit().clear().commit() },
+            deviceCodename = device,
+        )
+    }
+
     @Test
     fun `every builtin profile resolves cleanly and round trips`() = runBlocking {
         val root = Files.createTempDirectory("builtin-profiles").toFile()
         try {
-            val controller = AndroidProfileConfigController(
-                context = context,
-                externalProfiles = FakeExternalProfileStore(),
-                preferences = context.getSharedPreferences("builtin-profiles", 0)
-                    .also { it.edit().clear().commit() },
-            )
-
             val entries = builtinEntries()
             assertTrue("index.conf lists no builtin profiles", entries.isNotEmpty())
             for (entry in entries) {
+                val controller = controllerFor(entry.file)
                 val config = controller.load(entry.release, pair)
                 assertTrue("${entry.release}: profile did not resolve", config.hasProfile)
                 assertEquals(
@@ -104,13 +121,8 @@ class BuiltinProfilesTest {
     fun `advanced editor exposes the complete route and shared geometry`() = runBlocking {
         val root = Files.createTempDirectory("editor-fields").toFile()
         try {
-            val controller = AndroidProfileConfigController(
-                context = context,
-                externalProfiles = FakeExternalProfileStore(),
-                preferences = context.getSharedPreferences("editor-fields", 0)
-                    .also { it.edit().clear().commit() },
-            )
             for (entry in builtinEntries()) {
+                val controller = controllerFor(entry.file)
                 val config = controller.load(entry.release, pair)
                 val paths = leafPaths(config.roots)
                 assertTrue("${entry.release}: kernel_phys_load missing", "kernel_phys_load" in paths)

@@ -1,10 +1,27 @@
 # Per-device values — profile schema v2 (design plan)
 
 **Status:** implemented 2026-11-04 (schema v2, `device_defaults`, the 5.10 + `dew` migration).
-Editor write-back and extractor emission remain as follow-ups.
+Editor write-back and extractor emission remain as follow-ups. **2026-11-11:** an unlisted device
+is now refused, not resolved to null (see *Fail-closed unlisted device* below).
 **Origin:** the 2026-11-04 profile-scope audit
 (`external/port/profile-scope-audit-2026-11-04/README.md`) and the MTK report
 `external/github_error_reports/5.10.198-android12-9-00085-g226a9632f13d-ab11136126/20261104-115100.zip`.
+
+## Fail-closed unlisted device (2026-11-11)
+
+A v2 `kernel_phys_*` map that names no identity of the running device is now **refused**:
+`PerDevicePhys.resolveFor` throws (the merge reports the reason, `hasProfile` is false, and the
+run never starts on a guessed pair) instead of resolving the pair to null and letting the native
+default apply. The neutral resolution moved to `PerDevicePhys.resolveNeutral`, used by
+`ProfileExporter` and by an `AndroidProfileConfigController` with no device identity
+(`deviceCandidates` empty — tests/exporters); a real device always has identities, so the app is
+fail-closed.
+
+Tests: `PerDevicePhysTest` (unlisted, null and empty-map refusals; the neutral export path keeps
+the pair null), `DeviceDefaultsTest` (`a device the physical map does not name is refused`),
+`BuiltinProfilesTest` resolves each builtin with a device its own map names,
+`ControllerOverrideTest`/`ExporterAgreementTest` pass explicit identities, and the editor test
+asserts an unlisted device cannot load a profile to edit.
 
 ## Implementation status (2026-11-04)
 

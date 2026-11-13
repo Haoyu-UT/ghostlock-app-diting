@@ -73,6 +73,33 @@ int32_t main(void) {
         return 1;
     }
 
+    /* The multicast/sigreturn route guard's predicate: the per-image
+     * `waiter_layout.compact` is authoritative, the release family (5.x and
+     * 6.1 compact, 6.6+ the rt_waiter_node shape) is the fallback for profiles
+     * that predate it, and an unparsable release fails closed. The legacy
+     * route `compact_waiter` flag (set on `decoded` here) is not consulted. */
+    decoded.waiter.compact.reset();
+    decoded.uname_r = "6.6.66-android15-8-g29d86c5fc9dd-abogki428889875-4k";
+    ghostlock::profile::TargetProfile release_66 = ghostlock::profile::TargetProfile::from(&decoded);
+    decoded.waiter.compact = 1;
+    ghostlock::profile::TargetProfile explicit_compact = ghostlock::profile::TargetProfile::from(&decoded);
+    decoded.waiter.compact = 0;
+    decoded.uname_r = "5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284";
+    ghostlock::profile::TargetProfile explicit_noncompact = ghostlock::profile::TargetProfile::from(&decoded);
+    decoded.waiter.compact.reset();
+    ghostlock::profile::TargetProfile release_510 = ghostlock::profile::TargetProfile::from(&decoded);
+    decoded.uname_r = "6.1.138-android14-11-g44bda9e8f6e9-ab13792638";
+    ghostlock::profile::TargetProfile release_61 = ghostlock::profile::TargetProfile::from(&decoded);
+    decoded.uname_r = "not-a-release";
+    ghostlock::profile::TargetProfile unparsable = ghostlock::profile::TargetProfile::from(&decoded);
+    if (profile.waiter_is_compact() || release_66.waiter_is_compact() ||
+        !explicit_compact.waiter_is_compact() || explicit_noncompact.waiter_is_compact() ||
+        !release_510.waiter_is_compact() || !release_61.waiter_is_compact() ||
+        unparsable.waiter_is_compact()) {
+        fputs("waiter shape predicate test failed\n", stderr);
+        return 1;
+    }
+
     puts("target profile snapshot/accessor test passed");
     return 0;
 }

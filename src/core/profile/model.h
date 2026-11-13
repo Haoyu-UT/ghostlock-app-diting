@@ -90,6 +90,10 @@ namespace ghostlock::profile {
         uint8_t recommend_shizuku = 0;
         uint8_t fallback_route = 0;
         uint8_t safe_mode = 0;
+        /* The app's resolved pipeline (1 = GhostLock, 2 = DirtyFrag). Absent on
+         * a document that predates the cross-check; the native then keeps the
+         * legacy behaviour. */
+        std::optional<uint32_t> pipeline;
     };
 
     struct TaskStructOffsets {
@@ -155,6 +159,18 @@ namespace ghostlock::profile {
         std::optional<uint32_t> mcast_buffer_size;
         std::optional<uint32_t> mcast_task_offset;
         std::optional<uint32_t> mcast_lock_offset;
+        /* Compat (AArch32) multicast carrier: when the 64-bit
+         * `group_source_req` copy cannot reach the waiter, the route runs in
+         * the armv7 helper whose `is_compat_task()` branch copies the 32-bit
+         * struct to a different stack local. `compat_waiter_off` is the
+         * derived strip offset inside that copy, `compat_buffer_size` the
+         * compat struct size and `compat_futex_abi` 0/time32-1/time64.
+         * Absent `compat_carrier` (or 0) keeps the 64-bit route.
+         * See docs/analysis/compat-multicast-carrier-plan.md. */
+        std::optional<uint8_t> mcast_compat_carrier;
+        std::optional<int32_t> mcast_compat_waiter_off;
+        std::optional<uint32_t> mcast_compat_buffer_size;
+        std::optional<uint8_t> mcast_compat_futex_abi;
         /* Image-relative offset of a zero, writable, reference-free region used
          * as the walk's fake rt_mutex instead of the reclaimed page. Absent =>
          * the reclaimed page is used, i.e. the previous behaviour.
@@ -230,6 +246,12 @@ namespace ghostlock::profile {
     struct MulticastWaiterLayout {
         std::optional<int32_t> waiter_offset;
         std::optional<uint32_t> buffer_size, task_offset, lock_offset;
+        /* The AArch32 compat variant (docs/analysis/compat-multicast-carrier-plan.md):
+         * the armv7 helper's `MCAST_BLOCK_SOURCE` copy carries the strip. */
+        std::optional<uint8_t> compat_carrier;
+        std::optional<int32_t> compat_waiter_off;
+        std::optional<uint32_t> compat_buffer_size;
+        std::optional<uint8_t> compat_futex_abi;
         /* The same anchor keys the other routes carry. The lock word is
          * route-independent, and a document never merges another route's
          * section, so this route's own section has to be able to state it.
@@ -445,6 +467,35 @@ namespace ghostlock::profile {
             return values_.misc.compact_waiter.value_or(0) != 0;
         }
 
+        /* Whether the device's `rt_mutex_waiter` is the compact 5.x-6.1 shape,
+         * the one the multicast and sigreturn routes stamp as an eleven-word
+         * strip. The per-image `waiter_layout.compact` is authoritative; the
+         * release family is the fallback for profiles that predate it (5.x and
+         * 6.1 compact, 6.6+ the `rt_waiter_node` shape). The legacy
+         * `compact_waiter` flag is route-specific and is deliberately not
+         * consulted. A profile that states neither is non-compact, so the
+         * route guard fails closed. */
+        [[nodiscard]] bool waiter_is_compact() const noexcept {
+            if (!loaded_) return false;
+            if (values_.waiter.compact.has_value()) {
+                return *values_.waiter.compact != 0;
+            }
+            unsigned major = 0;
+            unsigned minor = 0;
+            const char *p = release();
+            while (*p >= '0' && *p <= '9') {
+                major = major * 10U + static_cast<unsigned>(*p - '0');
+                p++;
+            }
+            if (major == 0 || *p != '.') return false;
+            p++;
+            while (*p >= '0' && *p <= '9') {
+                minor = minor * 10U + static_cast<unsigned>(*p - '0');
+                p++;
+            }
+            return major == 5U || (major == 6U && minor == 1U);
+        }
+
         [[nodiscard]] std::optional<uint8_t> cred_usage_size() const noexcept {
             return loaded_ ? values_.credential.usage_size : std::nullopt;
         }
@@ -511,6 +562,10 @@ namespace ghostlock::profile {
                            .buffer_size = values_.geometry.mcast_buffer_size,
                            .task_offset = values_.geometry.mcast_task_offset,
                            .lock_offset = values_.geometry.mcast_lock_offset,
+                           .compat_carrier = values_.geometry.mcast_compat_carrier,
+                           .compat_waiter_off = values_.geometry.mcast_compat_waiter_off,
+                           .compat_buffer_size = values_.geometry.mcast_compat_buffer_size,
+                           .compat_futex_abi = values_.geometry.mcast_compat_futex_abi,
                            /* One shared anchor storage for every route (the
                             * sigreturn route already reuses these fields);
                             * only the transport section differs. */

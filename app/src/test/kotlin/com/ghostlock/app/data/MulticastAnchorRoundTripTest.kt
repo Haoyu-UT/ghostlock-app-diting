@@ -168,20 +168,29 @@ class MulticastAnchorRoundTripTest {
             "mcast.buffer_size" to 264L,
             "mcast.task_offset" to 48L,
             "mcast.lock_offset" to 56L,
+            "mcast.compat_carrier" to 1L,
+            "mcast.compat_waiter_off" to 0xa8L,
+            "mcast.compat_buffer_size" to 0x104L,
+            "mcast.compat_futex_abi" to 1L,
             "lock_anchor_image" to anchor,
             "lock_anchor_bytes" to anchorBytes,
             "lock_anchor_stride" to anchorStride,
         )
         val config = MulticastConfig.from { values[it] }
         assertEquals(
-            "the wire schema must declare exactly the seven keys",
+            "the wire schema must declare exactly the eleven keys",
             setOf(
                 "waiter_off", "buffer_size", "task_offset", "lock_offset",
+                "compat_carrier", "compat_waiter_off", "compat_buffer_size", "compat_futex_abi",
                 "lock_anchor_image", "lock_anchor_bytes", "lock_anchor_stride",
             ),
             config.keys().toSet(),
         )
         val entries = config.entries().toMap()
+        assertEquals(1.toULong(), entries["compat_carrier"])
+        assertEquals(0xa8L.toULong(), entries["compat_waiter_off"])
+        assertEquals(0x104L.toULong(), entries["compat_buffer_size"])
+        assertEquals(1.toULong(), entries["compat_futex_abi"])
         assertEquals(anchor.toULong(), entries["lock_anchor_image"])
         assertEquals(anchorBytes.toULong(), entries["lock_anchor_bytes"])
         assertEquals(anchorStride.toULong(), entries["lock_anchor_stride"])
@@ -189,5 +198,34 @@ class MulticastAnchorRoundTripTest {
         var reapplied: RouteConfig = MulticastConfig.EMPTY
         for ((key, value) in config.entries()) reapplied = reapplied.apply(key, value)
         assertEquals("apply must rebuild what entries emitted", config, reapplied)
+    }
+
+    /**
+     * The compat variant's geometry (docs/analysis/compat-multicast-carrier-plan.md)
+     * must survive the same chain: HOCON map -> resolver -> Kotlin config ->
+     * GLK1 bytes -> decode. A key dropped here leaves a profile that validates
+     * and then runs the 64-bit route on a kernel where it cannot land.
+     */
+    @Test
+    fun `a compat multicast profile carries its geometry through the wire`() {
+        val document = document(withAnchor = true)
+        val branch = (document["route"] as ValueMap)["multicast_waiter"] as ValueMap
+        branch["compat_carrier"] = 1L
+        branch["compat_waiter_off"] = 0xa8L
+        branch["compat_buffer_size"] = 0x104L
+        branch["compat_futex_abi"] = 1L
+        val profile = nativeProfile(document)
+        val config = profile.document.routeConfig as MulticastConfig
+        assertEquals(1, config.geometry.compatCarrier?.toInt())
+        assertEquals(0xa8, config.geometry.compatWaiterOff)
+        assertEquals(0x104, config.geometry.compatBufferSize?.toInt())
+        assertEquals(1, config.geometry.compatFutexAbi?.toInt())
+
+        val wire = (NativeProfileDocument.fromBinary(profile.toBinary())!!.routeConfig as MulticastConfig)
+            .geometry
+        assertEquals(1, wire.compatCarrier?.toInt())
+        assertEquals(0xa8, wire.compatWaiterOff)
+        assertEquals(0x104, wire.compatBufferSize?.toInt())
+        assertEquals(1, wire.compatFutexAbi?.toInt())
     }
 }

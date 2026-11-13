@@ -1,14 +1,18 @@
 package com.ghostlock.app.ui
 
+import android.Manifest
 import android.app.Application
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import androidx.core.net.toUri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.ghostlock.app.R
+import com.ghostlock.app.RunStatusService
 import com.ghostlock.app.data.MeasuredProfileStore
 import com.ghostlock.app.data.OptionDecision
+import com.ghostlock.app.data.OptionPipeline
 import com.ghostlock.app.data.OptionPlan
 import com.ghostlock.app.data.OptionSuperset
 import com.ghostlock.app.data.RoutePlans
@@ -68,6 +72,12 @@ sealed interface GhostlockEffect {
     data class Clipboard(val text: String) : GhostlockEffect
     data class KeepScreenAwake(val enabled: Boolean) : GhostlockEffect
     data object OpenShizuku : GhostlockEffect
+
+    /** Ask the platform for POST_NOTIFICATIONS (the run-status surface). */
+    data object RequestNotificationPermission : GhostlockEffect
+
+    /** Open the selected KernelSU manager's own UI (user-initiated). */
+    data class OpenManager(val packageName: String) : GhostlockEffect
 }
 
 private const val OverwriteSummaryLimit = 12
@@ -159,9 +169,13 @@ class GhostlockViewModel(
     /** The layer notice is decided once per process, from the first resolution. */
     private var layerNoticeChecked = false
 
+    /** The notification rationale is offered once per process. */
+    private var notificationRationaleShown = false
+
     fun initialize() {
         if (initialized) return
         initialized = true
+        maybeAskNotificationPermission()
         repository.setShizukuStatusListener { refreshAccessStatus() }
         viewModelScope.launch {
             refreshSnapshot()
@@ -1023,6 +1037,16 @@ class GhostlockViewModel(
         mutableState.update { it.copy(forceAttackTestEnabled = enabled) }
     }
 
+    fun toggleSecondWay(enabled: Boolean) {
+        repository.setSecondWay(enabled)
+        mutableState.update { it.copy(secondWayEnabled = enabled) }
+    }
+
+    /** Debug-only: arm the one-shot pre-W1 fallback gate for the next run. */
+    fun setFallbackTest(enabled: Boolean) {
+        repository.setFallbackTest(enabled)
+    }
+
     fun setVrKoTagClear(mode: VrKoMode) {
         repository.setVrKoTagClear(mode)
         mutableState.update { it.copy(vrKoTagClear = mode) }
@@ -1045,6 +1069,26 @@ class GhostlockViewModel(
     }
 
     fun onRun() = runExploit()
+
+    /** Debug-only: run the DirtyFrag viability probe without an attack. */
+    fun runDirtyfragProbeCheck() {
+        viewModelScope.launch {
+            val report = runCatching {
+                withContext(Dispatchers.IO) { repository.probeDirtyfrag() }
+            }.getOrElse { "probe=NotRun error=$it" }
+            appendLog("<b> $report")
+        }
+    }
+
+    /** Debug-only: run the DirtyFrag ROM preflight without an attack. */
+    fun runDirtyfragPreflightCheck() {
+        viewModelScope.launch {
+            val report = runCatching {
+                withContext(Dispatchers.IO) { repository.preflightDirtyfrag() }
+            }.getOrElse { "preflight=NotRun error=$it" }
+            appendLog("<b> $report")
+        }
+    }
 
     /** Explains why the run button is greyed out. */
     fun onProfileInvalid() {
@@ -1107,6 +1151,14 @@ class GhostlockViewModel(
             }
             if (!beginOperation()) return@launch
             send(GhostlockEffect.KeepScreenAwake(true))
+            mutableState.update { it.copy(runStatus = RunStatus.Running) }
+            /* A foreground service keeps the app's uid out of the cached
+             * (freezable) state if the KSU manager takes the foreground during
+             * the handoff; the notification also carries the run status. */
+            RunStatusService.start(
+                application,
+                application.getString(R.string.run_notif_running_text),
+            )
             appendLog("==== start ${if (useShizuku) "Shizuku/V20" else "base"} ====")
             appendLog("cpu pair: $pairLabel")
             withContext(Dispatchers.IO) {
@@ -1114,11 +1166,92 @@ class GhostlockViewModel(
                     val code = runExploitUseCase(pair, useShizuku, ::appendLog)
                     appendLog(if (code == 0) "result: exploit completed" else "result: exploit failed (exit code=$code)")
                     appendLog("exit code=$code")
+                    finishRunStatus(code)
                 } finally {
+                    if (mutableState.value.runStatus == RunStatus.Running) finishRunStatus(-1)
                     endOperation()
                     send(GhostlockEffect.KeepScreenAwake(false))
                 }
             }
+        }
+    }
+
+    /** Terminal run status for the sheet footer and the result notification. */
+    private fun finishRunStatus(code: Int) {
+        val text = mutableState.value.logLines.joinToString("\n") { it.text }
+        val dirtyfrag = text.contains("pipeline=dirtyfrag")
+        val rooted = code == 0 && (text.contains("KernelSU ready") || text.contains("RESULT=OK"))
+        val message = application.getString(
+            when {
+                rooted && dirtyfrag -> R.string.run_notif_success_text_dirtyfrag
+                rooted -> R.string.run_notif_success_text_ghostlock
+                else -> R.string.run_notif_failure_text
+            },
+        )
+        mutableState.update {
+            it.copy(runStatus = if (rooted) RunStatus.Success else RunStatus.Failure)
+        }
+        RunStatusService.finish(application, message, rooted)
+    }
+
+    /**
+     * Ask for POST_NOTIFICATIONS before the first run's status matters. The
+     * rationale is ours (the system dialog is terse); declining is not fatal —
+     * the foreground service still protects the run, only its status is hidden.
+     */
+    private fun maybeAskNotificationPermission() {
+        if (notificationRationaleShown) return
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        if (application.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        notificationRationaleShown = true
+        mutableState.update {
+            it.copy(
+                dialogVisible = true,
+                dialogType = DialogType.NOTIFICATION_PERMISSION,
+                dialogTitleRes = R.string.run_notif_permission_title,
+                dialogMessageRes = R.string.run_notif_permission_message,
+                dialogMessage = "",
+                dialogItems = emptyList(),
+                dialogItemResIds = emptyList(),
+                dialogItemGrades = emptyList(),
+                dialogLeadingResId = null,
+                dialogCurrentItemIndex = -1,
+                dialogInput = "",
+                dialogExportLog = false,
+                dialogDocUrl = null,
+                dialogLayerNotice = null,
+            )
+        }
+    }
+
+    fun onNotificationPermissionResult(granted: Boolean) {
+        if (!granted) {
+            appendLog("note: notification permission not granted; run status stays in the app")
+        }
+    }
+
+    /** User-initiated: open the selected (or auto-resolved) manager's UI. */
+    fun onOpenManager() {
+        val selected = state.value.selectedManagerPackage
+        if (selected != null) {
+            send(GhostlockEffect.OpenManager(selected))
+            return
+        }
+        viewModelScope.launch {
+            val packageName = runCatching {
+                repository.managerCandidates().firstOrNull { it.suitable }?.packageName
+            }.getOrNull()
+            send(
+                if (packageName != null) {
+                    GhostlockEffect.OpenManager(packageName)
+                } else {
+                    GhostlockEffect.Toast(R.string.run_notif_manager_missing)
+                },
+            )
         }
     }
 
@@ -1365,6 +1498,7 @@ class GhostlockViewModel(
                 parseDialogStage = ParseDialogStage.Mode
                 if (parse != null && route != null) {
                     appendLog("route chosen: $route")
+                    appendLog("pipeline order: ${options?.pipelineOrder?.joinToString(", ") ?: "legacy default"}")
                     /* Keep the sidecar re-run path; when the superset is
                      * present the route choice itself needs no second pass. */
                     pendingParse = parse.copy(route = route)
@@ -1474,6 +1608,9 @@ class GhostlockViewModel(
             selectUri != null -> selectExternalProfile(selectUri)
             dialogType == DialogType.INPUT -> parseUrl(value)
             dialogType == DialogType.CONFIRM -> toggleShizuku(true)
+            dialogType == DialogType.NOTIFICATION_PERMISSION ->
+                send(GhostlockEffect.RequestNotificationPermission)
+
             else -> Unit
         }
     }
@@ -1598,6 +1735,7 @@ class GhostlockViewModel(
                 cpuPairIndex = snapshot.selectedCpuPair,
                 safeModeEnabled = snapshot.safeModeEnabled,
                 forceAttackTestEnabled = snapshot.forceAttackTest,
+                secondWayEnabled = snapshot.secondWay,
                 vrKoTagClear = snapshot.vrKoTagClear,
                 vrKoSelinuxBlock = snapshot.vrKoSelinuxBlock,
                 shizukuEnabled = snapshot.shizukuEnabled,
@@ -1796,37 +1934,12 @@ class GhostlockViewModel(
                         appendLog("result: route ambiguity without a usable route")
                         showNotice(R.string.parse_result_title, R.string.parse_failed)
                     } else {
-                        /* The choice is the user's: every feasible route is
-                         * derived from the image, and which one runs is a
-                         * device fact. The second pass forces the pick with
-                         * --route. The picker labels the waiter shape and the
-                         * ABI inline and shows the measured grade. */
-                        pendingRouteParse = request
-                        pendingRouteChoices = feasible
-                        pendingRouteOptions = result.options
-                        parseDialogStage = ParseDialogStage.Route
-                        val routeOptions = result.options
-                        mutableState.update {
-                            it.copy(
-                                dialogVisible = true,
-                                dialogType = DialogType.LIST,
-                                dialogTitleRes = R.string.parse_route_title,
-                                dialogItems = feasible.map { choice ->
-                                    val geometry = routeOptions?.route(choice.route)?.geometry.orEmpty()
-                                    "${RouteDisplay.label(choice.route, geometry, routeOptions?.release)} — ${choice.reason}"
-                                },
-                                dialogItemResIds = emptyList(),
-                                dialogItemGrades = feasible.map { choice ->
-                                    RouteDisplay.grade(choice.route)
-                                },
-                                dialogLeadingResId = null,
-                                dialogCurrentItemIndex = -1,
-                                /* The picker must be the only overlay on
-                                 * screen; a log sheet behind it would swallow
-                                 * its taps (same rule as the overwrite dialog). */
-                                executionSheetVisible = false,
-                            )
-                        }
+                        val options = result.options
+                        appendLog(
+                            "result: pipeline order " +
+                                (options?.pipelineOrder?.joinToString(", ") ?: "legacy default"),
+                        )
+                        showRouteDialog(request, feasible, options)
                     }
                 }
 
@@ -1845,6 +1958,39 @@ class GhostlockViewModel(
             }
         } finally {
             endOperation()
+        }
+    }
+
+    /** The pipeline picker is retired: the extractor derives the order and the
+     * run path resolves it before W1. Kept out of the UI deliberately. */
+
+    /** The route picker: every feasible route is derived from the image, and
+     * which one runs is a device fact. The labels carry the waiter shape and
+     * the ABI inline; the grade is the route's measured mechanism hint. */
+    private fun showRouteDialog(
+        request: ParseRequest,
+        feasible: List<RouteVerdict>,
+        options: OptionSuperset?,
+    ) {
+        pendingRouteParse = request
+        pendingRouteChoices = feasible
+        pendingRouteOptions = options
+        parseDialogStage = ParseDialogStage.Route
+        mutableState.update {
+            it.copy(
+                dialogVisible = true,
+                dialogType = DialogType.LIST,
+                dialogTitleRes = R.string.parse_route_title,
+                dialogItems = feasible.map { choice ->
+                    val geometry = options?.route(choice.route)?.geometry.orEmpty()
+                    "${RouteDisplay.label(choice.route, geometry, options?.release)} — ${choice.reason}"
+                },
+                dialogItemResIds = emptyList(),
+                dialogItemGrades = feasible.map { choice -> RouteDisplay.grade(choice.route) },
+                dialogLeadingResId = null,
+                dialogCurrentItemIndex = -1,
+                executionSheetVisible = false,
+            )
         }
     }
 
@@ -2064,18 +2210,24 @@ class GhostlockViewModel(
      * not a second extractor run. The sidecar re-run path still applies when a
      * physical source is missing.
      */
-    private fun parsedFromOptions(options: OptionSuperset, route: String): ParseResult.Parsed? {
-        val plans = options.plansFor(route) ?: return null
+    private fun parsedFromOptions(
+        options: OptionSuperset,
+        route: String?,
+    ): ParseResult.Parsed? {
+        val chosenRoute = route
+            ?: options.routes.firstOrNull { it.verdict == OptionSuperset.Feasible }?.route
+            ?: return null
+        val plans = options.plansFor(chosenRoute) ?: return null
         val plan = when (val decision = plans.decision()) {
             is OptionDecision.Auto -> decision.plan
             else -> plans.safeOptions.firstOrNull() ?: plans.anchorOnly ?: plans.page
         }
-        val document = options.cut(route, plan, options.device) ?: return null
+        val document = options.cut(chosenRoute, plan, options.device) ?: return null
         return ParseResult.Parsed(
             releases = listOf(options.release),
             missing = if (options.physLoad == null) setOf("kernel_phys_load") else emptySet(),
             documentName = options.release.replace(Regex("[^A-Za-z0-9._-]"), "_") + ".conf",
-            route = route,
+            route = chosenRoute,
             anchor = plan.anchorName?.let { "info: plan anchor $it" },
             hasAnchor = plan.anchor != null,
             physSource = options.physSource,

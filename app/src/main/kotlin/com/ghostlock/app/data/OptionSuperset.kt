@@ -57,6 +57,13 @@ data class OptionRoute(
     val geometry: Map<String, Long>,
 )
 
+/** One `pipelines[]` verdict from the extractor's maximal pass. */
+data class OptionPipeline(
+    val pipeline: String,
+    val verdict: String,
+    val reason: String,
+)
+
 /** One device sidecar set's physical derivation from the superset's `devices[]`. */
 data class OptionDevice(
     val device: String,
@@ -115,9 +122,20 @@ data class OptionSuperset(
     /** Every device derivation the extractor recorded (`--device`); empty on
      * a legacy device-neutral pass. */
     val devices: List<OptionDevice> = emptyList(),
+    /** The image's pipeline verdicts (`pipelines[]`); empty on a superset
+     * written before the selector existed. */
+    val pipelines: List<OptionPipeline> = emptyList(),
+    /** The extractor's default pipeline order (highest precedence first); the
+     * cut writes it into the profile's `pipeline` list. */
+    val pipelineOrder: List<String> = emptyList(),
 ) {
     /** The device key this superset was generated for, when it has one. */
     val device: String? get() = devices.firstOrNull()?.device
+
+    /** The pipelines this image can run; the extractor requires a choice when
+     * more than one is feasible. */
+    val feasiblePipelines: List<OptionPipeline>
+        get() = pipelines.filter { it.verdict == Feasible }
 
     fun route(name: String): OptionRoute? = routes.firstOrNull { it.route == name }
 
@@ -128,7 +146,12 @@ data class OptionSuperset(
      * extractor) plus the selected route, anchor and scratch. No derivation
      * happens here.
      */
-    fun cut(route: String, plan: OptionPlan, device: String? = null): String? {
+    fun cut(
+        route: String,
+        plan: OptionPlan,
+        device: String? = null,
+        pipelineOrder: List<String>? = null,
+    ): String? {
         val routeOption = routes.firstOrNull { it.route == route && it.verdict == Feasible }
             ?: return null
         val top = profile[""] ?: return null
@@ -149,6 +172,12 @@ data class OptionSuperset(
             document["schema_version"] = 2L
             document["kernel_phys_load"] = selected.physLoad?.let { mapOf(selected.device to it) }
             document["kernel_phys_offset"] = selected.physOffset?.let { mapOf(selected.device to it) }
+        }
+        /* The profile carries the ordered pipeline preference; a cut without
+         * one would read as the legacy ghostlock default. */
+        val order = pipelineOrder ?: this.pipelineOrder
+        if (order.isNotEmpty()) {
+            document["pipeline"] = order
         }
         val block = linkedMapOf<String, Any?>()
         routeOption.geometry.forEach { (key, value) -> block[key] = value }
@@ -239,6 +268,17 @@ data class OptionSuperset(
                     physSource = map["phys_source"] as? String ?: "unset",
                 )
             }
+            val pipelines = root["pipelines"].asValueList().orEmpty().mapNotNull { entry ->
+                val map = entry.asValueMap() ?: return@mapNotNull null
+                val pipeline = map["pipeline"] as? String ?: return@mapNotNull null
+                OptionPipeline(
+                    pipeline = pipeline,
+                    verdict = map["verdict"] as? String ?: "",
+                    reason = map["reason"] as? String ?: "",
+                )
+            }
+            val pipelineOrder = root["pipeline_order"].asValueList().orEmpty()
+                .mapNotNull { (it as? String)?.trim()?.lowercase()?.takeIf(String::isNotEmpty) }
             OptionSuperset(
                 release = root["release"] as? String ?: return@runCatching null,
                 kernelMajor = (root["kernel_major"] as? Number)?.toInt(),
@@ -249,6 +289,8 @@ data class OptionSuperset(
                 plans = plans,
                 profile = profile,
                 devices = devices,
+                pipelines = pipelines,
+                pipelineOrder = pipelineOrder,
             )
         }.getOrNull()
 

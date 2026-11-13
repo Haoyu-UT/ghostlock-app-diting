@@ -92,8 +92,26 @@ pub fn has_direct_call(lines: &[String], target: u64) -> bool {
     lines.iter().any(|line| re.is_match(line))
 }
 
+/// A call or a tail branch to `target` (`bl`/`b`). A caller that proves a
+/// capability may end with `return helper(...)`, which `-Os`/LTO compiles to
+/// a `b`; control still reaches the callee and the capability is exercised.
+/// Not a substitute for `has_direct_call` where the call's *result* matters.
+pub fn has_call_or_tail_branch(lines: &[String], target: u64) -> bool {
+    let re = Regex::new(&format!(r"(?i)\b(?:bl|b)\s+0x{target:x}\b")).unwrap();
+    lines.iter().any(|line| re.is_match(line))
+}
+
 fn is_sp_sub_imm(line: &str) -> bool {
     Regex::new(r"(?i)\bsub\s+sp,\s*sp,\s*#0x[0-9a-f]+")
+        .unwrap()
+        .is_match(line)
+}
+
+/// A preindex frame-pointer prologue (`stp x29, x30, [sp, #-N]!`). Some
+/// wrappers have no separate `sub sp` (the compat syscall wrappers), so the
+/// preindex form is a frame on its own.
+fn is_preindex_stp(line: &str) -> bool {
+    Regex::new(r"(?i)\bstp\s+x29,\s*x30,\s*\[sp,\s*#-0x[0-9a-f]+\]!")
         .unwrap()
         .is_match(line)
 }
@@ -131,26 +149,25 @@ pub fn validate_frame_live_at(lines: &[String], anchor: &Regex, name: &str) -> R
         )));
     }
     let anchor_index = anchor_indices[0];
-    let subs: Vec<usize> = lines[..anchor_index]
+    let frame_start = lines[..anchor_index]
         .iter()
-        .enumerate()
-        .filter(|(_, line)| is_sp_sub_imm(line))
-        .map(|(index, _)| index)
-        .collect();
-    if subs.len() != 1 {
-        return Err(ExtractError::new(format!(
-            "{name} has {} SP frames before anchor",
-            subs.len()
-        )));
-    }
-    for index in subs[0] + 1..anchor_index {
+        .position(|line| is_sp_sub_imm(line) || is_preindex_stp(line))
+        .ok_or_else(|| {
+            ExtractError::new(format!("{name} has 0 SP frames before anchor"))
+        })?;
+    let sub_index = lines[..anchor_index]
+        .iter()
+        .position(|line| is_sp_sub_imm(line));
+    for index in frame_start + 1..anchor_index {
         let line = &lines[index];
         if is_sp_post_index_restore(line) {
             return Err(ExtractError::new(format!(
                 "{name} restores SP post-index before anchor"
             )));
         }
-        if is_sp_add_or_sub(line) {
+        /* The prologue's own `sub sp` (after a preindex `stp`) is the frame
+         * itself, not an adjustment. */
+        if is_sp_add_or_sub(line) && Some(index) != sub_index {
             let rest = &lines[index + 1..anchor_index];
             if !rest.iter().any(|tail| is_ret(tail)) {
                 return Err(ExtractError::new(format!(
@@ -207,6 +224,20 @@ pub fn cmp_immediates(lines: &[String]) -> Vec<u64> {
     out
 }
 
+/// `cmp` immediates against either width's register. The compat handlers keep
+/// their sizes in 32-bit locals (`cmp w8, #0x2a`), where the 64-bit-verified
+/// derivations see `cmp x8, #…` only.
+pub fn cmp_immediates_any_width(lines: &[String]) -> Vec<u64> {
+    let re = Regex::new(r"(?i)\bcmp\s+[xw]\d+,\s*#0x([0-9a-f]+)").unwrap();
+    let mut out = Vec::new();
+    for line in lines {
+        for caps in re.captures_iter(line) {
+            out.push(u64::from_str_radix(&caps[1], 16).unwrap());
+        }
+    }
+    out
+}
+
 pub fn bl_targets(lines: &[String]) -> Vec<u64> {
     let re = Regex::new(r"(?i)\bbl\s+0x([0-9a-f]+)\b").unwrap();
     let mut out = Vec::new();
@@ -244,3 +275,29 @@ pub fn is_mov_w0_wzr(line: &str) -> bool {
 
 /// Alias for ARMv8 decoder used by callers that need a decoder type.
 pub type Armv8 = ARMv8;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_call_or_a_tail_branch_reaches_the_target() {
+        let lines: Vec<String> = ["bl 0x1234", "b 0x5678", "ret"]
+            .iter()
+            .map(|line| line.to_string())
+            .collect();
+        assert!(has_call_or_tail_branch(&lines, 0x1234));
+        assert!(has_call_or_tail_branch(&lines, 0x5678));
+        assert!(!has_call_or_tail_branch(&lines, 0x9abc));
+    }
+
+    #[test]
+    fn conditional_branches_and_longer_targets_do_not_match() {
+        let lines: Vec<String> = ["b.eq 0x1234", "cbz x0, 0x1234", "tbz w0, #5, 0x1234", "bl 0x12345"]
+            .iter()
+            .map(|line| line.to_string())
+            .collect();
+        assert!(!has_call_or_tail_branch(&lines, 0x1234));
+        assert!(has_call_or_tail_branch(&lines, 0x12345));
+    }
+}

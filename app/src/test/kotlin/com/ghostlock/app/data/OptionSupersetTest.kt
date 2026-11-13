@@ -31,6 +31,12 @@ class OptionSupersetTest {
               "reason": "cap 0x40", "anchor_capable": false, "geometry": { "compact_waiter": 1 } }
           ],
           "candidates": [],
+          "pipelines": [
+            { "pipeline": "ghostlock", "verdict": "feasible", "reason": "KDP is not enabled" },
+            { "pipeline": "dirtyfrag", "verdict": "feasible",
+              "reason": "the ESP fix is absent; send path ip_append_page" }
+          ],
+          "pipeline_order": ["dirtyfrag", "ghostlock"],
           "plans": [
             { "route": "select_stack",
               "page": { "route": "select_stack", "anchor": null, "scratch": null,
@@ -124,6 +130,29 @@ class OptionSupersetTest {
 
         val none = plans.copy(pageFree = emptyList())
         assertTrue(none.decision() is OptionDecision.NoPageFree)
+    }
+
+    @Test
+    fun `both feasible pipelines are exposed and the cut carries the order`() {
+        val superset = requireNotNull(OptionSuperset.parse(sample))
+        val feasible = superset.feasiblePipelines
+        assertEquals(listOf("ghostlock", "dirtyfrag"), feasible.map { it.pipeline })
+        assertEquals(listOf("dirtyfrag", "ghostlock"), superset.pipelineOrder)
+        val plan = superset.plansFor("select_stack")!!.safeOptions[0]
+        /* The cut uses the superset's order by default... */
+        val chosen = requireNotNull(superset.cut("select_stack", plan))
+        assertTrue(chosen.contains("pipeline = ["))
+        assertTrue(chosen.contains("\"dirtyfrag\""))
+        assertTrue(chosen.contains("\"ghostlock\""))
+        /* ...and an explicit order replaces it; an empty one is the legacy
+         * no-pipeline form. */
+        val override = requireNotNull(
+            superset.cut("select_stack", plan, pipelineOrder = listOf("ghostlock")),
+        )
+        assertTrue(override.contains("\"ghostlock\""))
+        assertFalse(override.contains("\"dirtyfrag\""))
+        val legacy = requireNotNull(superset.cut("select_stack", plan, pipelineOrder = emptyList()))
+        assertFalse(legacy.contains("pipeline ="))
     }
 
     @Test

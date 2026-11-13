@@ -147,6 +147,8 @@
     <string name="safe_mode_summary">禁用所有模块</string>
     <string name="force_attack_test_label">强制攻击测试</string>
     <string name="force_attack_test_summary">忽略已加载的 KernelSU 直接运行攻击；结束后丢弃 root child</string>
+    <string name="second_way_label">DirtyFrag 第二路线（实验）</string>
+    <string name="second_way_summary">只执行到 SELinux permissive，再通过 libc++ 页缓存桩投递 root；由 init shell 运行 root 脚本</string>
     <string name="vr_ko_entry_label">vr.ko 反 root 对策</string>
     <string name="vr_ko_entry_summary">标记 %1$s · SELinux %2$s</string>
     <string name="vr_ko_scope">这些选项只清除模块的每任务标记，并拦截其 /proc/vrp 的 SELinux 0/1 enforce 写入。模块本身仍在运行，其钩子、挂载与检查不受影响。</string>
@@ -402,4 +404,22 @@
     <string name="preflight_anchor_grid">锚点状态文件与当前配置的槽位网格不一致。请重启手机后再运行。</string>
     <string name="preflight_cpu_title">CPU 组合不可用</string>
     <string name="preflight_cpu_message">所选 CPU 组合当前不可用（系统可能暂停了该核心）。请换一组 CPU，或重启手机后再试。</string>
+    <!-- 运行状态通知：前台服务让攻击进程在 KernelSU 管理器切到前台时不被冻结。 -->
+    <string name="run_notif_channel_name">运行状态</string>
+    <string name="run_notif_channel_description">攻击进度与结果</string>
+    <string name="run_notif_running_title">GhostLock 正在运行</string>
+    <string name="run_notif_running_text">攻击进行中。请保持应用在前台；KernelSU 管理器可能会切到前台。</string>
+    <string name="run_notif_success_title">Root 已就绪</string>
+    <string name="run_notif_success_text_ghostlock">KernelSU 已加载，SELinux 已恢复。</string>
+    <string name="run_notif_success_text_dirtyfrag">已获得 root shell，页缓存已恢复。</string>
+    <string name="run_notif_failure_title">运行结束</string>
+    <string name="run_notif_failure_text">未获得 root。打开应用查看日志。</string>
+    <string name="run_notif_permission_title">允许发送通知？</string>
+    <string name="run_notif_permission_message">GhostLock 用一条通知显示运行状态，并在其他应用（例如 KernelSU 管理器）切到前台时保持攻击进程继续运行。拒绝后运行仍可继续，但状态只能在应用内查看。</string>
+    <string name="run_notif_permission_allow">允许</string>
+    <string name="run_notif_permission_later">暂不</string>
+    <string name="run_status_root_active">Root 已就绪</string>
+    <string name="run_status_failed">未获得 root</string>
+    <string name="run_notif_open_manager">打开 KernelSU 管理器</string>
+    <string name="run_notif_manager_missing">未找到 KernelSU 管理器，或它没有启动界面。</string>
 </resources>
