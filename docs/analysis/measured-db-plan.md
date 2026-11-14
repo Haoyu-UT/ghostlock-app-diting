@@ -140,6 +140,14 @@ and requires an export through SAF. Nothing is applied in place; the source docu
 untouched. After a successful export the app offers to select the exported file for the next
 run (an explicit selection, never automatic).
 
+**Only profile-addressable facts are merge candidates (2026-11-14).** The DB holds the DirtyFrag
+probe trio (`dirtyfrag.probe`, `_rom`, `_protocol`) next to the root-measured stride; the merge
+reads the `MeasuredKernel.profileFacts()` projection, which excludes them. Without the filter a
+probe fact became an unknown top-level `dirtyfrag` key: the preview showed a bogus `—` row and
+`renderMerged` failed its validation, so the export died with `export_failed` (and the home merge
+banner never cleared). The probe facts stay visible in the measurements screen — they are runtime
+decisions for the pipeline resolver, not profile values.
+
 ### 4. Editor
 
 - Base = the active source document; edits = an in-memory sparse map (route, fallback, general,

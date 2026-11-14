@@ -162,6 +162,46 @@ class ControllerOverrideTest {
     }
 
     @Test
+    fun `probe facts in the measured database do not poison the merge`() = runBlocking {
+        /* The DB also records the DirtyFrag probe decision. Handing that to
+         * the renderer creates an unknown top-level key, which the validator
+         * refuses — the whole export fails. The merge consumes the
+         * profile-addressable projection only. */
+        val kernel = MeasuredKernel(
+            release = release,
+            updatedAt = 0L,
+            facts = listOf(
+                MeasuredFact(
+                    "kernelsnitch.mm_struct_sz", 960L, "root-slabinfo", "mm_struct …", 0L,
+                ),
+                MeasuredFact(
+                    MeasuredProfileStore.KeyDirtyfragProbe, 1L, "dirtyfrag-probe", "control=pass", 0L,
+                ),
+                MeasuredFact(
+                    MeasuredProfileStore.KeyDirtyfragProbeRom, 42L, "dirtyfrag-probe", "rom=…", 0L,
+                ),
+                MeasuredFact(
+                    MeasuredProfileStore.KeyDirtyfragProbeProtocol, 1L, "dirtyfrag-probe",
+                    "protocol=1", 0L,
+                ),
+            ),
+        )
+        assertNull(
+            controller.renderMerged(release, pair, kernel.facts.associate { it.key to it.value }),
+        )
+        val text = requireNotNull(
+            controller.renderMerged(
+                release,
+                pair,
+                kernel.profileFacts().associate { it.key to it.value },
+            ),
+        )
+        val parsed = checkNotNull(HoconSupport.parseValue(text).asValueMap())
+        assertEquals(960L, parsed.getLongAt("kernelsnitch.mm_struct_sz"))
+        assertNull(parsed["dirtyfrag"])
+    }
+
+    @Test
     fun `the cpu pair reaches the native document`() = runBlocking {
         val pair = CpuPair(primary = 2, consumer = 3)
         val config = controller.load(release, pair)

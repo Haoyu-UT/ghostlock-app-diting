@@ -179,6 +179,12 @@ class MeasuredProfileStoreTest {
             960L,
             kernel.fact(MeasuredProfileStore.KeyMmStructSz)!!.value,
         )
+        /* Only the profile-addressable fact is mergeable; the probe trio stays
+         * visible in the measurements screen and out of every merge. */
+        assertEquals(
+            listOf(MeasuredProfileStore.KeyMmStructSz),
+            kernel.profileFacts().map { it.key },
+        )
     }
 
     @Test

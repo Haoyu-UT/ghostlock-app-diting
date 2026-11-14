@@ -1632,7 +1632,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             val pair = cpuPairs.getOrNull(selectedCpuPair) ?: return@withContext emptyList()
             val numbers = profileController.resolvedNumbers(release, pair)
                 ?: return@withContext emptyList()
-            measuredProfiles.kernel(release)?.facts.orEmpty().map { fact ->
+            /* Only profile-addressable facts: the DirtyFrag probe fact is a
+             * runtime decision, and merging it would poison the document. */
+            measuredProfiles.kernel(release)?.profileFacts().orEmpty().map { fact ->
                 MeasurementMergeRow(
                     path = fact.key,
                     profileValue = numbers[fact.key],
@@ -1647,7 +1649,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     override fun mergedProfileDocument(): String? {
         val release = deviceRelease()
         val pair = cpuPairs.getOrNull(selectedCpuPair) ?: return null
-        val facts = measuredProfiles.kernel(release)?.facts.orEmpty()
+        val facts = measuredProfiles.kernel(release)?.profileFacts().orEmpty()
         if (facts.isEmpty()) return null
         val text = profileController.renderMerged(
             release,

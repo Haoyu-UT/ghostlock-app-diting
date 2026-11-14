@@ -25,7 +25,25 @@ internal data class MeasuredKernel(
     val facts: List<MeasuredFact>,
 ) {
     fun fact(key: String): MeasuredFact? = facts.firstOrNull { it.key == key }
+
+    /**
+     * Facts that name a profile path, i.e. the ones a merge may apply to a
+     * document. The DirtyFrag probe fact and its two companions are runtime
+     * decisions for the pipeline resolver: they stay visible in the
+     * measurements screen, but merged as profile values they would create an
+     * unknown top-level `dirtyfrag` key and the validator would refuse the
+     * whole export. The DB keeps one fact shape; this is the projection the
+     * merge needs.
+     */
+    fun profileFacts(): List<MeasuredFact> = facts.filter { it.key !in ProbeFactKeys }
 }
+
+/** The non-profile fact keys [MeasuredKernel.profileFacts] excludes. */
+private val ProbeFactKeys = setOf(
+    MeasuredProfileStore.KeyDirtyfragProbe,
+    MeasuredProfileStore.KeyDirtyfragProbeRom,
+    MeasuredProfileStore.KeyDirtyfragProbeProtocol,
+)
 
 /**
  * The measured database: per-kernel ground truth and one controlled probe fact.
