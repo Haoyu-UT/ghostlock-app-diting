@@ -1046,9 +1046,9 @@ class GhostlockViewModel(
         mutableState.update { it.copy(forceAttackTestEnabled = enabled) }
     }
 
+    /** Debug-only lab hook (`am start --ez second_way …`); no UI. */
     fun toggleSecondWay(enabled: Boolean) {
         repository.setSecondWay(enabled)
-        mutableState.update { it.copy(secondWayEnabled = enabled) }
     }
 
     /** Debug-only: arm the one-shot pre-W1 fallback gate for the next run. */
@@ -1769,7 +1769,6 @@ class GhostlockViewModel(
                 cpuPairIndex = snapshot.selectedCpuPair,
                 safeModeEnabled = snapshot.safeModeEnabled,
                 forceAttackTestEnabled = snapshot.forceAttackTest,
-                secondWayEnabled = snapshot.secondWay,
                 vrKoTagClear = snapshot.vrKoTagClear,
                 vrKoSelinuxBlock = snapshot.vrKoSelinuxBlock,
                 shizukuEnabled = snapshot.shizukuEnabled,

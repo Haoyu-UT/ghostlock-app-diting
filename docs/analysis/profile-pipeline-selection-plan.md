@@ -159,7 +159,10 @@ The generation UI **does not ask for a pipeline**. The parse/export flow writes 
 order; the profile page shows it read-only. The pipeline picker (`ParseDialogStage.Pipeline`) and
 its strings are retired. The debug-only `second_way` intent becomes a debug order override,
 logged, silently ignored in release builds, and still subject to the list validation (it cannot
-force GhostLock on KDP).
+force GhostLock on KDP). **The Advanced-screen switch is removed (2026-11-14)**: the product
+shows no pipeline choice, so the leftover debug switch only duplicated (and, in debug builds,
+overrode) the profile's own order; only the `am start --ez second_way …` harness hook remains,
+and the run log still records `pipeline order=dirtyfrag (debug override)` when it is used.
 
 Implementation of the probe, the ROM preflight, the resolver and their gates:
 [`dirtyfrag-viability-probe-plan.md`](dirtyfrag-viability-probe-plan.md).

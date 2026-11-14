@@ -214,9 +214,6 @@ private fun GhostlockRoute(
             override fun onForceAttackTestChanged(enabled: Boolean) =
                 viewModel.toggleForceAttackTest(enabled)
 
-            override fun onSecondWayChanged(enabled: Boolean) =
-                viewModel.toggleSecondWay(enabled)
-
             override fun onVrKoTagClearChanged(mode: VrKoMode) =
                 viewModel.setVrKoTagClear(mode)
 

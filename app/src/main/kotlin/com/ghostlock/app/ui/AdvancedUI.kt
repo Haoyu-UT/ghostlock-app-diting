@@ -198,21 +198,9 @@ internal fun AdvancedScreen(
                     )
                 }
             }
-            /* Debug-only: the profile's `pipeline` is the product selector.
-             * The toggle remains for lab overrides and is ignored by release
-             * builds (the run branch also gates it on BuildConfig.DEBUG). */
-            if (BuildConfig.DEBUG) {
-                item(key = "secondWay") {
-                    Card {
-                        SwitchPreference(
-                            checked = state.secondWayEnabled,
-                            onCheckedChange = actions::onSecondWayChanged,
-                            title = stringResource(R.string.second_way_label),
-                            summary = stringResource(R.string.second_way_summary),
-                        )
-                    }
-                }
-            }
+            /* The profile's `pipeline` is the only product selector; the
+             * debug-only `second_way` intent remains a lab hook for the
+             * harness and has no UI (see profile-pipeline-selection-plan). */
             item(key = "rootManager") {
                 Card {
                     ArrowPreference(
