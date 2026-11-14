@@ -2029,13 +2029,21 @@ class GhostlockViewModel(
         pendingRouteChoices = choices
         pendingRouteOptions = options
         parseDialogStage = ParseDialogStage.Route
+        /* The row is two fields — route and carrier — and nothing else. The
+         * derivation reason is technical detail for the generation log. */
+        choices.forEach { choice ->
+            appendLog(
+                "result: option ${RouteDisplay.optionLabel(choice.route, choice.carrier)}" +
+                    " — ${choice.reason}",
+            )
+        }
         mutableState.update {
             it.copy(
                 dialogVisible = true,
                 dialogType = DialogType.LIST,
                 dialogTitleRes = R.string.parse_route_title,
                 dialogItems = choices.map { choice ->
-                    "${RouteDisplay.label(choice.route, choice.geometry, options?.release)} — ${choice.reason}"
+                    RouteDisplay.optionLabel(choice.route, choice.carrier)
                 },
                 dialogItemResIds = emptyList(),
                 dialogItemGrades = choices.map { choice -> RouteDisplay.grade(choice.route) },

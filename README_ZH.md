@@ -2,7 +2,7 @@
 
 > English: [README.md](README.md)
 
-为尚未修补 CVE-2026-43499 漏洞的安卓内核提供临时 root。
+为尚未修补 CVE-2026-43499 漏洞的安卓内核提供临时 root。**三星手机需要同时未修补 CVE-2026-43284。**
 
 本仓库是 [YuKongA/ghostlock-app](https://github.com/YuKongA/ghostlock-app) 的分支。
 **本分支新增3条路线，并优化了决定配置文件导出准确性和漏洞利用成功率的关键部分**。
@@ -29,9 +29,6 @@
 测试使用40+个内核，全部准确生成配置文件，与实机/模拟器结果完全相同。具体清单见[`docs/DESIGN_ZH.md`](docs/DESIGN_ZH.md)。
 
 ## root成功率
-
-在真机上测量，每次重启只跑一次。
-下表使用 r11 候选构建测得，按是否使用页面分为两组。同一手机/内核/路线出现两行时，是同一路线的两种实现方式。
 
 **完全免页面**
 
@@ -61,10 +58,10 @@
 > **使用本 App 的一切风险由使用者自行承担。**
 
 - 系统为Android 12 或更高。
-- 内核及安全补丁尚未修补 CVE-2026-43499 漏洞。
-- 提前安装下列 root 管理器之一：KernelSU、KernelSU-Next、BakaSU（曾是ReSukiSU）、KowSU 或 SukiSU Ultra。每个管理器支持临时 root 的首个版本各不相同，尽可能下载新版。
+- 内核及安全补丁尚未修补 CVE-2026-43499 漏洞。**三星手机需要同时满足未修补 CVE-2026-43284。**
+- 提前安装下列 root 管理器之一：KernelSU、KernelSU-Next、BakaSU（曾是ReSukiSU）、KowSU 或 SukiSU Ultra。每个管理器支持临时 root 的首个版本各不相同，尽可能下载新版。**三星手机只能使用**[这个管理器](https://github.com/diabl0w/KernelSU)。
 
-## 支持的设备
+## 设备支持
 
 支持按内核家族划分，不按机型或具体构建逐一列举：
 
@@ -104,7 +101,7 @@
 
    <img src="docs/images/profile-generation/04-physical.png" width="420" alt="高通机型的 xbl_config 提示">
 
-6. 如果 App 询问 **多条路线均可用，请选择一条**，按行内说明选择。同一路线如果有 32 位布局，会分两行显示，分别标注 `64-bit` 与 `32-bit compat`；右侧是**该路线与这一选择**的建议等级（与内核型号无关），没有依据时显示“未测量”：
+6. 如果 App 询问 **多条路线均可用，请选择一条**，按行内说明选择。每个选项只有两项：路线与实现方式。同一路线如果有 32 位布局，会分两行显示，分别标注 `64-bit native` 与 `32-bit compat`；右侧是**该路线机制**的建议等级（与内核型号和实现方式无关），没有依据时显示“未测量”：
 
    <img src="docs/images/profile-generation/05-route.png" width="420" alt="路线选择">
 
@@ -127,7 +124,7 @@
 - **看方案、路线与 64/32 位选择**（如果 App 询问过）每个选项都有可能产生不同的成功率。
 - **导出日志** 并附在 issue 中。同时提交配置文件生成的日志和执行攻击的日志。
 
-## 成功率改善的原理
+## 我们如何改善成功率
 
 漏洞利用有很多环节，每个环节的失误都会降低全链路成功率。这个分支优化了以下环节：
 
@@ -146,12 +143,14 @@
 
 ## 致谢
 
-本仓库是 [YuKongA/ghostlock-app](https://github.com/YuKongA/ghostlock-app) 的分支，
+本仓库是 [YuKongA/ghostlock-app](https://github.com/YuKongA/ghostlock-app) 的分支，可选的DirtyFrag路线参考自 [diabl0w/DFRoot](https://github.com/diabl0w/DFRoot)，
 采用 Apache License 2.0。上游另致谢：
 
 - [NebuSec/CyberMeowfia](https://github.com/NebuSec/CyberMeowfia)
 - [JoinChang/ghostlock-oneplus](https://github.com/JoinChang/ghostlock-oneplus)
 - [x-spy/CVE-2026-43499-popsicle](https://github.com/x-spy/CVE-2026-43499-popsicle)
+- [lsposed/lspromise](https://github.com/lsposed/lspromise)
+- [combeng6th/DirtyInit](https://github.com/combeng6th/DirtyInit)
 
 App 还使用了 [miuix](https://github.com/compose-miuix-ui/miuix)、
 [Shizuku](https://github.com/RikkaApps/Shizuku)、

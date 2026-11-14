@@ -2,7 +2,8 @@
 
 > 中文: [README_ZH.md](README_ZH.md)
 
-Temporary root for Android kernels that have not yet patched CVE-2026-43499.
+Temporary root for Android kernels that have not yet patched CVE-2026-43499. **Samsung phones must
+also be unpatched for CVE-2026-43284.**
 
 This repository is a fork of [YuKongA/ghostlock-app](https://github.com/YuKongA/ghostlock-app).
 **This branch rebuilds the parts of the pipeline that decide whether a generated profile is
@@ -37,10 +38,6 @@ the real device or in the emulator. The full list is in [`docs/DESIGN.md`](docs/
 
 ## Root success rate
 
-Measured on real phones, one run per fresh boot. The tables were measured with the r11
-release-candidate build and are split into two groups by how much a run depends on a page. When the
-same phone, kernel and route appear on two rows, the two rows are the two carriers of that route.
-
 **Fully page-free**
 
 | Phone | Kernel | Route | Completed | Typical time | Measured |
@@ -72,12 +69,14 @@ same phone, kernel and route appear on two rows, the two rows are the two carrie
 > **You use this app entirely at your own risk.**
 
 - Android 12 or newer.
-- The kernel and its security patch level are not yet patched for CVE-2026-43499.
+- The kernel and its security patch level are not yet patched for CVE-2026-43499. **Samsung phones
+  must also be unpatched for CVE-2026-43284.**
 - A KernelSU-family root manager is installed first: KernelSU, KernelSU-Next, BakaSU (formerly
   ReSukiSU), KowSU, or SukiSU Ultra. Each manager gained temporary-root support in a different
-  version; use the newest one you can.
+  version; use the newest one you can. **Samsung phones must use
+  [this manager](https://github.com/diabl0w/KernelSU).**
 
-## Supported devices
+## Device support
 
 Support is organized by **kernel family**, not by phone model or by a list of individual builds:
 
@@ -127,10 +126,11 @@ Kernels outside these families have no derivation template and are currently out
 
    <img src="docs/images/profile-generation/en/04-physical.png" width="420" alt="The xbl_config prompt on a Qualcomm phone">
 
-6. If the app asks **Multiple routes are available — choose one**, pick from the row descriptions.
-   A route that also has a 32-bit layout appears twice, tagged `64-bit` and `32-bit compat`. The
-   grade on the right is about the route and that choice, not about your kernel; it reads **not
-   measured** when there is no evidence:
+6. If the app asks **Multiple routes are available — choose one**, pick from the rows. Each option
+   is two fields — the route and its carrier. A route that also has a 32-bit layout appears twice,
+   tagged `64-bit native` and `32-bit compat`. The grade on the right is the route's mechanism
+   hint, not a prediction for your kernel or carrier; it reads **not measured** when there is no
+   evidence:
 
    <img src="docs/images/profile-generation/en/05-route.png" width="420" alt="Route selection">
 
@@ -155,7 +155,7 @@ Kernels outside these families have no derivation template and are currently out
 - **Export the log** and attach it to the issue, together with the profile-generation log and the
   attack-run log.
 
-## Why the success rate is higher
+## How we improve the success rate
 
 An exploit has many steps, and a mistake in any one of them lowers the success rate of the whole
 chain. This branch optimizes the following steps:
@@ -184,11 +184,14 @@ chain. This branch optimizes the following steps:
 ## Acknowledgements
 
 This repository is a fork of [YuKongA/ghostlock-app](https://github.com/YuKongA/ghostlock-app),
-Apache License 2.0. Upstream in turn credits:
+with the optional DirtyFrag route adapted from
+[diabl0w/DFRoot](https://github.com/diabl0w/DFRoot), Apache License 2.0. Upstream in turn credits:
 
 - [NebuSec/CyberMeowfia](https://github.com/NebuSec/CyberMeowfia)
 - [JoinChang/ghostlock-oneplus](https://github.com/JoinChang/ghostlock-oneplus)
 - [x-spy/CVE-2026-43499-popsicle](https://github.com/x-spy/CVE-2026-43499-popsicle)
+- [lsposed/lspromise](https://github.com/lsposed/lspromise)
+- [combeng6th/DirtyInit](https://github.com/combeng6th/DirtyInit)
 
 The app also uses [miuix](https://github.com/compose-miuix-ui/miuix),
 [Shizuku](https://github.com/RikkaApps/Shizuku),
