@@ -2,14 +2,14 @@
 
 > 英文版：[BUNDLED_PROFILES.md](BUNDLED_PROFILES.md)
 
-APK 内置 **65 份内核配置**，另有四份内核族模板。内置配置只按 `uname -r` 的完整字符串精确匹配，
+APK 内置 **67 份内核配置**，另有四份内核族模板。内置配置只按 `uname -r` 的完整字符串精确匹配，
 不做模糊匹配；列表之外的内核，可以用本机镜像自行生成配置（见 README 的「自行生成配置」）。权威
 列表是 `app/src/main/assets/kernel_profiles/index.conf`，本页只是它的可读版本。
 
-65 份里，56 份完全免页面、2 份半页面、7 份基于页面。
+67 份里，58 份完全免页面、2 份半页面、7 份基于页面。
 
-- **路线**：这份配置实际跑的路线。标「兼容」的 `select_stack`，指的是用 32 位（armv7）
-  compat select 载体跑的 select。
+- **路线**：这份配置实际跑的路线。标「兼容」的 `select_stack` / `multicast_waiter`，指的是
+  用 32 位（armv7）compat 载体跑的对应路线。
 - **页面依赖**：*完全免页面* —— 锁和 W1 的写值都取自锚点区域；*半页面* —— 锁取自锚点，
   W1 的写值取自喷射页面；*完全页面* —— `tcp_zerocopy`，设计上就依赖页面。
 - **验证程度**：*设备* —— 整条链路在该确切构建上跑通过；*QEMU* —— 十个 `offset.*`、锚点和
@@ -44,6 +44,7 @@ APK 内置 **65 份内核配置**，另有四份内核族模板。内置配置�
 | `6.1.115-android14-11-gfaa9b1b32a11-ab13269000` | select_stack | 完全免页面 | QEMU | Redmi Note 14 Pro 5G / POCO X7 |
 | `6.1.118-android14-11-ga3b9c44908dd-ab13320413` | select_stack | 完全免页面 | QEMU | Redmi Note 15 Pro+ |
 | `6.1.118-android14-11-gca0ef6d17716-ab13624819` | select_stack | 完全免页面 | QEMU | Xiaomi 14 |
+| `6.1.134-android14-11-o-gd252f36df142` | multicast_waiter（兼容） | 完全免页面 | 报告者设备（路线单元门待跑） | Realme Neo7 |
 | `6.1.138-android14-11-g0c3d559bcd85-ab14529422` | select_stack | 完全免页面 | QEMU | Xiaomi 14 |
 | `6.1.138-android14-11-g151cf2b6bfbe-ab13719792` | tcp_zerocopy | 完全页面 | 未验证 | Lenovo Xiaoxin Pad Pro 12.7 (TB375FC) |
 | `6.1.138-android14-11-g2ecae636cf9b-ab14676408` | tcp_zerocopy | 完全页面 | 未验证 | Lenovo Yoga Tab Plus (TB520FU) |
@@ -78,6 +79,7 @@ APK 内置 **65 份内核配置**，另有四份内核族模板。内置配置�
 | `6.12.23-android16-5-g16e473de48a3-abogki462654244-4k` | select_stack | 完全免页面 | QEMU（9/10） | REDMI K90 Pro Max |
 | `6.12.23-android16-5-g316453da9a9e-abogki441133159-4k` | select_stack | 完全免页面 | QEMU | REDMI K90 Pro Max / POCO F8 Ultra |
 | `6.12.23-android16-5-g5a0e85dd9db0-ab14499855-4k` | select_stack | 完全免页面 | 设备 + QEMU | REDMI K90 Pro Max / POCO F8 Ultra |
+| `6.12.23-android16-5-abA165MUBS6CYL1-4k` | select_stack；pipeline DirtyFrag | 完全免页面 | 设备（DirtyFrag） | 三星 Galaxy A16 5G（SM-A165M） |
 | `6.12.23-android16-5-g75e9b1c7ae7c-abogki463945075-4k` | select_stack | 完全免页面 | QEMU | Xiaomi 17 / 17 Pro / 17 Pro Max / 17 Ultra |
 | `6.12.23-android16-5-gf1bdb13583da-ab13761046-4k` | select_stack | 完全免页面 | QEMU | Red Magic 11 Pro、Tablet 5 Pro |
 | `6.12.30-android16-5-g6e872b4863d6-ab13847919-4k` | select_stack | 完全免页面 | QEMU（9/10） | REDMI Note 15 4G、POCO M6 Pro 4G |

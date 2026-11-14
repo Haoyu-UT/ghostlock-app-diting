@@ -3,9 +3,9 @@
 > 中文: [DESIGN_ZH.md](DESIGN_ZH.md)
 
 This is the technical companion to the [README](../README.md). It explains the
-mechanism, the route list, the page-free design, how the extractor derives a
-profile, and how far each kernel is verified. It does not cite internal evidence
-paths.
+mechanism, the two pipelines (GhostLock and DirtyFrag), the route and carrier
+list, the page-free design, how the extractor derives a profile, and how far
+each kernel is verified. It does not cite internal evidence paths.
 
 ## 1. The bug and the chain
 
@@ -29,38 +29,71 @@ The chain is three writes and one handoff:
 A run either completes the handoff or stops at a named stage; the app's run
 record says which.
 
-## 2. Routes
+## 2. The second way: DirtyFrag
 
-| route | kernels served | delivery | page-free | anchor | notes |
+GhostLock is not the only pipeline. **DirtyFrag (CVE-2026-43284)** shares its first step — W1,
+SELinux to permissive — and then writes **file page cache**, not kernel memory. An app can install
+a transport-mode IPsec transform and splice a file page into the UDP send path through
+`IpSecManager`/`IpSecService`; on an image without the ESP fix the kernel attaches the file page
+to the skb and the payload becomes the file's page cache. The chain then injects a small stub into
+`init`'s libc++/libbase sentry constructor, so init runs it with its own uid 0 and opens a root
+daemon (module-free); KernelSU is optional. This is the second way for Samsung phones: KDP rejects
+credential writes, but there is nothing to reject when the credential is init's own.
+
+A profile carries an **ordered pipeline list** (`pipeline = [ "dirtyfrag", "ghostlock" ]`, highest
+precedence first). The app resolves it before W1: the static verdict from the image, the ROM
+preflight (libc++ hook and cave, policy/service), the stage-2 primitive probe (`libdfprobe`,
+recorded in the measured DB) and the live state. The first viable entry runs; there is no fallback
+after W1, and a KDP image carries `["dirtyfrag"]` only. Every DirtyFrag failure exit restores
+SELinux enforcing. The send path decides feasibility: 5.10 `splice() → udp_sendpage() →
+ip_append_page()`, 6.5+ `skb_splice_from_iter`; a 6.1 image without the latter copies the page,
+so DirtyFrag is infeasible there.
+
+## 3. Routes
+
+A route is a delivery mechanism for the stamped waiter; a **carrier** is how that mechanism is
+implemented for the image's ABI. The extractor decides both from the image.
+
+| route | carrier | kernels served | delivery | page-free | notes |
 |---|---|---|---|---|---|
-| `select_stack` | 5.10.136+, 6.1, 6.6, 6.12 | pselect / `_newselect` | yes | yes | the default route; compact waiter on 5.10/6.1 |
-| `sigreturn` | 5.10.43 / 81 / 101 | `rt_sigreturn` fpsimd restore | yes | yes | covers kernels older than 5.10.136 |
-| `tcp_zerocopy` | 6.1 | setsockopt / UDP | no | no | page-based by nature; select is its fallback |
-| `multicast_waiter` | a few kernels | IP multicast | yes | yes | no bundled profile uses it |
-| `select_stack` (32-bit compat) | 5.10.43 / 81 / 101 | pselect via a 32-bit helper | yes | yes | the 32-bit delivery of select_stack |
+| `select_stack` | 64-bit native | 5.10.136+, 6.1, 6.6, 6.12 | pselect / `_newselect` | yes | the default route; compact waiter on 5.10/6.1 |
+| `select_stack` | 32-bit compat | 5.10.43 / 81 / 101; 6.1.138 | pselect via the AArch32 helper | yes | the 32-bit delivery of select_stack |
+| `sigreturn` | 64-bit native | 5.10.43 / 81 / 101 | `rt_sigreturn` fpsimd restore | yes | covers kernels older than 5.10.136 |
+| `tcp_zerocopy` | 64-bit native | 6.1 | setsockopt / UDP | no | page-based by nature; select is its declared fallback |
+| `multicast_waiter` | 64-bit native | 5.15.194 (fuxi), a few 5.10 images | IP multicast | yes | the route those images run |
+| `multicast_waiter` | 32-bit compat | 6.1.134, 6.1.138 | AArch32 `MCAST_BLOCK_SOURCE` | yes | 6.1 images whose 64-bit copy is too deep |
 
-**Route verdicts.** The extractor reads each image's own instructions, decides
-which routes are feasible, and reports the numbers behind the verdict. When more
-than one route is feasible the app asks the user; it never silently picks one.
+**Route verdicts.** The extractor reads each image's own instructions, decides which routes are
+feasible and with which carrier, and reports the numbers behind the verdict. A route can be
+offered twice — the native and the compat carrier — and one option is exactly two fields: the
+route and its carrier (`64-bit native` / `32-bit compat`). The grade beside a row is the route's
+mechanism hint, not a per-kernel or per-carrier prediction. When more than one route is feasible
+the app asks; when only one is, it takes the image's primary carrier without asking.
 
-**The other two 5.10 delivery paths.**
+**The carrier variants.**
 
-- `sigreturn` delivers the stamp through the `rt_sigreturn` fpsimd restore. It
-  is for kernels whose `do_futex` frame is too shallow for the pselect route to
-  reach (the 5.10.43 / 81 / 101 generation).
-- **`select_stack` (32-bit compat)** covers the other half of that generation:
-  the stale waiter strip sits *below* the 64-bit pselect buffer, so a statically
-  linked AArch32 helper runs the race and parks in the compat `_newselect`, with
-  the 64-bit native packing the bitmap. Every kernel address, the anchor
-  allocator and the profile stay 64-bit. The helper refuses any geometry it
-  cannot cover — 5.10.236's 0x200 / 0x210 strips are the example; it fails
-  safely there, so the 236 keeps the 64-bit route.
+- `sigreturn` delivers the stamp through the `rt_sigreturn` fpsimd restore. It is for kernels
+  whose `do_futex` frame is too shallow for the pselect route to reach (the 5.10.43 / 81 / 101
+  generation).
+- **`select_stack` (32-bit compat)** covers the other half of that generation and, since r11, the
+  6.1 images whose compat chain fits: the stale waiter strip sits *below* the 64-bit pselect
+  buffer, so a statically linked AArch32 helper runs the race and parks in the compat
+  `_newselect`, with the 64-bit native packing the bitmap. Every kernel address, the anchor
+  allocator and the profile stay 64-bit. The helper refuses any geometry it cannot cover —
+  5.10.236's 0x200 / 0x210 strips are the example; it fails safely there, so the 236 keeps the
+  64-bit route. 6.1.138 is the first 6.1 device gate (4/4).
+- **`multicast_waiter` (32-bit compat)** is the 6.1 delivery for images whose 64-bit
+  `group_source_req` copy is too deep (on 6.1.138 the copy window ends 0x88 short of the lock
+  slot): the AArch32 helper's `MCAST_BLOCK_SOURCE` branch copies the 32-bit structure into a
+  local that lands on the waiter. It is device-gated on 6.1.138; the route's copy-to-lock window
+  is intrinsically exposed (the dead-frame audit found no parked carrier), so its measured rate
+  is the one quoted.
 
-**multicast_waiter** is not a default route: on a few 5.10 images (the 5.10.246
-candidate, for one) it is the only route that works, but its geometry does not
-fit other images, so no bundled profile depends on it.
+**multicast_waiter** is not a default route: the 5.15.194 (fuxi) and 6.1.134 (Realme) bundled
+profiles are the images where the derivation leaves it as the route that runs; it is the only
+route that works there, but its geometry does not fit the other images.
 
-## 3. Page-free routes
+## 4. Page-free routes
 
 The old chain depended on a sprayed payload page: leak a slab page, free it,
 reclaim it with controlled content, then hope the frag allocator hands the same
@@ -79,6 +112,15 @@ routes:
   `initialized` byte sits at offset 2 on 5.10/5.15/6.1 and offset 1 on
   6.6/6.12 (`+0x100` pins it). A region that cannot satisfy the rule is not
   offered as a self-contained plan.
+- **Policy capabilities.** The W1 value is a kernel address, so its bytes 5–6 are
+  `0xff`; those bytes are `policycap[3]` (`always_check_network`) and `[4]`
+  (`cgroup_seclabel`). The store silently forces them on, and the network data
+  path can be blocked until the policy is reloaded. The root script therefore
+  reloads the policy immediately after root, before any KernelSU handoff; when
+  the live policy is unreadable (a warm run with KernelSU already loaded returns
+  `EINVAL`), the app shows **建议重启** and posts a notification — a reboot
+  restores the bytes. The value-independent W1 write that would avoid the flip is
+  planned, not shipped.
 - **Region safety policy.** `dump_skip.zeroes`, `bm_pmd` and `serial8250_ports`
   are always allowed. `s3c24xx_serial_ports` is conditional: without Samsung
   serial hardware it is dead code, but on a Samsung device the driver may be
@@ -95,12 +137,14 @@ routes:
 The run log names the mode: `page_free=1 reason=policy+scratch+anchor`, or
 `page_free=0 reason=<first missing condition>`.
 
-## 4. The extractor
+## 5. The extractor
 
 The extractor decides which kernels can be covered. One parse produces
-an **option superset** — every feasible route with its geometry, every named
-anchor candidate with its page-free plan, and the common profile blocks. A
-runnable profile is a *cut* of that document; no second derivation happens.
+an **option superset** — every feasible route with its geometry and carrier
+variants (`alternatives[]`), the pipeline verdicts (`pipelines[]`, the derived
+order), every named anchor candidate with its page-free plan, and the common
+profile blocks. A runnable profile is a *cut* of that document; no second
+derivation happens.
 
 Inputs: `boot.img`, a raw arm64 `Image`, `payload.bin`, an OTA zip or an OTA
 URL. The physical load address and offset come from the platform image:
@@ -114,11 +158,19 @@ Route verdicts, the anchor scan and the slab stride (measured on the device or
 under QEMU) are part of the same derivation. Every value carries a source and
 confidence record (`--explain` prints it).
 
+The pipeline verdict decides whether DirtyFrag is feasible: the ESP fix level,
+the splice send path (`udp_sendpage`/`ip_append_page` on 5.10,
+`skb_splice_from_iter` on 6.5+) and the image's KDP fact. The app's pre-W1
+resolver adds the ROM preflight (hook and cave) and the live probe.
+
 ### Verified kernels
 
 "Device" means the full chain completed on that exact build; "QEMU" means the
 ten `offset.*` values, the anchor and the stride were checked against the same
-image running under QEMU.
+image running under QEMU. The authoritative per-kernel list, with each bundled
+profile's route and verification level, is
+[`kernel_profiles/BUNDLED_PROFILES.md`](kernel_profiles/BUNDLED_PROFILES.md);
+the table below is the derivation corpus the design was validated on.
 
 | Kernel (`uname -r`) | Route(s) | Verified |
 |---|---|---|
@@ -152,8 +204,9 @@ image running under QEMU.
 | `6.1.115-android14-11-gfaa9b1b32a11-ab13269000` | select_stack, tcp_zerocopy | QEMU |
 | `6.1.118-android14-11-ga3b9c44908dd-ab13320413` | select_stack, tcp_zerocopy | QEMU |
 | `6.1.118-android14-11-gca0ef6d17716-ab13624819` | select_stack, tcp_zerocopy | QEMU |
+| `6.1.134-android14-11-o-gd252f36df142` | multicast_waiter (32-bit compat), sigreturn | reporter's device (image and profile match); the compat route is the derived fix, unit gate pending |
 | `6.1.138-android14-11-g0c3d559bcd85-ab14529422` | select_stack, tcp_zerocopy | QEMU |
-| `6.1.138-android14-11-g44bda9e8f6e9-ab13792638` | select_stack, tcp_zerocopy | device (duchamp) + QEMU |
+| `6.1.138-android14-11-g44bda9e8f6e9-ab13792638` | select_stack (native + 32-bit compat), tcp_zerocopy, multicast_waiter (32-bit compat), sigreturn | device (duchamp: native select 10/10, compat select 4/4, compat multicast 8/10) + QEMU |
 | `6.1.138-android14-11-g51f8c580613d-ab13911623` | select_stack, tcp_zerocopy | QEMU |
 | `6.6.30-android15-8-g6b55ce738535-4k` | select_stack | QEMU |
 | `6.6.56-android15-8-g443415d527b9-ab13130172-4k` | select_stack | QEMU |
@@ -164,6 +217,7 @@ image running under QEMU.
 | `6.12.23-android16-5-g16e473de48a3-abogki462654244-4k` | select_stack | QEMU (9/10; `security_hook_heads` absent) |
 | `6.12.23-android16-5-g316453da9a9e-abogki441133159-4k` | select_stack | QEMU (9/10; same reason) |
 | `6.12.23-android16-5-g5a0e85dd9db0-ab14499855-4k` | select_stack | device (parse + stride; no chain run yet) |
+| `6.12.23-android16-5-abA165MUBS6CYL1-4k` | select_stack + DirtyFrag pipeline | device (DirtyFrag second way, operator-confirmed) |
 | `6.12.30-android16-5-g6e872b4863d6-ab13847919-4k` | select_stack | QEMU (9/10; same reason) |
 | `6.12.38-android16-5-g3c4da6410bcb-ab13872285-4k` | select_stack | QEMU (9/10; same reason) |
 | `6.12.69-android16-6-g014ca48a80ee-ab15889839-4k` | select_stack | patched; the extractor refuses, the anchor was checked by hand |
@@ -175,11 +229,15 @@ Notes:
 - The corpus also holds host-checked-only kernels (5.10.157, 5.10.189, 5.10.214
   and another 5.10.209 build). Their profiles generate and are self-consistent,
   but there is no runtime or device witness, so they are not listed above.
+- The store holds 71 corpora; sixty of them ship as golden-derived bundled
+  profiles. The seven hand-finished 6.1 profiles carry family evidence only
+  (their Images are not in the store), and the four templates are reference
+  documents that never match a device.
 - The extractor's contract is checked in both languages: the native wire digest
   and the Kotlin document digest hold the same value, and changing either side
   fails its own test.
 
-## 5. The profile model
+## 6. The profile model
 
 - **Bundled profiles** are assets inside the APK, looked up by exact `uname -r`;
   for the kernel they cover they are the authoritative source.
@@ -192,14 +250,15 @@ Notes:
 - The editor lives in memory; export is the only save. The native wire schema and
   the Kotlin document stay in step through one shared digest.
 
-## 6. Measurement method
+## 7. Measurement method
 
 - One run per fresh boot: reboot, wait for `sys.boot_completed=1`, let the system
   settle, run, then confirm the boot id changed.
-- The series are driven by `sigret-run-once.sh`: before each run it puts the app
-  back into the `top-app` cpuset, and on devices that expose `core_ctl` it also
-  keeps the profile's CPUs in the active mask. The numbers in the README tables
-  were measured under exactly that setup.
+- The canonical series pair is `series-run.sh` (one fresh boot per run) around
+  `sigret-run-once.sh`: before the tap it puts the app back into the `top-app`
+  cpuset, and on devices that expose `core_ctl` it also keeps the profile's CPUs
+  in the active mask. The numbers in the README tables were measured under
+  exactly that setup.
 - The verdict is the app's run record: `state=completed` (plus
   `native exited code=0` for a handoff run). Secondary: the route line
   (`calls=… success=… clean=1/1`) and any oops in the polled kernel log.
@@ -211,7 +270,7 @@ Notes:
   `/proc/kallsyms` and `/proc/slabinfo`, compares the generated profile with the
   running kernel, and uses the device-verified 5.10.236 values as the control.
 
-## 7. Building and testing
+## 8. Building and testing
 
 Toolchain: ONDK r30.1 (not Google's stock NDK), JDK 25, and the Android Rust
 target.
@@ -227,7 +286,11 @@ cargo test --release           # extractor
 ```
 
 The APK packages `libghostlock.so`, the AArch32 `libghostlock32.so` and the
-extractor `libextract.so`. Before a release the attack path is also checked with
+extractor `libextract.so`. The store corpus tests run only when
+`GHOSTLOCK_IMAGE_DIR` points at `external/test-kernels`; without it they skip
+silently. Before a release the attack path is also checked with
 `tools/cmp_disasm.py`; its known control failure (two `multicast_*` symbols
 absent from both binaries) is expected, so read the per-target instruction
-counts, not just the exit code.
+counts, not just the exit code. The release itself is gated on
+`tools/ship_golden_profiles.py --check` (60 bundled, 0 missing, 0 mismatched, 11
+exempt at r11) plus a fresh-boot smoke on the final build.

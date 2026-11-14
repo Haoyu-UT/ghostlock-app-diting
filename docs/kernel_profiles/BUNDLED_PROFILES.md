@@ -2,14 +2,14 @@
 
 > 中文版本：[BUNDLED_PROFILES_ZH.md](BUNDLED_PROFILES_ZH.md)
 
-The APK ships **65 kernel profiles** plus four family templates. A profile is matched by the exact
+The APK ships **67 kernel profiles** plus four family templates. A profile is matched by the exact
 `uname -r` and nothing else; a kernel that is not on this list can still generate its own profile
 (see the README's *Generating a profile*). The authoritative list is
 `app/src/main/assets/kernel_profiles/index.conf`; this page is its readable form.
 
-Current mix: 56 page-free, 2 half-page, 7 page-based.
+Current mix: 58 page-free, 2 half-page, 7 page-based.
 
-- **Route** — what the bundled profile runs.
+- **Route** — what the bundled profile runs; `(compat)` means the AArch32 helper carries it.
 - **Page-free** — *page-free*: the lock and the W1 value both come from anchor areas; *half*: the
   lock comes from an anchor, the W1 value from a sprayed page; *page*: `tcp_zerocopy`, page-based by
   construction.
@@ -45,6 +45,7 @@ Current mix: 56 page-free, 2 half-page, 7 page-based.
 | `6.1.115-android14-11-gfaa9b1b32a11-ab13269000` | select_stack | page-free | QEMU | Redmi Note 14 Pro 5G / POCO X7 |
 | `6.1.118-android14-11-ga3b9c44908dd-ab13320413` | select_stack | page-free | QEMU | Redmi Note 15 Pro+ |
 | `6.1.118-android14-11-gca0ef6d17716-ab13624819` | select_stack | page-free | QEMU | Xiaomi 14 |
+| `6.1.134-android14-11-o-gd252f36df142` | multicast_waiter (compat) | page-free | reporter's device (route gate pending) | Realme Neo7 |
 | `6.1.138-android14-11-g0c3d559bcd85-ab14529422` | select_stack | page-free | QEMU | Xiaomi 14 |
 | `6.1.138-android14-11-g151cf2b6bfbe-ab13719792` | tcp_zerocopy | page | unverified | Lenovo Xiaoxin Pad Pro 12.7 (TB375FC) |
 | `6.1.138-android14-11-g2ecae636cf9b-ab14676408` | tcp_zerocopy | page | unverified | Lenovo Yoga Tab Plus (TB520FU) |
@@ -79,6 +80,7 @@ Current mix: 56 page-free, 2 half-page, 7 page-based.
 | `6.12.23-android16-5-g16e473de48a3-abogki462654244-4k` | select_stack | page-free | QEMU (9/10) | REDMI K90 Pro Max |
 | `6.12.23-android16-5-g316453da9a9e-abogki441133159-4k` | select_stack | page-free | QEMU | REDMI K90 Pro Max / POCO F8 Ultra |
 | `6.12.23-android16-5-g5a0e85dd9db0-ab14499855-4k` | select_stack | page-free | device + QEMU | REDMI K90 Pro Max / POCO F8 Ultra |
+| `6.12.23-android16-5-abA165MUBS6CYL1-4k` | select_stack; pipeline DirtyFrag | page-free | device (DirtyFrag) | Samsung Galaxy A16 5G (SM-A165M) |
 | `6.12.23-android16-5-g75e9b1c7ae7c-abogki463945075-4k` | select_stack | page-free | QEMU | Xiaomi 17 / 17 Pro / 17 Pro Max / 17 Ultra |
 | `6.12.23-android16-5-gf1bdb13583da-ab13761046-4k` | select_stack | page-free | QEMU | Red Magic 11 Pro, Tablet 5 Pro |
 | `6.12.30-android16-5-g6e872b4863d6-ab13847919-4k` | select_stack | page-free | QEMU (9/10) | REDMI Note 15 4G, POCO M6 Pro 4G |
