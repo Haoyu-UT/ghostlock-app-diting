@@ -54,6 +54,12 @@ data class KernelSnapshot(
     val kernelSupported: Boolean,
     /** The kernel is known but its physical layout is missing on this MTK device. */
     val devicePairMissing: Boolean = false,
+    /**
+     * The stored external selection could not be read, so the resolver yields no
+     * profile (fail-closed). The home reports this instead of an unsupported
+     * kernel and offers re-selection; the badge stays unsupported until then.
+     */
+    val externalProfileUnreadable: Boolean = false,
     val cpuPairs: List<CpuPair>,
     val cpuPairLabels: List<String>,
     val selectedCpuPair: Int,
@@ -246,6 +252,14 @@ data class ProfileLayers(
     val externalParent: String? = null,
     /** Why the selected external document could not be used. */
     val externalError: String? = null,
+    /**
+     * The selected document could not be **read** at all (gone, revoked, or the
+     * provider stopped opening it — measured 2026-11-12, an `adb push` replaced
+     * the SAF inode). Distinct from [externalError] for a readable document that
+     * fails its content checks: only this case withdraws the selection's release
+     * from the supported set and asks the user to re-select the file.
+     */
+    val externalReadFailure: Boolean = false,
 ) {
     /** True when something present was deliberately not applied. */
     val hasInactiveLayer: Boolean

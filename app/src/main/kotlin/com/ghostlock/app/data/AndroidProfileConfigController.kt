@@ -772,7 +772,12 @@ internal class AndroidProfileConfigController(
 
     // ---- resolution ----
 
-    private data class Source(val document: ValueMap?, val error: String?)
+    private data class Source(
+        val document: ValueMap?,
+        val error: String?,
+        /** The selected document itself could not be read (not a content miss). */
+        val readFailure: Boolean = false,
+    )
 
     private data class Resolution(
         val profile: ValueMap?,
@@ -825,7 +830,7 @@ internal class AndroidProfileConfigController(
     ): Resolution {
         val source = loadSource(release, selection)
         val document = source.document
-            ?: return Resolution(null, layersFor(selection, source.error), selection)
+            ?: return Resolution(null, layersFor(selection, source.error, source.readFailure), selection)
         val merged = runCatching { merge(release, pair, document, overrides) }
         val layers = layersFor(selection, source.error ?: merged.exceptionOrNull()?.message)
         return Resolution(merged.getOrNull(), layers, selection)
@@ -884,7 +889,7 @@ internal class AndroidProfileConfigController(
 
             is ProfileSelection.External -> {
                 val text = externalProfiles.read(selection.uri)
-                    ?: return Source(null, "cannot read ${selection.name}")
+                    ?: return Source(null, "cannot read ${selection.name}", readFailure = true)
                 val document = ProfileDocumentParser.entryForRelease(
                     text, release, ::loadBundledInclude,
                 )
@@ -918,7 +923,11 @@ internal class AndroidProfileConfigController(
         document
     }.getOrNull()
 
-    private fun layersFor(selection: ProfileSelection?, error: String?): ProfileLayers {
+    private fun layersFor(
+        selection: ProfileSelection?,
+        error: String?,
+        readFailure: Boolean = false,
+    ): ProfileLayers {
         val external = selection as? ProfileSelection.External
         val builtinRelease = when (selection) {
             is ProfileSelection.Bundled -> selection.release
@@ -936,6 +945,7 @@ internal class AndroidProfileConfigController(
             externalSha256 = external?.sha256,
             externalParent = external?.parent,
             externalError = error,
+            externalReadFailure = readFailure,
         )
     }
 

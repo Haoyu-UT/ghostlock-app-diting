@@ -109,6 +109,7 @@
     <string name="cancel">取消</string>
     <string name="profile_invalid">配置参数不合法，请先修正红色标记的项</string>
     <string name="run_blocked_no_profile">未找到匹配本机内核的配置，请前往配置参数导入或调整</string>
+    <string name="run_blocked_external_unreadable">所选外部配置无法读取，请前往配置参数重新选择</string>
     <string name="run_blocked_shizuku">Shizuku 未就绪，请点击状态卡启动或授权</string>
     <string name="export_share">分享偏移</string>
     <string name="export_failed">导出失败</string>
@@ -136,11 +137,13 @@
     <string name="kernel_unsupported">不支持</string>
     <string name="kernel_profile_required">需要加载配置</string>
     <string name="kernel_profile_invalid">配置需要修正</string>
+    <string name="kernel_external_unreadable">配置无法读取</string>
     <string name="kernel_profile_ready">配置已就绪</string>
     <string name="kernel_profile_ready_shizuku">Shizuku 已就绪</string>
     <string name="kernel_unsupported_summary">未找到匹配的内核配置</string>
     <string name="kernel_profile_required_summary">加载配置后可继续</string>
     <string name="kernel_profile_invalid_summary">请修正标记的配置项</string>
+    <string name="kernel_external_unreadable_summary">请在配置参数中重新选择外部配置文件</string>
     <string name="cpu_pair_custom">自定义（%1$s）</string>
     <string name="cpu_pair_label">CPU 核心组</string>
     <string name="safe_mode_label">安全模式</string>

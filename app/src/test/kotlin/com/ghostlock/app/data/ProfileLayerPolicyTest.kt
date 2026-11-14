@@ -145,6 +145,9 @@ class ProfileLayerPolicyTest {
         assertNotNull(layers.external)
         assertNotNull(layers.externalError)
         assertTrue(layers.externalError!!.contains("no entry for $bundledRelease"))
+        /* A readable document that misses this release is a content miss, not a
+         * read failure: it must not take the "re-select the file" path. */
+        assertFalse(layers.externalReadFailure)
         assertTrue(layers.hasInactiveLayer)
     }
 
@@ -163,7 +166,33 @@ class ProfileLayerPolicyTest {
         val layers = checkNotNull(config.layers)
         assertFalse(layers.externalApplied)
         assertNotNull(layers.externalError)
+        /* The typed read-failure fact: the repository withdraws the selection's
+         * release from the supported set on this, and the home offers re-selection
+         * (the inode-swap case, 2026-11-12 G2). */
+        assertTrue(layers.externalReadFailure)
         assertTrue(layers.hasInactiveLayer)
+    }
+
+    @Test
+    fun `the same selection applies again once the document is readable`() = runBlocking {
+        val uri = external.add(
+            "content://profiles/wins.conf",
+            document(bundledRelease, routeWaitMs = 4242),
+        )
+        assertNotNull(controller.selectExternalProfile(uri, bundledRelease, pair))
+        val text = external.documents.getValue(uri)
+        external.documents.clear()
+        assertTrue(controller.load(bundledRelease, pair).layers!!.externalReadFailure)
+
+        /* Re-selecting the same file repairs the state without a restart: the
+         * reference already points at it, and the next resolution reads it. */
+        external.documents[uri] = text
+        val config = controller.load(bundledRelease, pair)
+
+        assertTrue(config.hasProfile)
+        val layers = checkNotNull(config.layers)
+        assertTrue(layers.externalApplied)
+        assertFalse(layers.externalReadFailure)
     }
 
     @Test

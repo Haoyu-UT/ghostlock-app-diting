@@ -114,6 +114,12 @@ data class GhostlockUiState(
     val kernelRelease: String = "",
     val socName: String = "",
     val kernelSupported: Boolean = false,
+    /**
+     * The stored external selection cannot be read, so there is no profile and
+     * no run: the home names the real cause and sends the user to re-select it
+     * instead of claiming the kernel is unsupported.
+     */
+    val externalProfileUnreadable: Boolean = false,
     val shizukuEnabled: Boolean = false,
     val shizukuStatus: ShizukuStatus = ShizukuStatus.NOT_REQUIRED,
     /** Root-manager choice (package name); null means Auto. */
@@ -1197,6 +1203,7 @@ private fun ControlPanel(
     Column(modifier = modifier) {
         ActivationStatusCard(
             supported = state.kernelSupported,
+            externalUnreadable = state.externalProfileUnreadable,
             profileAvailable = state.executionHasProfile,
             profileValid = state.profileInvalidPaths.isEmpty(),
             shizukuEnabled = state.shizukuEnabled,
@@ -1287,6 +1294,7 @@ private fun ControlPanel(
 @Composable
 private fun ActivationStatusCard(
     supported: Boolean,
+    externalUnreadable: Boolean,
     profileAvailable: Boolean,
     profileValid: Boolean,
     shizukuEnabled: Boolean,
@@ -1309,6 +1317,15 @@ private fun ActivationStatusCard(
             Icons.Rounded.CheckCircleOutline,
         )
 
+        /* The selected document itself cannot be read: the resolver has no
+         * profile, and the fault is the selection, not the kernel. Checked
+         * before `missing` so the card never blames the kernel match. */
+        externalUnreadable -> Triple(
+            MiuixTheme.colorScheme.errorContainer,
+            R.string.kernel_external_unreadable,
+            Icons.Rounded.ErrorOutline,
+        )
+
         missing -> Triple(
             MiuixTheme.colorScheme.errorContainer,
             if (!supported) R.string.kernel_unsupported else R.string.kernel_profile_required,
@@ -1328,6 +1345,7 @@ private fun ActivationStatusCard(
     val summary = when {
         ready && shizukuEnabled -> R.string.kernel_profile_ready_shizuku
         ready -> R.string.kernel_profile_ready
+        externalUnreadable -> R.string.kernel_external_unreadable_summary
         !supported -> R.string.kernel_unsupported_summary
         !profileAvailable -> R.string.kernel_profile_required_summary
         !profileValid -> R.string.kernel_profile_invalid_summary
@@ -1336,7 +1354,7 @@ private fun ActivationStatusCard(
 
         else -> R.string.shizuku_status_not_running
     }
-    val action = if (supported && profileAvailable && profileValid && !accessReady) {
+    val action = if (!externalUnreadable && supported && profileAvailable && profileValid && !accessReady) {
         onShizukuClick
     } else {
         onParametersClick

@@ -280,6 +280,7 @@ class GhostlockViewModel(
                 executionEditing = if (preserveEditing) state.executionEditing
                 else config.general.associate { field -> field.path to field.value.toString() },
                 profileInvalidPaths = config.invalidPaths,
+                externalProfileUnreadable = config.layers?.externalReadFailure == true,
                 profileRoute = config.route,
                 profileFallback = config.fallbackTo,
                 activeBuiltinProfile = profileController.activeBuiltinRelease(),
@@ -1102,6 +1103,9 @@ class GhostlockViewModel(
     fun onProfileInvalid() {
         val state = state.value
         val messageRes = when {
+            /* The unreadable selection is also "no profile", but its repair is
+             * re-selecting a file, not finding a kernel match. */
+            state.externalProfileUnreadable -> R.string.run_blocked_external_unreadable
             !state.executionHasProfile -> R.string.run_blocked_no_profile
             state.shizukuEnabled && state.shizukuStatus != ShizukuStatus.READY ->
                 R.string.run_blocked_shizuku
@@ -1130,10 +1134,14 @@ class GhostlockViewModel(
         if (!snapshot.kernelSupported) {
             if (beginOperation()) {
                 appendLog(
-                    if (snapshot.devicePairMissing) {
-                        "result: device physical layout missing; attach vendor_boot/dtbo (MediaTek) and re-parse"
-                    } else {
-                        "result: exploit chain unsupported by this kernel"
+                    when {
+                        snapshot.externalProfileUnreadable ->
+                            "result: the selected external profile cannot be read; re-select it"
+
+                        snapshot.devicePairMissing ->
+                            "result: device physical layout missing; attach vendor_boot/dtbo (MediaTek) and re-parse"
+
+                        else -> "result: exploit chain unsupported by this kernel"
                     },
                 )
                 endOperation()
@@ -1767,6 +1775,10 @@ class GhostlockViewModel(
                 shizukuEnabled = snapshot.shizukuEnabled,
                 shizukuStatus = snapshot.shizukuStatus,
                 profileInvalidPaths = loaded?.invalidPaths ?: emptySet(),
+                /* The fresh resolution is the authority; the snapshot's copy
+                 * covers the no-pair case where no config was resolved here. */
+                externalProfileUnreadable = loaded?.layers?.externalReadFailure
+                    ?: snapshot.externalProfileUnreadable,
                 executionHasProfile = loaded?.hasProfile ?: false,
                 profileLayers = loaded?.layers,
                 externalProfile = profileController.activeExternalProfile(),

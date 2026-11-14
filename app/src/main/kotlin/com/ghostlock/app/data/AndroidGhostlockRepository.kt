@@ -229,16 +229,23 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             importedOffsetsRecommendShizuku(release)
         val shizukuActive = if (shizukuPreferenceSet) shizukuEnabled else recommendShizuku
         val socName = resolveSocName()
-        val kernelKnown = isKernelSupported()
-        /* A known kernel is not enough on MediaTek: the compiled pair there is
-         * wrong on most of the fleet, so the resolved profile must carry the
-         * bootloader-derived pair (from the device map or the parse flow). */
-        val profile = if (kernelKnown) {
+        /* Resolve before judging support: the stored external selection makes its
+         * release a candidate, but the selection only counts once the document
+         * can actually be read. An unreadable one must not keep the badge
+         * supported — the resolver refuses it (fail-closed) and the home says
+         * why (2026-11-12, G2: an inode swap made the SAF row unopenable). */
+        val coveredByStoredSource = releaseCoveredByStoredSource()
+        val profile = if (coveredByStoredSource) {
             runCatching { profileController.load(release, currentPairOrZero()) }.getOrNull()
         } else {
             null
         }
+        val externalReadFailure = profile?.layers?.externalReadFailure == true
+        val kernelKnown = coveredByStoredSource && !externalReadFailure
         val pairKnown = profile?.physLoad != null && profile.physOffset != null
+        /* A known kernel is not enough on MediaTek: the compiled pair there is
+         * wrong on most of the fleet, so the resolved profile must carry the
+         * bootloader-derived pair (from the device map or the parse flow). */
         val usable = kernelKnown && physicalPairUsable(socName, pairKnown)
         return KernelSnapshot(
             deviceName = resolveDeviceName(),
@@ -246,6 +253,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             socName = socName,
             kernelSupported = usable,
             devicePairMissing = kernelKnown && !usable,
+            externalProfileUnreadable = externalReadFailure,
             cpuPairs = cpuPairs.toList(),
             cpuPairLabels = cpuPairLabels.toList(),
             selectedCpuPair = selectedCpuPair,
@@ -1800,7 +1808,14 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     private fun freshReleases(entries: List<*>): List<String> =
         entries.mapNotNull { (it.asValueMap()?.get("release") as? String) }.distinct()
 
-    private fun isKernelSupported(): Boolean {
+    /**
+     * Whether a stored source names this release: a bundled asset, the stored
+     * external selection's recorded release, or a legacy import. The external
+     * term is only a **candidate** — [snapshot] discounts it when the document
+     * cannot be read, because the resolver then refuses the release rather
+     * than falling back to the bundle.
+     */
+    private fun releaseCoveredByStoredSource(): Boolean {
         val version = System.getProperty("os.version", "").orEmpty()
         return releaseSupportedByProfileSources(
             version,

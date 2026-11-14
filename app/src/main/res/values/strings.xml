@@ -109,6 +109,7 @@
     <string name="cancel">Cancel</string>
     <string name="profile_invalid">Profile parameters are invalid; fix the red fields first</string>
     <string name="run_blocked_no_profile">No profile matches this kernel; import or adjust it in Parameters</string>
+    <string name="run_blocked_external_unreadable">The selected external profile cannot be read; re-select it in Parameters</string>
     <string name="run_blocked_shizuku">Shizuku is not ready; tap the status card to start or authorize</string>
     <string name="export_share">Share offsets</string>
     <string name="export_failed">Export failed</string>
@@ -136,11 +137,13 @@
     <string name="kernel_unsupported">Not supported</string>
     <string name="kernel_profile_required">Profile required</string>
     <string name="kernel_profile_invalid">Profile needs correction</string>
+    <string name="kernel_external_unreadable">Profile unreadable</string>
     <string name="kernel_profile_ready">Profile ready</string>
     <string name="kernel_profile_ready_shizuku">Shizuku ready</string>
     <string name="kernel_unsupported_summary">No matching kernel profile</string>
     <string name="kernel_profile_required_summary">Load a profile to continue</string>
     <string name="kernel_profile_invalid_summary">Correct the marked fields</string>
+    <string name="kernel_external_unreadable_summary">Re-select the external profile file in Parameters</string>
     <string name="cpu_pair_custom">Custom (%1$s)</string>
     <string name="cpu_pair_label">CPU cores</string>
     <string name="safe_mode_label">Safe mode</string>
