@@ -8,6 +8,19 @@ This repository is a fork of [YuKongA/ghostlock-app](https://github.com/YuKongA/
 **This branch rebuilds the parts of the pipeline that decide whether a generated profile is
 accurate and whether a run completes.**
 
+## Supported routes and carriers
+
+This fork supports the following route and carrier combinations.
+
+| Route | Carrier | Page model | Notes |
+|---|---|---|---|
+| `select_stack` | 64-bit native | page-free | from upstream, made page-free |
+| `tcp_zerocopy` | 64-bit native | page-based | from upstream |
+| `multicast_waiter` | 64-bit native | page-free | from upstream, made page-free |
+| `sigreturn` | 64-bit native | page-free | added by this fork |
+| `select_stack` | 32-bit compat | page-free | added by this fork |
+| `multicast_waiter` | 32-bit compat | page-free | added by this fork |
+
 ## Design principles
 
 1. Support comes from a profile generator that reads the kernel image, not from a hand-maintained
@@ -24,36 +37,31 @@ the real device or in the emulator. The full list is in [`docs/DESIGN.md`](docs/
 
 ## Root success rate
 
-Measured on real phones, one run per fresh boot. The tables were measured with the r8
-release-candidate build and are split into three groups by how much a run depends on a page. When
-the same phone, kernel and route appear twice, the two rows are two page-dependency configurations.
+Measured on real phones, one run per fresh boot. The tables were measured with the r11
+release-candidate build and are split into two groups by how much a run depends on a page. When the
+same phone, kernel and route appear on two rows, the two rows are the two carriers of that route.
 
 **Fully page-free**
 
 | Phone | Kernel | Route | Completed | Typical time | Measured |
 |---|---|---|---|---|---|
-| Redmi K50 Ultra (`diting`) | 5.10.236 | `select_stack` | 10/10 | 13.8–15.9 s | 2026-10-31 |
-| Redmi K50 Ultra (`diting`) | 5.10.236 | `sigreturn` | 6/10<br>(4 runs rebooted mid-run) | 12.8–13.4 s | 2026-10-31 |
-| Redmi K50 Ultra (`diting`) | 5.10.236<br>(custom build) | `multicast_waiter` | 10/10 | 12.5–14.0 s | 2026-10-31 |
-| Redmi K50 Ultra (`diting`) | 5.10.81 | `select_stack`<br>(32-bit compat) | 10/10 | 6.6–7.8 s | 2026-10-31 |
-| POCO X6 Pro 5G (`duchamp`) | 6.1.138 | `select_stack` | 10/10 | 20.8–23.1 s | 2026-11-01 |
-| OnePlus 13T | 6.6.66 | `select_stack` | 10/10 | 22.3–22.7 s | 2026-11-01 |
-| Xiaomi K90 Pro Max (`myron`) | 6.12.23 | `select_stack` | 10/10 | 20.3–22.6 s | 2026-10-31 |
-
-**Partly page-based**
-
-| Phone | Kernel | Route | Completed | Typical time | Measured |
-|---|---|---|---|---|---|
-| POCO X6 Pro 5G (`duchamp`) | 6.1.138 | `select_stack` | 10/10 | 35.3–46.1 s | 2026-10-31 |
-| OnePlus 13T | 6.6.66 | `select_stack` | 10/10 | 45.9–69.5 s | 2026-10-31 |
+| Redmi K50 Ultra (`diting`) | 5.10.236 | `select_stack` | 10/10 | 8.0–8.7 s | 2026-11-14 |
+| Redmi K50 Ultra (`diting`) | 5.10.236 | `sigreturn` | 4/10<br>(6 runs rebooted mid-run) | 6.8 s | 2026-11-14 |
+| Redmi K50 Ultra (`diting`) | 5.10.236<br>(custom build) | `multicast_waiter` | 9/10 | 38.7–39.9 s | 2026-11-14 |
+| Redmi K50 Ultra (`diting`) | 5.10.81 | `select_stack`<br>(32-bit compat) | 10/10 | 7.9 s | 2026-11-14 |
+| POCO X6 Pro 5G (`duchamp`) | 6.1.138 | `select_stack` | 10/10 | 16.2–18.2 s | 2026-11-14 |
+| POCO X6 Pro 5G (`duchamp`) | 6.1.138 | `select_stack`<br>(32-bit compat) | 10/10 | 16.9 s | 2026-11-14 |
+| POCO X6 Pro 5G (`duchamp`) | 6.1.138 | `multicast_waiter`<br>(32-bit compat) | 8/10 | 16.3 s | 2026-11-14 |
+| OnePlus 13T | 6.6.66 | `select_stack` | 10/10 | 16.5–17.1 s | 2026-11-14 |
+| Xiaomi K90 Pro Max (`myron`) | 6.12.23 | `select_stack` | 10/10 | 34.9–35.2 s | 2026-11-14 |
 
 **Fully page-based**
 
 | Phone | Kernel | Route | Completed | Typical time | Measured |
 |---|---|---|---|---|---|
-| POCO X6 Pro 5G (`duchamp`) | 6.1.138 | `tcp_zerocopy` | 10/10 | 25.0–39.3 s | 2026-10-31 |
+| POCO X6 Pro 5G (`duchamp`) | 6.1.138 | `tcp_zerocopy` | 8/10 | 30–36 s | 2026-11-14 |
 
-*All numbers are from the r8 release-candidate build.*
+*All numbers are from the r11 release-candidate build (2026-11-14 series, versionCode 745).*
 
 ## Prerequisites
 
@@ -66,8 +74,8 @@ the same phone, kernel and route appear twice, the two rows are two page-depende
 - Android 12 or newer.
 - The kernel and its security patch level are not yet patched for CVE-2026-43499.
 - A KernelSU-family root manager is installed first: KernelSU, KernelSU-Next, BakaSU (formerly
-  ReSukiSU), or KowSU. Each manager gained temporary-root support in a different version; use the
-  newest one you can.
+  ReSukiSU), KowSU, or SukiSU Ultra. Each manager gained temporary-root support in a different
+  version; use the newest one you can.
 
 ## Supported devices
 
@@ -88,7 +96,9 @@ Kernels outside these families have no derivation template and are currently out
 1. Install the APK and open the app.
 2. The home screen checks your kernel.
 3. If it reads **Supported / Profile ready**, keep the app in the foreground and tap **Run**.
-4. Wait for `KernelSU ready`. `su` works until the next reboot.
+4. Wait for `KernelSU ready`. `su` works until the next reboot. If the app shows **Reboot
+   recommended**, reboot the phone: the run changed SELinux policy capabilities that the post-root
+   repair could not restore, and the network may not work until the reboot.
 
 ## Generating a profile
 
@@ -118,7 +128,8 @@ Kernels outside these families have no derivation template and are currently out
    <img src="docs/images/profile-generation/en/04-physical.png" width="420" alt="The xbl_config prompt on a Qualcomm phone">
 
 6. If the app asks **Multiple routes are available — choose one**, pick from the row descriptions.
-   The grade on the right is about the route itself, not about your kernel; it reads **not
+   A route that also has a 32-bit layout appears twice, tagged `64-bit` and `32-bit compat`. The
+   grade on the right is about the route and that choice, not about your kernel; it reads **not
    measured** when there is no evidence:
 
    <img src="docs/images/profile-generation/en/05-route.png" width="420" alt="Route selection">
@@ -137,8 +148,10 @@ Kernels outside these families have no derivation template and are currently out
 ## If a run fails
 
 - **Reboot and retry.** A fresh boot is the strongest single lever; one attempt per boot.
-- **Check the plan and route choice** if the app offered one; each option can produce a different
-  success rate.
+- **If the app says Reboot recommended, reboot.** The run changed the SELinux policy capabilities
+  and the post-root repair did not restore them; the network may be blocked until the reboot.
+- **Check the plan, route and 64/32-bit choice** if the app offered one; each option can produce a
+  different success rate.
 - **Export the log** and attach it to the issue, together with the profile-generation log and the
   attack-run log.
 
@@ -157,7 +170,9 @@ chain. This branch optimizes the following steps:
    used to fail in the middle of the chain; that class of failure is gone.
 3. **Older 5.10 kernels get a route that fits.** Two extra routes cover kernels the default route
    cannot reach: one for older 5.10 layouts, and a 32-bit helper for 5.10.43 / 5.10.81 / 5.10.101,
-   whose stack layouts are outside the 64-bit route's reach.
+   whose stack layouts are outside the 64-bit route's reach. The same helper is now also offered
+   where both layouts fit (for example a second `select_stack` choice on 6.1.138); the shipped
+   profile follows the measured route order.
 4. **A failed attempt cleans up after itself.** Kernel state left behind by one attempt used to
    spoil the next. The app disarms after every attempt and retries the early stages, so one miss
    does not end the run.
