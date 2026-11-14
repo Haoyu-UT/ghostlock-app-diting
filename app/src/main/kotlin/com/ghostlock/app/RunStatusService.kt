@@ -67,6 +67,7 @@ class RunStatusService : Service() {
         private const val CHANNEL_ID = "run_status"
         private const val NOTIFICATION_ID = 0x676c6f63 // "gloc"
         private const val RESULT_NOTIFICATION_ID = 0x676c6f64 // "glod"
+        private const val REBOOT_NOTIFICATION_ID = 0x676c6f65 // "gloe"
         private const val ACTION_START = "com.ghostlock.app.action.RUN_STATUS_START"
         private const val EXTRA_TEXT = "text"
         private const val EXTRA_SUCCESS = "success"
@@ -96,6 +97,31 @@ class RunStatusService : Service() {
                 .notify(RESULT_NOTIFICATION_ID, buildNotification(context, text, ongoing = false, success = success))
         }
 
+        /**
+         * A page-free W1 that the post-root policy load did not repair leaves
+         * `selinux_state.policycap[3]`/`[4]` set, which kills the data path
+         * until the policy is reloaded. This is a separate, explicit
+         * notification so it survives the ordinary result notification and
+         * names the action (reboot) rather than just the run result.
+         */
+        fun rebootRecommended(context: Context, text: String) {
+            runCatching {
+                if (text.isEmpty()) return
+                createChannel(context)
+                context.getSystemService(NotificationManager::class.java)
+                    .notify(
+                        REBOOT_NOTIFICATION_ID,
+                        buildNotification(
+                            context,
+                            text,
+                            ongoing = false,
+                            success = false,
+                            titleRes = R.string.reboot_recommended_title,
+                        ),
+                    )
+            }
+        }
+
         private fun createChannel(context: Context) {
             val manager = context.getSystemService(NotificationManager::class.java) ?: return
             if (manager.getNotificationChannel(CHANNEL_ID) != null) return
@@ -115,6 +141,7 @@ class RunStatusService : Service() {
             text: String,
             ongoing: Boolean,
             success: Boolean,
+            titleRes: Int? = null,
         ): Notification {
             val openApp = PendingIntent.getActivity(
                 context,
@@ -124,7 +151,7 @@ class RunStatusService : Service() {
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
             )
             val title = context.getString(
-                when {
+                titleRes ?: when {
                     ongoing -> R.string.run_notif_running_title
                     success -> R.string.run_notif_success_title
                     else -> R.string.run_notif_failure_title

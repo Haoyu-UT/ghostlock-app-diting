@@ -39,6 +39,12 @@ data class SelectConfig(
     val compatCarrier: UByte? = null,
     val waiterHome: UInt? = null,
     val selectDstDepth: UInt? = null,
+    /**
+     * 0 = `futex_time32`, 1 = `futex_time64`. Absent => the native's legacy
+     * home table (0x1b0/0x1c0); a 6.x home is derived, not one of those
+     * constants, so the profile carries the ABI.
+     */
+    val compatFutexAbi: UByte? = null,
 ) : RouteConfig {
     override fun entries(): List<Pair<String, ULong>> = buildList {
         waiterShift?.let { add("waiter_shift" to it.toLong().toULong()) }
@@ -49,6 +55,7 @@ data class SelectConfig(
         compatCarrier?.let { add("compat_carrier" to it.toULong()) }
         waiterHome?.let { add("waiter_home" to it.toULong()) }
         selectDstDepth?.let { add("select_dst_depth" to it.toULong()) }
+        compatFutexAbi?.let { add("compat_futex_abi" to it.toULong()) }
         enterDelayUs?.let { add("enter_delay_us" to it.toULong()) }
         timeoutUs?.let { add("timeout_us" to it.toULong()) }
     }
@@ -65,6 +72,7 @@ data class SelectConfig(
         "compat_carrier" -> copy(compatCarrier = value.toUByte())
         "waiter_home" -> copy(waiterHome = value.toUInt())
         "select_dst_depth" -> copy(selectDstDepth = value.toUInt())
+        "compat_futex_abi" -> copy(compatFutexAbi = value.toUByte())
         "enter_delay_us" -> copy(enterDelayUs = value.toUInt())
         "timeout_us" -> copy(timeoutUs = value.toUInt())
         else -> this
@@ -74,7 +82,7 @@ data class SelectConfig(
         private val SchemaKeys = listOf(
             "waiter_shift", "compact_waiter", "lock_anchor_image", "lock_anchor_bytes",
             "lock_anchor_stride", "compat_carrier", "waiter_home", "select_dst_depth",
-            "enter_delay_us", "timeout_us",
+            "compat_futex_abi", "enter_delay_us", "timeout_us",
         )
 
         val EMPTY = SelectConfig(null, null, null, null)
@@ -90,6 +98,7 @@ data class SelectConfig(
             compatCarrier = value("compat_carrier")?.toUByte(),
             waiterHome = value("waiter_home")?.toUInt(),
             selectDstDepth = value("select_dst_depth")?.toUInt(),
+            compatFutexAbi = value("compat_futex_abi")?.toUByte(),
         )
     }
 }

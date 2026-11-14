@@ -49,10 +49,15 @@ namespace ghostlock::route::compat {
     static_assert(kBitmapBytes == 0x78);
 
     struct BitmapGeometry final {
-        /* The profile's measured strip home (0x1b0 / 0x1c0 on this family). */
+        /* The profile's measured strip home (0x1b0 / 0x1c0 on the 5.x family;
+         * an image-derived depth on 6.x). */
         uint32_t waiter_home = 0;
         /* The profile's measured compat-select buffer depth (0x1e0). */
         uint32_t select_dst_depth = 0;
+        /* The profile's derived ABI (0 = futex_time32, 1 = futex_time64).
+         * Absent => the legacy home table decides; a novel 6.x home needs
+         * the key. */
+        std::optional<uint8_t> futex_abi;
     };
 
     enum class BitmapFitError : int32_t {

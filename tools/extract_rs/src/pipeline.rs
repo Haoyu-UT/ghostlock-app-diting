@@ -136,11 +136,7 @@ pub fn measure(
 /// verdicts. The order is stable: `ghostlock`, `dirtyfrag`.
 pub fn verdicts(facts: &PipelineFacts, routes: &[RouteVerdict]) -> Vec<PipelineOption> {
     let ghostlock = match facts.kdp {
-        Some(false) => PipelineOption::of(
-            "ghostlock",
-            Feasibility::Feasible,
-            "KDP is not enabled",
-        ),
+        Some(false) => PipelineOption::of("ghostlock", Feasibility::Feasible, "KDP is not enabled"),
         Some(true) => PipelineOption::of(
             "ghostlock",
             Feasibility::Infeasible,
@@ -230,9 +226,7 @@ pub fn default_order(verdicts: &[PipelineOption]) -> Vec<String> {
 /// `CONFIG_KDP=y` or a KDP-only symbol. The symbol wins over a config that
 /// says otherwise; `None` when neither source is available.
 fn kdp(config: Option<&KernelConfig>, symbols: &BTreeMap<String, BTreeSet<u64>>) -> Option<bool> {
-    if symbols.contains_key("security_integrity_current")
-        || symbols.contains_key("kdp_cred_init")
-    {
+    if symbols.contains_key("security_integrity_current") || symbols.contains_key("kdp_cred_init") {
         return Some(true);
     }
     config.map(|config| config.value("CONFIG_KDP") == "y")
@@ -327,7 +321,9 @@ fn send_mark_line(line: &str) -> bool {
 /// `skb_cow_data` call. `Some(false)`: the call is present and the window has
 /// no such test. `None`: no call to anchor the check.
 fn shared_frag_test(dis: &[String], cow: u64) -> Option<bool> {
-    let call = dis.iter().position(|line| has_direct_call(std::slice::from_ref(line), cow))?;
+    let call = dis
+        .iter()
+        .position(|line| has_direct_call(std::slice::from_ref(line), cow))?;
     let start = call.saturating_sub(24);
     Some(
         dis[start..call]
@@ -384,7 +380,11 @@ fn send_path(kernel: &[u8], rel_symbols: &RelSymbols, sorted_offsets: &[u64]) ->
             SPLICE_CALLERS,
             SendPath::SkbSpliceFromIter,
         ),
-        ("ip_append_page", APPEND_PAGE_CALLERS, SendPath::IpAppendPage),
+        (
+            "ip_append_page",
+            APPEND_PAGE_CALLERS,
+            SendPath::IpAppendPage,
+        ),
     ] {
         let Some(target) = unique_offset_optional(rel_symbols, symbol) else {
             continue;
@@ -423,6 +423,7 @@ mod tests {
             verdict,
             reason: String::new(),
             numbers: BTreeMap::new(),
+            alternatives: Vec::new(),
         }
     }
 
@@ -461,11 +462,17 @@ mod tests {
             &routes,
         );
         assert_eq!(default_order(&both), vec!["dirtyfrag", "ghostlock"]);
-        let kdp = verdicts(&facts(Some(true), EspFix::Absent, SendPath::IpAppendPage), &routes);
+        let kdp = verdicts(
+            &facts(Some(true), EspFix::Absent, SendPath::IpAppendPage),
+            &routes,
+        );
         assert_eq!(default_order(&kdp), vec!["dirtyfrag"]);
         let copy = verdicts(&facts(Some(false), EspFix::Absent, SendPath::Copy), &routes);
         assert_eq!(default_order(&copy), vec!["ghostlock"]);
-        let fixed = verdicts(&facts(Some(false), EspFix::Present, SendPath::IpAppendPage), &routes);
+        let fixed = verdicts(
+            &facts(Some(false), EspFix::Present, SendPath::IpAppendPage),
+            &routes,
+        );
         assert_eq!(default_order(&fixed), vec!["ghostlock"]);
     }
 
@@ -485,14 +492,20 @@ mod tests {
     #[test]
     fn unknown_kdp_is_not_offered() {
         let routes = vec![route("select_stack", Feasibility::Feasible)];
-        let verdicts = verdicts(&facts(None, EspFix::Absent, SendPath::IpAppendPage), &routes);
+        let verdicts = verdicts(
+            &facts(None, EspFix::Absent, SendPath::IpAppendPage),
+            &routes,
+        );
         assert_eq!(verdicts[0].verdict, "unknown");
     }
 
     #[test]
     fn esp_fix_blocks_dirtyfrag() {
         let routes = vec![route("select_stack", Feasibility::Feasible)];
-        let verdicts = verdicts(&facts(Some(false), EspFix::Present, SendPath::IpAppendPage), &routes);
+        let verdicts = verdicts(
+            &facts(Some(false), EspFix::Present, SendPath::IpAppendPage),
+            &routes,
+        );
         assert_eq!(verdicts[1].verdict, "infeasible");
         assert!(verdicts[1].reason.contains("ESP"));
     }
@@ -614,7 +627,10 @@ mod tests {
          * conservative (infeasible), and the reason says it was not
          * measured rather than claiming the path copies. */
         let routes = vec![route("select_stack", Feasibility::Feasible)];
-        let verdicts = verdicts(&facts(Some(false), EspFix::Absent, SendPath::Unknown), &routes);
+        let verdicts = verdicts(
+            &facts(Some(false), EspFix::Absent, SendPath::Unknown),
+            &routes,
+        );
         assert_eq!(verdicts[1].verdict, "infeasible");
         assert!(verdicts[1].reason.contains("could not be measured"));
     }
@@ -651,7 +667,10 @@ mod tests {
     #[test]
     fn both_feasible_are_equal_options() {
         let routes = vec![route("select_stack", Feasibility::Feasible)];
-        let verdicts = verdicts(&facts(Some(false), EspFix::Absent, SendPath::SkbSpliceFromIter), &routes);
+        let verdicts = verdicts(
+            &facts(Some(false), EspFix::Absent, SendPath::SkbSpliceFromIter),
+            &routes,
+        );
         assert_eq!(
             verdicts
                 .iter()
@@ -661,4 +680,3 @@ mod tests {
         );
     }
 }
-

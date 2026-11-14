@@ -13,14 +13,13 @@ device's sidecars; the physical maps are then written from the superset's
 ``devices[]`` entries so every device in the set resolves. The profile's
 ``pipeline`` line is the superset's derived ``pipeline_order`` (highest
 precedence first), overridable per entry by ``pipeline = ...`` in ``meta.txt``.
-A kernel whose
-64-bit ``select_stack`` is infeasible (the superset's own verdict) is
-``sigreturn``-only; for those the route block is replaced with the AArch32
-compat select carrier (docs/analysis/compat-select-carrier-plan.md; G1 QEMU on
-the six store images, G4 device 10/10 on the era 5.10.81). The carrier needs a
-``dump_skip`` anchor candidate; when the superset has none, the profile keeps
-``sigreturn``. New assets carry a SHIPPED GOLDEN header and are never
-overwritten by a later run.
+The route is chosen by the measured order (2026-11-14 A/B): ``select_stack``
+(at the ceiling on every rig), ``tcp_zerocopy`` (18/20 on 6.1), the compact
+``multicast_waiter`` (14/15 with the drain fix), then ``sigreturn`` (6/10) as
+the last resort. A 5.10 pre-136 image whose 64-bit select is infeasible reports
+the AArch32 compat ``select_stack`` as its own verdict (the carrier's geometry
+is the extractor's), so the order sees the route that actually runs. New assets
+carry a SHIPPED GOLDEN header and are never overwritten by a later run.
 
 Usage:
     tools/ship_golden_profiles.py --check    # report unbundled goldens, exit 1
@@ -44,7 +43,8 @@ DEFAULT_ASSETS = os.path.join(APP, "app", "src", "main", "assets", "kernel_profi
 DEFAULT_EXTRACT = os.path.join(APP, "build", "extract", "release", "ghostlock-extract")
 
 SKIP_CORPUS = {"btf-only", "codegen", "excluded"}
-ROUTE_PRIORITY = ["select_stack", "sigreturn", "tcp_zerocopy", "multicast_waiter"]
+# The measured order (2026-11-14 A/B): select > tcp > multicast > sigreturn.
+ROUTE_PRIORITY = ["select_stack", "tcp_zerocopy", "multicast_waiter", "sigreturn"]
 # The AArch32 compat select carrier's route block and geometry are the
 # extractor's own now (analysis::apply_compat_select + report::
 # conf_compat_route_geometry): a 5.10 pre-136 image whose 64-bit select is

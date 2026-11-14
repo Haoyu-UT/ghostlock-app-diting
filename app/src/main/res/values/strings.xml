@@ -415,6 +415,8 @@
     <string name="run_notif_success_text_dirtyfrag">Root shell obtained; page cache restored.</string>
     <string name="run_notif_failure_title">Run finished</string>
     <string name="run_notif_failure_text">Root was not obtained. Open the app for the log.</string>
+    <string name="reboot_recommended_title">Reboot recommended</string>
+    <string name="reboot_recommended_message">This run modified SELinux policy capabilities, which can block network traffic. Reboot the device to restore them.</string>
     <string name="run_notif_permission_title">Allow notifications?</string>
     <string name="run_notif_permission_message">GhostLock shows the run status in a notification, and keeps the attack running when another app (such as the KernelSU manager) comes to the front. Without this permission the run still works, but its status is only visible inside the app.</string>
     <string name="run_notif_permission_allow">Allow</string>

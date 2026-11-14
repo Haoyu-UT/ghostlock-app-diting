@@ -13,11 +13,11 @@ use ghostlock_extract::derive::{
     PSELECT_ROUTE_NFDS, derive_cred_5x, derive_nf_logger_registration, derive_pselect_layout,
     ensure_rtmutex_43499_unpatched, relative_symbols,
 };
+use ghostlock_extract::dtbo;
 use ghostlock_extract::error::{ExtractError, Result};
 use ghostlock_extract::fact;
 use ghostlock_extract::family;
 use ghostlock_extract::fdt::{recover_kernel_phys_load, recover_kernel_phys_load_from_uefi};
-use ghostlock_extract::dtbo;
 use ghostlock_extract::ikconfig;
 use ghostlock_extract::kallsyms;
 use ghostlock_extract::kallsyms::Kallsyms;
@@ -32,9 +32,7 @@ use ghostlock_extract::symbols::{
     kernel_layout_verified, kernel_struct_macro, loggers_anchor_fallback, resolve_structs,
     resolve_symbols,
 };
-use ghostlock_extract::vendor_boot::{
-    recover_kernel_phys_from_vendor_boot, PhysOffsetSource,
-};
+use ghostlock_extract::vendor_boot::{PhysOffsetSource, recover_kernel_phys_from_vendor_boot};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -272,9 +270,7 @@ fn selinux_layout(btf: Option<&Btf>, release: &str) -> Option<(u32, u32, &'stati
         let enforcing = btf.field("selinux_state", "enforcing")?;
         let initialized = btf.field("selinux_state", "initialized")?;
         if btf.field("selinux_state", "disabled").is_some() {
-            eprintln!(
-                "warning: selinux_state.disabled is present; the selinux block is omitted"
-            );
+            eprintln!("warning: selinux_state.disabled is present; the selinux block is omitted");
             return None;
         }
         if enforcing != 0 || initialized >= 8 {
@@ -402,9 +398,7 @@ fn run(cli: &Cli) -> Result<i32> {
                             "info: vendor_boot DTB /memory; \
                              kernel_phys_offset=0x{offset:x}"
                         );
-                        if let (Some(header), Some(dtb)) =
-                            (info.header_offset, info.phys_offset)
-                        {
+                        if let (Some(header), Some(dtb)) = (info.header_offset, info.phys_offset) {
                             if header != dtb {
                                 eprintln!(
                                     "warning: header alignment implies \
@@ -429,9 +423,7 @@ fn run(cli: &Cli) -> Result<i32> {
                 }
                 vendor_boot_phys_offset = info.phys_offset;
             }
-            Err(err) => eprintln!(
-                "warning: vendor_boot parse failed: {err}; trying other sources"
-            ),
+            Err(err) => eprintln!("warning: vendor_boot parse failed: {err}; trying other sources"),
         }
     }
     if vendor_boot_phys_offset.is_none() {
@@ -522,9 +514,9 @@ fn run(cli: &Cli) -> Result<i32> {
                 "warning: series patch-range:{range} (no IKCONFIG); every template value \
                  is a heuristic"
             ),
-            ikconfig::SeriesMatch::None { reason } => eprintln!(
-                "warning: series none: {reason}; template fields stay null"
-            ),
+            ikconfig::SeriesMatch::None { reason } => {
+                eprintln!("warning: series none: {reason}; template fields stay null")
+            }
         }
         if let Some(config) = &kernel_config {
             eprintln!("info: IKCONFIG full hash {}", config.full_hash());
@@ -843,7 +835,10 @@ fn run(cli: &Cli) -> Result<i32> {
     // re-running the extractor.
     if btf.is_none() && cli.format == "conf" {
         for name in struct_offsets.keys() {
-            let source = field_sources.get(name).map(String::as_str).unwrap_or("null");
+            let source = field_sources
+                .get(name)
+                .map(String::as_str)
+                .unwrap_or("null");
             eprintln!("info: field_source {name}={source}");
         }
     }
@@ -1024,8 +1019,7 @@ fn run(cli: &Cli) -> Result<i32> {
                         &sorted_offsets,
                     );
                     let (suggested, _, reasons) = analysis::suggest_route(&paths);
-                    suggested
-                        .map(|route| (route, reasons.first().cloned().unwrap_or_default()))
+                    suggested.map(|route| (route, reasons.first().cloned().unwrap_or_default()))
                 })
             };
             match analysis::select_route(&route_verdicts, fallback) {
@@ -1068,7 +1062,10 @@ fn run(cli: &Cli) -> Result<i32> {
                 return Ok(3);
             }
             for name in order {
-                match pipeline_verdicts.iter().find(|entry| entry.pipeline == *name) {
+                match pipeline_verdicts
+                    .iter()
+                    .find(|entry| entry.pipeline == *name)
+                {
                     Some(entry) if entry.verdict == "infeasible" => {
                         eprintln!(
                             "error: pipeline-order entry {name} is infeasible on this \
@@ -1092,7 +1089,10 @@ fn run(cli: &Cli) -> Result<i32> {
             }
             order.to_vec()
         } else if let Some(forced) = cli.pipeline.as_deref() {
-            match pipeline_verdicts.iter().find(|entry| entry.pipeline == forced) {
+            match pipeline_verdicts
+                .iter()
+                .find(|entry| entry.pipeline == forced)
+            {
                 Some(entry) if entry.verdict == "infeasible" => {
                     eprintln!(
                         "error: forced pipeline {forced} is infeasible on this kernel: {}",
@@ -1154,14 +1154,16 @@ fn run(cli: &Cli) -> Result<i32> {
         /* The compat select variant has no 64-bit `waiter_shift`; it is placed
          * from the compat strip home. Keying the geometry on the verdict's own
          * marker keeps the render and the superset consistent. */
-        let compat_geometry_for = |verdict: &analysis::RouteVerdict| -> Option<Vec<(&'static str, i64)>> {
-            if !verdict.is_compat_carrier() {
-                return None;
-            }
-            let home = *verdict.numbers.get("waiter_home")?;
-            let dst = *verdict.numbers.get("select_dst_depth")?;
-            Some(report::conf_compat_route_geometry(home, dst))
-        };
+        let compat_geometry_for =
+            |verdict: &analysis::RouteVerdict| -> Option<Vec<(&'static str, i64)>> {
+                if !verdict.is_compat_carrier() {
+                    return None;
+                }
+                let home = *verdict.numbers.get("waiter_home")?;
+                let dst = *verdict.numbers.get("select_dst_depth")?;
+                let abi = *verdict.numbers.get("compat_futex_abi")?;
+                Some(report::conf_compat_route_geometry(home, dst, abi))
+            };
         let chosen_compat = route
             .as_deref()
             .and_then(|name| route_verdicts.iter().find(|verdict| verdict.route == name))
@@ -1175,10 +1177,7 @@ fn run(cli: &Cli) -> Result<i32> {
             .and_then(|name| route_verdicts.iter().find(|verdict| verdict.route == name))
             .filter(|verdict| verdict.is_compat_multicast())
             .map(|verdict| {
-                report::conf_compat_multicast_route_geometry(
-                    &verdict.numbers,
-                    &struct_offsets,
-                )
+                report::conf_compat_multicast_route_geometry(&verdict.numbers, &struct_offsets)
             });
         let route_shift = if compat_select {
             None
@@ -1201,8 +1200,7 @@ fn run(cli: &Cli) -> Result<i32> {
         let sigreturn_offsets = route_verdicts
             .iter()
             .find(|verdict| {
-                verdict.route == "sigreturn"
-                    && verdict.verdict == analysis::Feasibility::Feasible
+                verdict.route == "sigreturn" && verdict.verdict == analysis::Feasibility::Feasible
             })
             .and_then(|verdict| {
                 Some((
@@ -1611,13 +1609,7 @@ fn run(cli: &Cli) -> Result<i32> {
                     scratch
                 }
                 (None, None) => policy_scratch.or_else(|| {
-                    anchor::pick_w1_scratch(
-                        anchor_image,
-                        anchor_bytes,
-                        stride,
-                        delta,
-                        initialized,
-                    )
+                    anchor::pick_w1_scratch(anchor_image, anchor_bytes, stride, delta, initialized)
                 }),
             }
         })();
@@ -1649,46 +1641,64 @@ fn run(cli: &Cli) -> Result<i32> {
          * it can be cut into any plan. An ambiguous route set reaches this
          * point and exits 7 below, after the document is on disk. */
         if let Some(path) = &cli.options_out {
-            let mut all_geometry: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
-            for verdict in &route_verdicts {
-                if verdict.verdict != analysis::Feasibility::Feasible {
-                    continue;
-                }
-                let shift = if verdict.route == "select_stack" {
+            let mut all_geometry: BTreeMap<(String, String), BTreeMap<String, i64>> =
+                BTreeMap::new();
+            let build_geometry = |route: &str,
+                                  numbers: &BTreeMap<String, i64>,
+                                  compat: bool|
+             -> BTreeMap<String, i64> {
+                let shift = if route == "select_stack" && !compat {
                     pselect_shift.or_else(|| {
-                        // The compat variant carries its own geometry; the
-                        // family shift belongs to the 64-bit branch only.
-                        (!verdict.is_compat_carrier() && release_major == Some(5))
-                            .then_some(family::SELECT_WAITER_SHIFT)
+                        // The family shift belongs to the 64-bit branch only.
+                        (release_major == Some(5)).then_some(family::SELECT_WAITER_SHIFT)
                     })
                 } else {
                     pselect_shift
                 };
-                let geometry: BTreeMap<String, i64> = if verdict.route == "multicast_waiter" {
-                    // The multicast block is the route's own image-derived
-                    // numbers; there is no release-keyed branch.
-                    report::conf_multicast_route_geometry(&verdict.numbers, &struct_offsets)
-                        .into_iter()
-                        .map(|(key, value)| (key.to_string(), value))
-                        .collect()
-                } else if let Some(compat) = compat_geometry_for(verdict) {
-                    compat
-                        .into_iter()
-                        .map(|(key, value)| (key.to_string(), value))
-                        .collect()
+                if route == "multicast_waiter" && compat {
+                    report::conf_compat_multicast_route_geometry(numbers, &struct_offsets)
+                } else if route == "multicast_waiter" {
+                    report::conf_multicast_route_geometry(numbers, &struct_offsets)
+                } else if route == "select_stack" && compat {
+                    let home = *numbers.get("waiter_home").unwrap_or(&0);
+                    let dst = *numbers.get("select_dst_depth").unwrap_or(&0);
+                    let abi = *numbers.get("compat_futex_abi").unwrap_or(&0);
+                    report::conf_compat_route_geometry(home, dst, abi)
                 } else {
                     report::conf_route_geometry_with_sigreturn(
-                        verdict.route,
+                        route,
                         release_text,
                         shift,
                         sigreturn_offsets,
                         layouts.waiter_compact.value,
                     )
-                    .into_iter()
-                    .map(|(key, value)| (key.to_string(), value))
-                    .collect()
-                };
-                all_geometry.insert(verdict.route.to_string(), geometry);
+                }
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect()
+            };
+            for verdict in &route_verdicts {
+                if verdict.verdict == analysis::Feasibility::Feasible {
+                    let compat = verdict.is_compat_carrier() || verdict.is_compat_multicast();
+                    let carrier = if compat { "compat" } else { "native" };
+                    all_geometry.insert(
+                        (verdict.route.to_string(), carrier.to_string()),
+                        build_geometry(verdict.route, &verdict.numbers, compat),
+                    );
+                }
+                for alt in &verdict.alternatives {
+                    if alt.verdict != analysis::Feasibility::Feasible {
+                        continue;
+                    }
+                    all_geometry.insert(
+                        (verdict.route.to_string(), alt.carrier.label().to_string()),
+                        build_geometry(
+                            verdict.route,
+                            &alt.numbers,
+                            alt.carrier == analysis::Carrier::Compat,
+                        ),
+                    );
+                }
             }
             let common_text = report::render_conf(&report::ConfInputs {
                 release: release_text,
@@ -1730,8 +1740,7 @@ fn run(cli: &Cli) -> Result<i32> {
             let superset = options::build(&input);
             let text = serde_json::to_string_pretty(&superset)
                 .map_err(|err| ExtractError::new(format!("cannot serialize options: {err}")))?;
-            std::fs::write(path, text + "\n")
-                .map_err(|err| ExtractError::new(format!("{err}")))?;
+            std::fs::write(path, text + "\n").map_err(|err| ExtractError::new(format!("{err}")))?;
             eprintln!("info: options superset written to {}", path.display());
         }
         if ambiguous {
@@ -1845,7 +1854,9 @@ fn anchor_scan(
     only: Option<&str>,
 ) -> String {
     let g = |n: &str| -> u64 {
-        rel.get(n).and_then(|s| s.iter().next().copied()).unwrap_or(0)
+        rel.get(n)
+            .and_then(|s| s.iter().next().copied())
+            .unwrap_or(0)
     };
     let bounds = anchor::Bounds {
         text_start: g("_text"),
@@ -1861,8 +1872,13 @@ fn anchor_scan(
     out.push_str(&format!(
         "[anchor] .bss [+0x{:x}, +0x{:x}), writable from +0x{:x}; \
 text [+0x{:x}, +0x{:x}), init [+0x{:x}, +0x{:x})\n",
-        bounds.bss_start, bounds.bss_end, bounds.ro_after_init_end,
-        bounds.text_start, bounds.text_end, bounds.init_start, bounds.init_end,
+        bounds.bss_start,
+        bounds.bss_end,
+        bounds.ro_after_init_end,
+        bounds.text_start,
+        bounds.text_end,
+        bounds.init_start,
+        bounds.init_end,
     ));
 
     let mut cands = anchor::candidates(rel, &bounds, min_extent);
@@ -1969,9 +1985,9 @@ register provenance across branches; supply it in the profile (see the design do
                 ));
                 out.push_str(&format!("     lock_anchor_stride = {}\n\n", stride));
             }
-            None => out.push_str(
-                "  => no triple: the safe prefix is shorter than one lock slot\n\n",
-            ),
+            None => {
+                out.push_str("  => no triple: the safe prefix is shorter than one lock slot\n\n")
+            }
         }
     }
     out

@@ -313,6 +313,53 @@ writes the selector. Device-verified on the diting (5.10.81 Image → compat row
 `pipeline = "dirtyfrag"`, `compat_carrier = 1`, home 432, dst 480; 236 boot image → normal select,
 `pipeline = "ghostlock"`): `external/port/extractor-compat-2026-11-10/`.
 
+**2026-11-14 — the 6.x question is closed by measurement, not by the family gate.** The extractor
+still refuses a 6.x image at three places; only one is a kernel-family test, and it is correct:
+`derive_compat_carrier_layout()`'s `kernel_major == Some(5)` is the no-BTF waiter-template
+fallback (with BTF the waiter comes from the image). The other two refusals are stale:
+
+- `waiter.wake_state.is_some()` treats the 5.15/6.1 compact waiter as unsupported, but the native
+  stamp already builds it: `waiter_prio_word(..., compact_waiter_has_wake_state())` packs
+  `(prio << 32) | wake_state` into the strip's +0x40 word, and `compat_carrier.cpp` passes the
+  profile fact (the same word the 64-bit select and sigreturn routes use).
+- `compat_carrier_coverage()` and `compat_bitmap.cpp::abi_for_waiter_home()` key the ABI on the
+  home constants 0x1b0/0x1c0, so an image whose derived home differs is refused even when the
+  geometry fits. The home is an output of the derivation; the ABI is which futex entry produced
+  it. The helper only needs the ABI (`carrier_protocol.h`), not the home.
+
+**What a fix would change — no route today.** `apply_compat_select()` substitutes the compat
+variant only when the 64-bit `select_stack` is infeasible and `sigreturn` is feasible. Across the
+6.x store (2026-11-14), exactly one entry meets that: **6.1.134
+(`6.1.134-android14-11-o-gd252f36df142`, the Realme)** — and its compat select geometry is
+independently refuted by the dead-frame audit (2026-11-12): the `_newselect` dst is 0x1e0, the
+time32 home is 0x1e8 (the base word sits 8 bytes deeper than the copy), and the time64 home is
+0x198 (the strip needs buffer offsets [0x48,0xa0]; the user copy ends at ≤0x7e and the `res_*`
+memsets zero the tail). Removing the gates would change the refusal reason from `wake_state` to
+`does not fit`, not the verdict. The other case, **6.1.138** (duchamp), fits per the dead-frame
+study, but its 64-bit `select_stack` is already feasible — the substitution never fires and the
+compat variant is redundant. The superset is one verdict per route name, not one per carrier: a
+compat variant fills the route's own slot (as `multicast_waiter` does here when its 64-bit copy
+is short), so there is no second `select_stack` entry to emit. All 6.6/6.12 entries are the
+non-compact `rt_waiter_node` shape (and `sigreturn` unknown); the eleven-word stamp does not
+represent it.
+
+So the 5.x scope now rests on measurement, not on the major number: the gate cleanup is a
+correctness/diagnostic fix (the reason names the real blocker, and a future 6.1 image whose
+geometry fits gets the route automatically), but it moves no bundle today. The 6.x compat select
+has no device need; the only kernel that would need it is refuted.
+
+**Device for a 6.x check.** The duchamp (6.1.138) is the only 6.x compact-waiter device in hand.
+It can exercise the helper/ABI path with an external compat profile (the G2 pattern — helper
+exec, seccomp, `_newselect`), but it cannot demonstrate a new route because the 64-bit select
+already works there. The 6.1.134 Realme has no unit (the unit gate remains); QEMU on the 6.1.134
+Image is the only way to exercise its geometry, and it is expected to refuse by coverage.
+
+**If the cleanup is implemented:** drop the `wake_state` refusal (carry the shape fact; the
+profile already has `waiter_layout.wake_state`), pass the `(home, abi)` pair from the futex-entry
+derivation into `compat_carrier_coverage()`, and have the packer read the profile's
+`compat_futex_abi` (the multicast compat block already carries that key) instead of matching the
+home. Host tests pin the two refusal reasons on the 6.1.134 entry; the 6.6/6.12 refusal stays.
+
 **G6 — evidence.** `external/port/compat-carrier-<date>/` with the QEMU logs, run stores
 and excerpts; plan-doc result; PORT-PLAN.
 

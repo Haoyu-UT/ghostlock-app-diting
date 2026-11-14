@@ -223,6 +223,12 @@ internal class AndroidProfileConfigController(
                             invalid += "$routePrefix.$field"
                         }
                     }
+                    /* Optional: the derived ABI (0 time32, 1 time64). Absent
+                     * keeps the native's legacy home table. */
+                    val abi = value("$routePrefix.compat_futex_abi")
+                    if (abi != null && abi !in 0L..1L) {
+                        invalid += "$routePrefix.compat_futex_abi"
+                    }
                 } else {
                     val shift = value("$routePrefix.waiter_shift")
                     if (shift == null ||

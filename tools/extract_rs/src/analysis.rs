@@ -68,6 +68,35 @@ impl Feasibility {
     }
 }
 
+/// The carrier that delivers a route's stamp. `Native` is the route's own
+/// 64-bit/engine implementation; `Compat` is the AArch32 helper's variant
+/// (the compat select and compat multicast carriers).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Carrier {
+    Native,
+    Compat,
+}
+
+impl Carrier {
+    pub fn label(self) -> &'static str {
+        match self {
+            Carrier::Native => "native",
+            Carrier::Compat => "compat",
+        }
+    }
+}
+
+/// A non-primary carrier variant of a route (`alternatives[]` in the superset).
+#[derive(Clone, Debug, Serialize)]
+pub struct RouteVariant {
+    pub carrier: Carrier,
+    pub verdict: Feasibility,
+    pub reason: String,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub numbers: BTreeMap<String, i64>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct RouteVerdict {
     pub route: &'static str,
@@ -75,6 +104,10 @@ pub struct RouteVerdict {
     pub reason: String,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub numbers: BTreeMap<String, i64>,
+    /// The route's other feasible carriers. The primary stays the default for
+    /// every consumer (ship script, app cut, route selection).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alternatives: Vec<RouteVariant>,
 }
 
 impl RouteVerdict {
@@ -295,6 +328,8 @@ fn select_stack_verdict(pselect: &PselectOutcome) -> RouteVerdict {
                 verdict: Feasibility::Feasible,
                 reason: format!("pselect/futex geometry derived ({})", layout.chain),
                 numbers,
+
+                alternatives: Vec::new(),
             }
         }
         PselectOutcome::Infeasible { message, numbers } => RouteVerdict {
@@ -302,18 +337,24 @@ fn select_stack_verdict(pselect: &PselectOutcome) -> RouteVerdict {
             verdict: Feasibility::Infeasible,
             reason: message.clone(),
             numbers: numbers.clone(),
+
+            alternatives: Vec::new(),
         },
         PselectOutcome::Failed(message) => RouteVerdict {
             route: "select_stack",
             verdict: Feasibility::Unknown,
             reason: message.clone(),
             numbers: BTreeMap::new(),
+
+            alternatives: Vec::new(),
         },
         PselectOutcome::NotAttempted(reason) => RouteVerdict {
             route: "select_stack",
             verdict: Feasibility::Unknown,
             reason: (*reason).to_string(),
             numbers: BTreeMap::new(),
+
+            alternatives: Vec::new(),
         },
     }
 }
@@ -345,6 +386,8 @@ fn tcp_zerocopy_verdict(
         verdict: Feasibility::Unknown,
         reason,
         numbers: BTreeMap::new(),
+
+        alternatives: Vec::new(),
     };
     if !allow_disasm {
         return unknown("--no-disasm".to_string());
@@ -352,12 +395,7 @@ fn tcp_zerocopy_verdict(
     let Some(waiter) = waiter_depth(pselect) else {
         return unknown("pselect/futex waiter depth not derived".to_string());
     };
-    match crate::derive::derive_tcp_zerocopy_layout(
-        kernel,
-        rel_symbols,
-        sorted_offsets,
-        waiter,
-    ) {
+    match crate::derive::derive_tcp_zerocopy_layout(kernel, rel_symbols, sorted_offsets, waiter) {
         Ok(layout) => {
             let numbers = BTreeMap::from([
                 ("copy_cap".to_string(), layout.copy_cap as i64),
@@ -377,6 +415,8 @@ fn tcp_zerocopy_verdict(
                         crate::derive::TCP_FAKE_WAITER_END
                     ),
                     numbers,
+
+                    alternatives: Vec::new(),
                 }
             } else if layout.delta != 0 {
                 RouteVerdict {
@@ -387,6 +427,8 @@ fn tcp_zerocopy_verdict(
                         layout.delta, layout.copy_cap
                     ),
                     numbers,
+
+                    alternatives: Vec::new(),
                 }
             } else {
                 RouteVerdict {
@@ -398,6 +440,8 @@ fn tcp_zerocopy_verdict(
                         -layout.zc_depth, layout.copy_cap
                     ),
                     numbers,
+
+                    alternatives: Vec::new(),
                 }
             }
         }
@@ -411,6 +455,8 @@ fn unknown_verdict(route: &'static str, reason: impl Into<String>) -> RouteVerdi
         verdict: Feasibility::Unknown,
         reason: reason.into(),
         numbers: BTreeMap::new(),
+
+        alternatives: Vec::new(),
     }
 }
 
@@ -430,8 +476,22 @@ pub fn route_verdicts(
 ) -> Vec<RouteVerdict> {
     let mut routes = vec![
         select_stack_verdict(pselect),
-        multicast_verdict(kernel, rel_symbols, sorted_offsets, btf, release, allow_disasm),
-        sigreturn_verdict(kernel, rel_symbols, sorted_offsets, btf, release, allow_disasm),
+        multicast_verdict(
+            kernel,
+            rel_symbols,
+            sorted_offsets,
+            btf,
+            release,
+            allow_disasm,
+        ),
+        sigreturn_verdict(
+            kernel,
+            rel_symbols,
+            sorted_offsets,
+            btf,
+            release,
+            allow_disasm,
+        ),
         tcp_zerocopy_verdict(kernel, rel_symbols, sorted_offsets, pselect, allow_disasm),
     ];
     /* The AArch32 compat carrier is the substitute for the 64-bit select route
@@ -441,13 +501,27 @@ pub fn route_verdicts(
      * (derive_compat_carrier_layout). It is only a W1 carrier: the route still
      * needs sigreturn as its delivery fallback, so the pairing is the
      * condition. Nothing here reads the release family. */
-    apply_compat_select(&mut routes, kernel, rel_symbols, sorted_offsets, btf, release);
+    apply_compat_select(
+        &mut routes,
+        kernel,
+        rel_symbols,
+        sorted_offsets,
+        btf,
+        release,
+    );
     /* The same substitution for the multicast route: the 64-bit copy is too
      * deep on some images, while the handler's `is_compat_task()` branch
      * copies the 32-bit `group_source_req` to a different, shallower local
      * (derive_compat_multicast_layout). Pair it with sigreturn like the
      * compat select carrier. */
-    apply_compat_multicast(&mut routes, kernel, rel_symbols, sorted_offsets, btf, release);
+    apply_compat_multicast(
+        &mut routes,
+        kernel,
+        rel_symbols,
+        sorted_offsets,
+        btf,
+        release,
+    );
     routes
 }
 
@@ -462,15 +536,9 @@ fn apply_compat_select(
     btf: Option<&Btf>,
     release: Option<&str>,
 ) {
-    let sigreturn_feasible = routes
-        .iter()
-        .any(|verdict| verdict.route == "sigreturn" && verdict.verdict == Feasibility::Feasible);
-    if !sigreturn_feasible {
-        return;
-    }
     let Some(select) = routes
         .iter_mut()
-        .find(|verdict| verdict.route == "select_stack" && verdict.verdict == Feasibility::Infeasible)
+        .find(|verdict| verdict.route == "select_stack")
     else {
         return;
     };
@@ -484,12 +552,17 @@ fn apply_compat_select(
         btf,
         kernel_major,
     ) {
-        Ok(layout) => *select = compat_select_verdict(select, &layout),
+        Ok(layout) => {
+            if select.verdict == Feasibility::Infeasible {
+                *select = compat_select_verdict(select, &layout);
+            } else if select.verdict == Feasibility::Feasible {
+                select.alternatives.push(compat_select_variant(&layout));
+            }
+        }
         Err(error) => {
-            select.reason = format!(
-                "{}; compat carrier not derivable: {error}",
-                select.reason
-            );
+            if select.verdict == Feasibility::Infeasible {
+                select.reason = format!("{}; compat carrier not derivable: {error}", select.reason);
+            }
         }
     }
 }
@@ -507,6 +580,7 @@ fn compat_select_verdict(
         "select_dst_depth".to_string(),
         layout.select_dst_depth as i64,
     );
+    numbers.insert("compat_futex_abi".to_string(), layout.futex_abi as i64);
     RouteVerdict {
         route: "select_stack",
         verdict: Feasibility::Feasible,
@@ -514,8 +588,34 @@ fn compat_select_verdict(
             "AArch32 compat carrier ({}): the 64-bit route cannot cover the waiter strip \
              ({}); this image's compat chain puts the strip home at 0x{:x} under the \
              0x{:x} _newselect buffer (packed at 0x{:x})",
-            layout.abi, infeasible.reason, layout.waiter_home, layout.select_dst_depth,
+            layout.abi,
+            infeasible.reason,
+            layout.waiter_home,
+            layout.select_dst_depth,
             layout.offset
+        ),
+        numbers,
+        alternatives: Vec::new(),
+    }
+}
+
+/// The compat select variant as a non-primary alternative.
+fn compat_select_variant(layout: &crate::derive::CompatCarrierLayout) -> RouteVariant {
+    let mut numbers = BTreeMap::new();
+    numbers.insert("compat_carrier".to_string(), 1);
+    numbers.insert("waiter_home".to_string(), layout.waiter_home as i64);
+    numbers.insert(
+        "select_dst_depth".to_string(),
+        layout.select_dst_depth as i64,
+    );
+    numbers.insert("compat_futex_abi".to_string(), layout.futex_abi as i64);
+    RouteVariant {
+        carrier: Carrier::Compat,
+        verdict: Feasibility::Feasible,
+        reason: format!(
+            "AArch32 compat carrier ({}): this image's compat chain puts the strip home \
+             at 0x{:x} under the 0x{:x} _newselect buffer (packed at 0x{:x})",
+            layout.abi, layout.waiter_home, layout.select_dst_depth, layout.offset
         ),
         numbers,
     }
@@ -532,15 +632,9 @@ fn apply_compat_multicast(
     btf: Option<&Btf>,
     release: Option<&str>,
 ) {
-    let sigreturn_feasible = routes
-        .iter()
-        .any(|verdict| verdict.route == "sigreturn" && verdict.verdict == Feasibility::Feasible);
-    if !sigreturn_feasible {
-        return;
-    }
     let Some(multicast) = routes
         .iter_mut()
-        .find(|verdict| verdict.route == "multicast_waiter" && verdict.verdict == Feasibility::Infeasible)
+        .find(|verdict| verdict.route == "multicast_waiter")
     else {
         return;
     };
@@ -554,16 +648,26 @@ fn apply_compat_multicast(
         btf,
         kernel_major,
     ) {
-        Ok(layout) => *multicast = compat_multicast_verdict(multicast, &layout),
+        Ok(layout) => {
+            if multicast.verdict == Feasibility::Infeasible {
+                *multicast = compat_multicast_verdict(multicast, &layout);
+            } else if multicast.verdict == Feasibility::Feasible {
+                multicast
+                    .alternatives
+                    .push(compat_multicast_variant(&layout));
+            }
+        }
         /* A geometry that was derived and does not fit is worth reporting on
          * top of the 64-bit verdict. An image without the compat copy at all
          * (the 5.x trains and any build that inlines it) is not a derivation
          * failure the reader needs; leave the 64-bit verdict's own reason. */
         Err(crate::error::ExtractError::Infeasible { message, .. }) => {
-            multicast.reason = format!(
-                "{}; compat multicast not feasible: {message}",
-                multicast.reason
-            );
+            if multicast.verdict == Feasibility::Infeasible {
+                multicast.reason = format!(
+                    "{}; compat multicast not feasible: {message}",
+                    multicast.reason
+                );
+            }
         }
         Err(_) => {}
     }
@@ -597,7 +701,44 @@ fn compat_multicast_verdict(
             layout.waiter_off,
             layout.buffer_size,
             layout.waiter_off + crate::derive::WAITER_STRIP_BYTES,
-            if layout.source_overlap { "overlapped" } else { "clear" }
+            if layout.source_overlap {
+                "overlapped"
+            } else {
+                "clear"
+            }
+        ),
+        numbers,
+        alternatives: Vec::new(),
+    }
+}
+
+/// The compat multicast variant as a non-primary alternative.
+fn compat_multicast_variant(layout: &crate::derive::CompatMulticastLayout) -> RouteVariant {
+    let mut numbers = BTreeMap::new();
+    numbers.insert("compat_carrier".to_string(), 1);
+    numbers.insert("compat_waiter_off".to_string(), layout.waiter_off as i64);
+    numbers.insert("compat_buffer_size".to_string(), layout.buffer_size as i64);
+    numbers.insert("compat_futex_abi".to_string(), layout.futex_abi as i64);
+    numbers.insert("waiter_home".to_string(), layout.waiter_home as i64);
+    numbers.insert("copy_depth".to_string(), layout.copy_depth as i64);
+    numbers.insert("source_overlap".to_string(), layout.source_overlap as i64);
+    RouteVariant {
+        carrier: Carrier::Compat,
+        verdict: Feasibility::Feasible,
+        reason: format!(
+            "AArch32 compat MCAST_BLOCK_SOURCE ({}): the compat group_source_req copy at \
+             depth 0x{:x} puts the strip at 0x{:x} under the 0x{:x} buffer (strip end \
+             0x{:x}, source header {})",
+            layout.abi,
+            layout.copy_depth,
+            layout.waiter_off,
+            layout.buffer_size,
+            layout.waiter_off + crate::derive::WAITER_STRIP_BYTES,
+            if layout.source_overlap {
+                "overlapped"
+            } else {
+                "clear"
+            }
         ),
         numbers,
     }
@@ -648,22 +789,14 @@ fn sigreturn_verdict(
             None => return unknown_verdict("sigreturn", "BTF names no rt_mutex_waiter shape"),
         }
     }
-    match derive_sigreturn_layout(
-        kernel,
-        rel_symbols,
-        sorted_offsets,
-        waiter.pi_tree_entry,
-    ) {
+    match derive_sigreturn_layout(kernel, rel_symbols, sorted_offsets, waiter.pi_tree_entry) {
         Ok(layout) => {
             let numbers = BTreeMap::from([
                 ("off_sve".to_string(), layout.off_sve as i64),
                 ("off_plain".to_string(), layout.off_plain as i64),
                 ("strip_home".to_string(), layout.strip_home as i64),
                 ("copy_dst_sve".to_string(), layout.copy_dst_sve as i64),
-                (
-                    "copy_dst_plain".to_string(),
-                    layout.copy_dst_plain as i64,
-                ),
+                ("copy_dst_plain".to_string(), layout.copy_dst_plain as i64),
                 ("chain_sve".to_string(), layout.chain_sve as i64),
                 ("chain_plain".to_string(), layout.chain_plain as i64),
             ]);
@@ -675,6 +808,8 @@ fn sigreturn_verdict(
                     layout.off_plain, layout.off_sve
                 ),
                 numbers,
+
+                alternatives: Vec::new(),
             }
         }
         Err(ExtractError::Infeasible { message, numbers }) => RouteVerdict {
@@ -682,12 +817,16 @@ fn sigreturn_verdict(
             verdict: Feasibility::Infeasible,
             reason: message,
             numbers,
+
+            alternatives: Vec::new(),
         },
         Err(err) => RouteVerdict {
             route: "sigreturn",
             verdict: Feasibility::Unknown,
             reason: err.to_string(),
             numbers: BTreeMap::new(),
+
+            alternatives: Vec::new(),
         },
     }
 }
@@ -723,10 +862,7 @@ fn multicast_verdict(
     let (task, lock) = match (layout.task, layout.lock) {
         (Some(task), Some(lock)) => (task, lock),
         _ => {
-            return unknown_verdict(
-                "multicast_waiter",
-                "BTF rt_mutex_waiter task/lock missing",
-            );
+            return unknown_verdict("multicast_waiter", "BTF rt_mutex_waiter task/lock missing");
         }
     };
     /* The route stamps the 5.x compact eleven-word strip. A 6.6+ image's
@@ -737,10 +873,7 @@ fn multicast_verdict(
         Some(btf) => match crate::layout::waiter_is_compact(btf) {
             Some(compact) => compact,
             None => {
-                return unknown_verdict(
-                    "multicast_waiter",
-                    "BTF names no rt_mutex_waiter shape",
-                );
+                return unknown_verdict("multicast_waiter", "BTF names no rt_mutex_waiter shape");
             }
         },
         None if waiter_template_5_10 => true,
@@ -768,7 +901,11 @@ fn multicast_verdict(
             );
         }
     };
-    let buffer_source = if btf.is_some() { "btf" } else { "uapi-fallback" };
+    let buffer_source = if btf.is_some() {
+        "btf"
+    } else {
+        "uapi-fallback"
+    };
     let mut candidates = match multicast_copy_candidates(kernel, rel_symbols, sorted_offsets) {
         Ok(candidates) => candidates,
         Err(err) => return unknown_verdict("multicast_waiter", err.to_string()),
@@ -860,6 +997,8 @@ fn multicast_verdict(
                 geometry.waiter_off
             ),
             numbers: numbers_for(size, &geometry),
+
+            alternatives: Vec::new(),
         };
     }
     if feasible.len() > 1 {
@@ -886,6 +1025,8 @@ fn multicast_verdict(
             verdict: Feasibility::Infeasible,
             reason: message,
             numbers,
+
+            alternatives: Vec::new(),
         };
     }
     unknown_verdict(
@@ -1250,10 +1391,7 @@ mod tests {
 
     #[test]
     fn path_presence_nominates_the_only_present_route() {
-        let paths = vec![
-            path("multicast_waiter", true),
-            path("tcp_zerocopy", false),
-        ];
+        let paths = vec![path("multicast_waiter", true), path("tcp_zerocopy", false)];
         let (route, confidence, _) = suggest_route(&paths);
         assert_eq!(route, Some("multicast_waiter"));
         assert_eq!(confidence, Confidence::Low);
@@ -1261,10 +1399,7 @@ mod tests {
 
     #[test]
     fn tcp_path_is_the_fallback_when_multicast_is_absent() {
-        let paths = vec![
-            path("multicast_waiter", false),
-            path("tcp_zerocopy", true),
-        ];
+        let paths = vec![path("multicast_waiter", false), path("tcp_zerocopy", true)];
         let (route, _, _) = suggest_route(&paths);
         assert_eq!(route, Some("tcp_zerocopy"));
     }
@@ -1289,6 +1424,8 @@ mod tests {
             verdict: value,
             reason: format!("{route} is {}", value.label()),
             numbers: BTreeMap::new(),
+
+            alternatives: Vec::new(),
         }
     }
 
@@ -1297,7 +1434,10 @@ mod tests {
     }
 
     #[test]
-    fn compat_select_requires_a_sigreturn_fallback() {
+    fn compat_select_is_attempted_without_a_sigreturn_route() {
+        /* The sigreturn pairing is not a derivation gate: with no sigreturn
+         * route at all the compat derivation still runs, and its failure is
+         * reported. */
         let (kernel, symbols, offsets) = compat_inputs();
         let mut routes = vec![
             verdict("select_stack", Feasibility::Infeasible),
@@ -1312,7 +1452,11 @@ mod tests {
             Some("5.10.81-android12-9-00001-g6cd504626bae-ab8485363"),
         );
         assert_eq!(routes[0].verdict, Feasibility::Infeasible);
-        assert!(!routes[0].reason.contains("compat carrier"));
+        assert!(
+            routes[0].reason.contains("compat carrier not derivable"),
+            "the derivation must be attempted: {}",
+            routes[0].reason
+        );
     }
 
     #[test]

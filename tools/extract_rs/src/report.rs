@@ -248,15 +248,21 @@ pub fn conf_route_geometry(
 }
 
 /// The AArch32 compat select carrier's route block, from the image-derived
-/// geometry: the compat strip home and the `_newselect` buffer depth this
-/// image's own chain produced. It replaces the 64-bit route's `waiter_shift`
-/// branch (there is no 64-bit strip to shift).
-pub fn conf_compat_route_geometry(waiter_home: i64, select_dst_depth: i64) -> Vec<(&'static str, i64)> {
+/// geometry: the compat strip home, the `_newselect` buffer depth and the
+/// futex ABI this image's own chain produced. It replaces the 64-bit route's
+/// `waiter_shift` branch (there is no 64-bit strip to shift). The ABI travels
+/// because the runtime cannot recover it from a novel home.
+pub fn conf_compat_route_geometry(
+    waiter_home: i64,
+    select_dst_depth: i64,
+    futex_abi: i64,
+) -> Vec<(&'static str, i64)> {
     vec![
         ("compact_waiter", crate::family::SELECT_COMPACT_WAITER),
         ("compat_carrier", 1),
         ("waiter_home", waiter_home),
         ("select_dst_depth", select_dst_depth),
+        ("compat_futex_abi", futex_abi),
     ]
 }
 
@@ -298,7 +304,11 @@ pub fn conf_compat_multicast_route_geometry(
 ) -> Vec<(&'static str, i64)> {
     let fallback = crate::derive::multicast_geometry_corroborated(structs);
     let mut geometry: Vec<(&'static str, i64)> = vec![("compat_carrier", 1)];
-    for key in ["compat_futex_abi", "compat_waiter_off", "compat_buffer_size"] {
+    for key in [
+        "compat_futex_abi",
+        "compat_waiter_off",
+        "compat_buffer_size",
+    ] {
         if let Some(value) = numbers.get(key) {
             geometry.push((key, *value));
         }
@@ -512,10 +522,26 @@ pub fn render_conf_with_device(input: &ConfInputs<'_>, device: Option<&str>) -> 
         push_fact(&mut fact_sources, "waiter.pi_tree", &layouts.waiter_pi_tree);
         push_fact(&mut fact_sources, "waiter.task", &layouts.waiter_task);
         push_fact(&mut fact_sources, "waiter.lock", &layouts.waiter_lock);
-        push_fact(&mut fact_sources, "waiter.wake_state", &layouts.waiter_wake_state);
-        push_fact(&mut fact_sources, "cred.usage_size", &layouts.cred_usage_size);
-        push_fact(&mut fact_sources, "cred.uid_offset", &layouts.cred_uid_offset);
-        push_fact(&mut fact_sources, "cred.security_offset", &layouts.cred_security_offset);
+        push_fact(
+            &mut fact_sources,
+            "waiter.wake_state",
+            &layouts.waiter_wake_state,
+        );
+        push_fact(
+            &mut fact_sources,
+            "cred.usage_size",
+            &layouts.cred_usage_size,
+        );
+        push_fact(
+            &mut fact_sources,
+            "cred.uid_offset",
+            &layouts.cred_uid_offset,
+        );
+        push_fact(
+            &mut fact_sources,
+            "cred.security_offset",
+            &layouts.cred_security_offset,
+        );
         if !cred_from_6x_template && layouts.cred_caps_offset.source == Source::Btf {
             fact_sources.push(format!(
                 "cred.caps_offset={} (init_cred/derived)",
@@ -526,7 +552,11 @@ pub fn render_conf_with_device(input: &ConfInputs<'_>, device: Option<&str>) -> 
                 conf_lookup(input.cred, "copy_size")
             ));
         } else {
-            push_fact(&mut fact_sources, "cred.caps_offset", &layouts.cred_caps_offset);
+            push_fact(
+                &mut fact_sources,
+                "cred.caps_offset",
+                &layouts.cred_caps_offset,
+            );
             push_fact(&mut fact_sources, "cred.copy_size", &layouts.cred_copy_size);
         }
     }
@@ -634,8 +664,14 @@ pub fn render_conf_with_device(input: &ConfInputs<'_>, device: Option<&str>) -> 
             &mut lines,
             "selinux",
             &[
-                ("enforcing".to_string(), stage1.selinux_enforcing.to_string()),
-                ("initialized".to_string(), stage1.selinux_initialized.to_string()),
+                (
+                    "enforcing".to_string(),
+                    stage1.selinux_enforcing.to_string(),
+                ),
+                (
+                    "initialized".to_string(),
+                    stage1.selinux_initialized.to_string(),
+                ),
             ],
         );
         if let Some(scratch) = stage1.w1_scratch {
@@ -871,10 +907,10 @@ mod tests {
             route_geometry: &geometry,
             cred: &conf_cred_6x(),
             extra_offsets: &no_extra_offsets(),
-       
+
             layouts: None,
             stage1: None,
-       
+
             phys_source: "test",
         });
         assert!(!out.contains("include"));
@@ -914,10 +950,10 @@ mod tests {
             route_geometry: &geometry,
             cred: &conf_cred_6x(),
             extra_offsets: &no_extra_offsets(),
-       
+
             layouts: None,
             stage1: None,
-       
+
             phys_source: "test",
         });
         assert!(out.contains("tcp_zerocopy {\n    compact_waiter = 1"));
@@ -1000,7 +1036,7 @@ mod tests {
             extra_offsets: &no_extra_offsets(),
             layouts: Some(&layouts),
             stage1: None,
-       
+
             phys_source: "test",
         });
         assert!(out.contains("usage_size = 8"));
@@ -1117,7 +1153,12 @@ mod tests {
         };
         let layouts = LayoutFacts {
             rt_mutex_size: Fact::new(0, Domain::SizeOf, Source::Unknown, Confidence::Unknown),
-            waiter_compact: Fact::new(false, Domain::EnumValue, Source::Unknown, Confidence::Unknown),
+            waiter_compact: Fact::new(
+                false,
+                Domain::EnumValue,
+                Source::Unknown,
+                Confidence::Unknown,
+            ),
             waiter_pi_tree: unknown("null"),
             waiter_task: unknown("null"),
             waiter_lock: unknown("null"),
@@ -1222,10 +1263,10 @@ mod tests {
             extra_offsets: &ConfExtraOffsets {
                 empty_zero_page: Some(47_529_984),
             },
-       
+
             layouts: None,
             stage1: None,
-       
+
             phys_source: "test",
         });
         assert!(out.contains("multicast_waiter {\n    waiter_off = 96"));
@@ -1407,8 +1448,9 @@ mod tests {
         // The block never grows the removed device-placement keys.
         let geometry = conf_multicast_route_geometry(&numbers, &structs);
         assert!(
-            !geometry.iter().any(|(key, _)| key.starts_with("fake_")
-                || key.starts_with("lock_slot")),
+            !geometry
+                .iter()
+                .any(|(key, _)| key.starts_with("fake_") || key.starts_with("lock_slot")),
             "device-measured placement must not be inherited"
         );
     }
@@ -1431,10 +1473,10 @@ mod tests {
             extra_offsets: &ConfExtraOffsets {
                 empty_zero_page: None,
             },
-       
+
             layouts: None,
             stage1: None,
-       
+
             phys_source: "test",
         });
         assert!(out.contains("route {"));
@@ -1457,10 +1499,10 @@ mod tests {
             route_geometry: &[],
             cred: &[],
             extra_offsets: &no_extra_offsets(),
-       
+
             layouts: None,
             stage1: None,
-       
+
             phys_source: "test",
         });
         assert!(out.contains("kernelsnitch {"));
@@ -1494,10 +1536,10 @@ mod tests {
             route_geometry: &geometry,
             cred: &[],
             extra_offsets: &no_extra_offsets(),
-       
+
             layouts: None,
             stage1: None,
-       
+
             phys_source: "test",
         });
         assert!(out.contains("multicast_waiter {\n    waiter_off = 96"));
@@ -1671,10 +1713,10 @@ mod tests {
             route_geometry: &geometry,
             cred: &cred,
             extra_offsets: &extra,
-       
+
             layouts: None,
             stage1: None,
-       
+
             phys_source: "test",
         });
         /* The r8 bundle dropped its 5.15 assets; this is the hardware-validated

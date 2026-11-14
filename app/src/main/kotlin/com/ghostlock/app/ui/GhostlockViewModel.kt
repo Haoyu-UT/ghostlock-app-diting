@@ -97,6 +97,14 @@ private data class ParseRequest(
     val route: String? = null,
 )
 
+/** One carrier of one route, as offered by the parse flow's route picker. */
+private data class RouteChoice(
+    val route: String,
+    val carrier: String,
+    val geometry: Map<String, Long>,
+    val reason: String,
+)
+
 private enum class ParseDialogStage { Mode, PhysImage, Route, Plan, Lock, Source }
 
 class GhostlockViewModel(
@@ -132,7 +140,7 @@ class GhostlockViewModel(
     private var pendingConfirmation: PendingConfirmation? = null
     /** The pass that reported Ambiguous, re-run with the picked route. */
     private var pendingRouteParse: ParseRequest? = null
-    private var pendingRouteChoices: List<RouteVerdict> = emptyList()
+    private var pendingRouteChoices: List<RouteChoice> = emptyList()
     /** The option superset from the ambiguous pass, when the extractor wrote one. */
     private var pendingRouteOptions: OptionSuperset? = null
     private var pendingLockParse: ParseResult.Parsed? = null
@@ -1192,6 +1200,19 @@ class GhostlockViewModel(
             it.copy(runStatus = if (rooted) RunStatus.Success else RunStatus.Failure)
         }
         RunStatusService.finish(application, message, rooted)
+        /* The page-free W1's value is a kernel address, so it sets the two
+         * policycap bytes at selinux_state+5/+6. The post-root policy load
+         * repairs them; when that load did not run or failed, only a reboot
+         * does. The prompt is a safety net, not a run verdict: a completed run
+         * whose fixup landed never shows it. */
+        if (RunSafety.needsRebootPrompt(text, code)) {
+            appendLog("warning: the page-free W1 left SELinux policy capabilities modified; reboot to restore them")
+            showNotice(R.string.reboot_recommended_title, R.string.reboot_recommended_message)
+            RunStatusService.rebootRecommended(
+                application,
+                application.getString(R.string.reboot_recommended_message),
+            )
+        }
     }
 
     /**
@@ -1490,19 +1511,22 @@ class GhostlockViewModel(
 
             ParseDialogStage.Route -> {
                 val parse = pendingRouteParse
-                val route = pendingRouteChoices.getOrNull(index)?.route
+                val choice = pendingRouteChoices.getOrNull(index)
+                val route = choice?.route
+                val carrier = choice?.carrier
                 val options = pendingRouteOptions
                 pendingRouteParse = null
                 pendingRouteChoices = emptyList()
                 pendingRouteOptions = null
                 parseDialogStage = ParseDialogStage.Mode
                 if (parse != null && route != null) {
-                    appendLog("route chosen: $route")
+                    val carrierLabel = carrier?.takeIf { it != "native" }
+                    appendLog("route chosen: $route" + (carrierLabel?.let { " ($it)" } ?: ""))
                     appendLog("pipeline order: ${options?.pipelineOrder?.joinToString(", ") ?: "legacy default"}")
                     /* Keep the sidecar re-run path; when the superset is
                      * present the route choice itself needs no second pass. */
                     pendingParse = parse.copy(route = route)
-                    val synthetic = options?.let { parsedFromOptions(it, route) }
+                    val synthetic = options?.let { parsedFromOptions(it, route, carrier) }
                     if (synthetic != null) {
                         viewModelScope.launch(Dispatchers.IO) { advancePhys(synthetic) }
                     } else {
@@ -1528,13 +1552,15 @@ class GhostlockViewModel(
                     /* Page-based: the lock-source choice still applies when a
                      * safe anchor exists. */
                     if (plans.anchorOnly != null && showLockDialog(parse)) return
-                    val cut = options.cut(route, plans.page, options.device) ?: return
+                    val cut = options.cut(route, plans.page, options.device, carrier = parse.carrier)
+                        ?: return
                     appendLog("option: page (no page-free)")
                     viewModelScope.launch { continueParsed(parse, cut) }
                     return
                 }
                 val plan = choices.getOrNull(index - if (pageOffered) 1 else 0) ?: return
-                val cut = options.cut(route, plan, options.device) ?: return
+                val cut = options.cut(route, plan, options.device, carrier = parse.carrier)
+                    ?: return
                 appendLog(
                     "option: " + plan.label + if (plan.conditioned) " (needs review)" else "",
                 )
@@ -1972,8 +1998,23 @@ class GhostlockViewModel(
         feasible: List<RouteVerdict>,
         options: OptionSuperset?,
     ) {
+        val choices = feasible.flatMap { choice ->
+            val option = options?.route(choice.route)
+            if (option == null || option.verdict != OptionSuperset.Feasible) {
+                listOf(RouteChoice(choice.route, "native", emptyMap(), choice.reason))
+            } else {
+                buildList {
+                    add(RouteChoice(choice.route, option.carrier, option.geometry, choice.reason))
+                    option.alternatives
+                        .filter { it.verdict == OptionSuperset.Feasible }
+                        .forEach { alt ->
+                            add(RouteChoice(choice.route, alt.carrier, alt.geometry, alt.reason))
+                        }
+                }
+            }
+        }
         pendingRouteParse = request
-        pendingRouteChoices = feasible
+        pendingRouteChoices = choices
         pendingRouteOptions = options
         parseDialogStage = ParseDialogStage.Route
         mutableState.update {
@@ -1981,12 +2022,11 @@ class GhostlockViewModel(
                 dialogVisible = true,
                 dialogType = DialogType.LIST,
                 dialogTitleRes = R.string.parse_route_title,
-                dialogItems = feasible.map { choice ->
-                    val geometry = options?.route(choice.route)?.geometry.orEmpty()
-                    "${RouteDisplay.label(choice.route, geometry, options?.release)} — ${choice.reason}"
+                dialogItems = choices.map { choice ->
+                    "${RouteDisplay.label(choice.route, choice.geometry, options?.release)} — ${choice.reason}"
                 },
                 dialogItemResIds = emptyList(),
-                dialogItemGrades = feasible.map { choice -> RouteDisplay.grade(choice.route) },
+                dialogItemGrades = choices.map { choice -> RouteDisplay.grade(choice.route) },
                 dialogLeadingResId = null,
                 dialogCurrentItemIndex = -1,
                 executionSheetVisible = false,
@@ -2101,7 +2141,12 @@ class GhostlockViewModel(
         if (options != null && plans != null) {
             when (val decision = plans.decision()) {
                 is OptionDecision.Auto -> {
-                    val cut = options.cut(plans.route, decision.plan, options.device)
+                    val cut = options.cut(
+                        plans.route,
+                        decision.plan,
+                        options.device,
+                        carrier = result.carrier,
+                    )
                     if (cut != null) {
                         appendLog("option: ${decision.plan.label} (auto)")
                         continueParsed(result, cut)
@@ -2213,6 +2258,7 @@ class GhostlockViewModel(
     private fun parsedFromOptions(
         options: OptionSuperset,
         route: String?,
+        carrier: String? = null,
     ): ParseResult.Parsed? {
         val chosenRoute = route
             ?: options.routes.firstOrNull { it.verdict == OptionSuperset.Feasible }?.route
@@ -2222,7 +2268,8 @@ class GhostlockViewModel(
             is OptionDecision.Auto -> decision.plan
             else -> plans.safeOptions.firstOrNull() ?: plans.anchorOnly ?: plans.page
         }
-        val document = options.cut(chosenRoute, plan, options.device) ?: return null
+        val document = options.cut(chosenRoute, plan, options.device, carrier = carrier)
+            ?: return null
         return ParseResult.Parsed(
             releases = listOf(options.release),
             missing = if (options.physLoad == null) setOf("kernel_phys_load") else emptySet(),
@@ -2235,6 +2282,7 @@ class GhostlockViewModel(
             physOffsetPresent = options.physOffset != null,
             documentText = document,
             options = options,
+            carrier = carrier,
         )
     }
 

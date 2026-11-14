@@ -23,10 +23,16 @@ class OptionSupersetTest {
           "kernel_phys_offset": 1073741824,
           "phys_source": "vendor_boot DTB /memory",
           "routes": [
-            { "route": "select_stack", "verdict": "feasible",
+            { "route": "select_stack", "carrier": "native", "verdict": "feasible",
               "reason": "pselect/futex geometry derived",
               "anchor_capable": true,
-              "geometry": { "compact_waiter": 1, "waiter_shift": 1 } },
+              "geometry": { "compact_waiter": 1, "waiter_shift": 1 },
+              "alternatives": [
+                { "carrier": "compat", "verdict": "feasible",
+                  "reason": "AArch32 compat carrier",
+                  "geometry": { "compat_carrier": 1, "waiter_home": 432,
+                                "select_dst_depth": 480, "compat_futex_abi": 0 } }
+              ] },
             { "route": "tcp_zerocopy", "verdict": "feasible",
               "reason": "cap 0x40", "anchor_capable": false, "geometry": { "compact_waiter": 1 } }
           ],
@@ -153,6 +159,27 @@ class OptionSupersetTest {
         assertFalse(override.contains("\"dirtyfrag\""))
         val legacy = requireNotNull(superset.cut("select_stack", plan, pipelineOrder = emptyList()))
         assertFalse(legacy.contains("pipeline ="))
+    }
+
+    @Test
+    fun `carrier alternatives are exposed and the cut renders the chosen one`() {
+        val superset = requireNotNull(OptionSuperset.parse(sample))
+        val route = requireNotNull(superset.route("select_stack"))
+        assertEquals("native", route.carrier)
+        val compat = route.alternatives.single()
+        assertEquals("compat", compat.carrier)
+        assertEquals(1L, compat.geometry["compat_carrier"])
+        val plan = superset.plansFor("select_stack")!!.safeOptions[0]
+        val native = requireNotNull(superset.cut("select_stack", plan))
+        assertTrue(native.contains("waiter_shift = 1"))
+        assertFalse(native.contains("compat_carrier"))
+        val chosen = requireNotNull(superset.cut("select_stack", plan, carrier = "compat"))
+        assertTrue(chosen.contains("compat_carrier = 1"))
+        assertTrue(chosen.contains("waiter_home = 432"))
+        assertTrue(chosen.contains("select_dst_depth = 480"))
+        assertTrue(chosen.contains("compat_futex_abi = 0"))
+        assertFalse(chosen.contains("waiter_shift"))
+        assertNull(superset.cut("select_stack", plan, carrier = "bogus"))
     }
 
     @Test

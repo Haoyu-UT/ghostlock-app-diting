@@ -70,7 +70,7 @@ int main() {
 
     /* --- time64: full eleven-word user stamp, exact fit at 0x20 --- */
     {
-        BitmapGeometry geometry{.waiter_home = 0x1c0, .select_dst_depth = 0x1e0};
+        BitmapGeometry geometry{.waiter_home = 0x1c0, .select_dst_depth = 0x1e0, .futex_abi = std::nullopt};
         BitmapPlan plan{};
         BitmapFitError error = BitmapFitError::BufferMismatch;
         const auto bitmap = pack(words, geometry, &plan, &error);
@@ -98,14 +98,14 @@ int main() {
         BitmapPlan plan{};
         BitmapFitError error = BitmapFitError::None;
         assert(!plan_compat_bitmap(
-            BitmapGeometry{.waiter_home = 0x1c0, .select_dst_depth = 0x1e8},
+            BitmapGeometry{.waiter_home = 0x1c0, .select_dst_depth = 0x1e8, .futex_abi = std::nullopt},
             &plan, &error));
         assert(error == BitmapFitError::TooDeep);
     }
 
     /* --- time32: nine words at 0x30, zero deadline/ww_ctx tail --- */
     {
-        BitmapGeometry geometry{.waiter_home = 0x1b0, .select_dst_depth = 0x1e0};
+        BitmapGeometry geometry{.waiter_home = 0x1b0, .select_dst_depth = 0x1e0, .futex_abi = std::nullopt};
         BitmapPlan plan{};
         BitmapFitError error = BitmapFitError::BufferMismatch;
         const auto bitmap = pack(words, geometry, &plan, &error);
@@ -139,14 +139,14 @@ int main() {
         BitmapPlan plan{};
         BitmapFitError error = BitmapFitError::None;
         assert(!pack_compat_bitmap(
-            dirty, BitmapGeometry{.waiter_home = 0x1b0, .select_dst_depth = 0x1e0},
+            dirty, BitmapGeometry{.waiter_home = 0x1b0, .select_dst_depth = 0x1e0, .futex_abi = std::nullopt},
             std::span<uint8_t>(out), &plan, &error));
         assert(error == BitmapFitError::NonZeroTail);
         dirty = words;
         dirty.ww_ctx = 0x8000000000000000ULL;
         error = BitmapFitError::None;
         assert(!pack_compat_bitmap(
-            dirty, BitmapGeometry{.waiter_home = 0x1b0, .select_dst_depth = 0x1e0},
+            dirty, BitmapGeometry{.waiter_home = 0x1b0, .select_dst_depth = 0x1e0, .futex_abi = std::nullopt},
             std::span<uint8_t>(out), &plan, &error));
         assert(error == BitmapFitError::NonZeroTail);
     }
@@ -156,12 +156,12 @@ int main() {
         BitmapPlan plan{};
         BitmapFitError error = BitmapFitError::None;
         assert(!plan_compat_bitmap(
-            BitmapGeometry{.waiter_home = 0x200, .select_dst_depth = 0x1e0},
+            BitmapGeometry{.waiter_home = 0x200, .select_dst_depth = 0x1e0, .futex_abi = std::nullopt},
             &plan, &error));
         assert(error == BitmapFitError::HomeBelowDepth);
         error = BitmapFitError::None;
         assert(!plan_compat_bitmap(
-            BitmapGeometry{.waiter_home = 0x210, .select_dst_depth = 0x1e0},
+            BitmapGeometry{.waiter_home = 0x210, .select_dst_depth = 0x1e0, .futex_abi = std::nullopt},
             &plan, &error));
         assert(error == BitmapFitError::HomeBelowDepth);
     }
@@ -171,7 +171,7 @@ int main() {
         BitmapPlan plan{};
         BitmapFitError error = BitmapFitError::None;
         assert(!plan_compat_bitmap(
-            BitmapGeometry{.waiter_home = 0x1c8, .select_dst_depth = 0x1e8},
+            BitmapGeometry{.waiter_home = 0x1c8, .select_dst_depth = 0x1e8, .futex_abi = std::nullopt},
             &plan, &error));
         assert(error == BitmapFitError::UnknownHome);
     }
@@ -181,7 +181,7 @@ int main() {
         BitmapPlan plan{};
         BitmapFitError error = BitmapFitError::None;
         assert(!plan_compat_bitmap(
-            BitmapGeometry{.waiter_home = 0x1b0, .select_dst_depth = 0x1d0},
+            BitmapGeometry{.waiter_home = 0x1b0, .select_dst_depth = 0x1d0, .futex_abi = std::nullopt},
             &plan, &error));
         assert(error == BitmapFitError::ZeroWindow);
     }
@@ -191,7 +191,7 @@ int main() {
         std::array<uint8_t, kBitmapBytes - 1> out{};
         BitmapFitError error = BitmapFitError::None;
         assert(!pack_compat_bitmap(
-            words, BitmapGeometry{.waiter_home = 0x1c0, .select_dst_depth = 0x1e0},
+            words, BitmapGeometry{.waiter_home = 0x1c0, .select_dst_depth = 0x1e0, .futex_abi = std::nullopt},
             std::span<uint8_t>(out), nullptr, &error));
         assert(error == BitmapFitError::BufferMismatch);
     }
@@ -201,5 +201,32 @@ int main() {
     assert(abi_for_waiter_home(0x1c0) == CarrierFutexAbi::Time64);
     assert(!abi_for_waiter_home(0x1a0));
     assert(!abi_for_waiter_home(0x200));
+
+    /* --- the profile's derived ABI overrides the legacy home table --- */
+    {
+        BitmapPlan plan{};
+        BitmapFitError error = BitmapFitError::None;
+        /* A 6.1-style home 0x1e8 under a 0x1f0 buffer, time64. */
+        assert(plan_compat_bitmap(
+            BitmapGeometry{.waiter_home = 0x1e8, .select_dst_depth = 0x1f0, .futex_abi = 1},
+            &plan, &error));
+        assert(error == BitmapFitError::None);
+        assert(plan.futex_abi == CarrierFutexAbi::Time64);
+        assert(plan.offset == 0x08);
+        /* The same home without the key is an unknown home. */
+        error = BitmapFitError::None;
+        assert(!plan_compat_bitmap(
+            BitmapGeometry{.waiter_home = 0x1e8, .select_dst_depth = 0x1f0, .futex_abi = std::nullopt},
+            &plan, &error));
+        assert(error == BitmapFitError::UnknownHome);
+        /* A value outside the two ABIs is refused. */
+        error = BitmapFitError::None;
+        assert(!plan_compat_bitmap(
+            BitmapGeometry{.waiter_home = 0x1e8,
+                           .select_dst_depth = 0x1f0,
+                           .futex_abi = static_cast<uint8_t>(2)},
+            &plan, &error));
+        assert(error == BitmapFitError::UnknownHome);
+    }
     return 0;
 }

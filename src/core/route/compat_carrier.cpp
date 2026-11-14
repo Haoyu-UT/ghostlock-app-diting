@@ -424,6 +424,7 @@ namespace ghostlock::route::compat {
         const BitmapGeometry geometry{
             .waiter_home = *layout.waiter_home,
             .select_dst_depth = *layout.select_dst_depth,
+            .futex_abi = layout.compat_futex_abi,
         };
         BitmapPlan plan{};
         BitmapFitError fit = BitmapFitError::None;

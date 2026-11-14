@@ -22,7 +22,7 @@ namespace {
      * block. Asserted with the same value in the Kotlin test
      * (profile-core `NativeProfileDigestTest`), which is what makes the two
      * implementations a checked contract rather than two hopeful copies. */
-    constexpr uint64_t kGoldenSchemaDigest = 0x6d7228fbbf71e00cull;
+    constexpr uint64_t kGoldenSchemaDigest = 0x275387e01fa41b2aull;
 
     void put_u16(std::string &out, uint16_t value) {
         out.push_back(static_cast<char>(value & 0xff));

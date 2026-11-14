@@ -193,6 +193,11 @@ namespace ghostlock::profile {
         std::optional<uint8_t> select_compat_carrier;
         std::optional<uint32_t> select_waiter_home;
         std::optional<uint32_t> select_select_dst_depth;
+        /* The compat select carrier's futex ABI: 0 = futex_time32,
+         * 1 = futex_time64. Absent => the legacy home table decides
+         * (0x1b0/0x1c0); a 6.x home is not in that table, so the derived
+         * profiles carry the key. */
+        std::optional<uint8_t> select_compat_futex_abi;
         /* Sigreturn route: where waiter byte 0 sits inside the 0x200-byte fpsimd
          * copy window `rt_sigreturn`'s restore performs. The value is per build
          * and per restore helper -- the SVE path copies at sp+0x10, the plain
@@ -277,6 +282,10 @@ namespace ghostlock::profile {
         std::optional<uint8_t> compat_carrier;
         std::optional<uint32_t> waiter_home;
         std::optional<uint32_t> select_dst_depth;
+        /* 0 = futex_time32, 1 = futex_time64; absent => the native's legacy
+         * home table. The 6.x carrier carries it because a novel home cannot
+         * be mapped back to an ABI. */
+        std::optional<uint8_t> compat_futex_abi;
     };
 
     struct TcpZerocopyLayout {
@@ -587,6 +596,7 @@ namespace ghostlock::profile {
                            .compat_carrier = values_.geometry.select_compat_carrier,
                            .waiter_home = values_.geometry.select_waiter_home,
                            .select_dst_depth = values_.geometry.select_select_dst_depth,
+                           .compat_futex_abi = values_.geometry.select_compat_futex_abi,
                        }
                        : SelectStackLayout{};
         }

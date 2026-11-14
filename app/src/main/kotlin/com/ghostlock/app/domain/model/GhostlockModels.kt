@@ -474,6 +474,8 @@ sealed interface ParseResult {
         val documentText: String? = null,
         /** The extractor's option superset (all routes/candidates/plans). */
         val options: OptionSuperset? = null,
+        /** The carrier the profile was cut for; null = the route's primary. */
+        val carrier: String? = null,
     ) : ParseResult
 
     /**

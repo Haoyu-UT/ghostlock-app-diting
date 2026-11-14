@@ -54,7 +54,23 @@ namespace ghostlock::route::compat {
             set_error(error, BitmapFitError::HomeBelowDepth);
             return false;
         }
-        const auto abi = abi_for_waiter_home(geometry.waiter_home);
+        std::optional<::ghostlock::compat::CarrierFutexAbi> abi;
+        if (geometry.futex_abi.has_value()) {
+            switch (*geometry.futex_abi) {
+                case 0:
+                    abi = ::ghostlock::compat::CarrierFutexAbi::Time32;
+                    break;
+                case 1:
+                    abi = ::ghostlock::compat::CarrierFutexAbi::Time64;
+                    break;
+                default:
+                    break;
+            }
+        } else {
+            /* Legacy profiles did not carry the ABI; the 5.x homes identify
+             * it. A 6.x home reaches this arm only from an old document. */
+            abi = abi_for_waiter_home(geometry.waiter_home);
+        }
         if (!abi) {
             set_error(error, BitmapFitError::UnknownHome);
             return false;

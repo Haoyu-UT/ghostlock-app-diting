@@ -49,12 +49,24 @@ data class OptionPlan(
         }
 }
 
+/** One non-primary carrier of a route, with its own geometry. */
+data class OptionRouteVariant(
+    val carrier: String,
+    val verdict: String,
+    val reason: String,
+    val geometry: Map<String, Long>,
+)
+
 data class OptionRoute(
     val route: String,
     val verdict: String,
     val reason: String,
     val anchorCapable: Boolean,
     val geometry: Map<String, Long>,
+    /** The primary carrier: `native` or `compat`. */
+    val carrier: String = "native",
+    /** The route's other feasible carriers (the carrier × route matrix). */
+    val alternatives: List<OptionRouteVariant> = emptyList(),
 )
 
 /** One `pipelines[]` verdict from the extractor's maximal pass. */
@@ -151,9 +163,18 @@ data class OptionSuperset(
         plan: OptionPlan,
         device: String? = null,
         pipelineOrder: List<String>? = null,
+        carrier: String? = null,
     ): String? {
         val routeOption = routes.firstOrNull { it.route == route && it.verdict == Feasible }
             ?: return null
+        /* The carrier choice is a geometry choice inside the route; the primary
+         * is the default, and an absent or unknown carrier fails closed. */
+        val geometry = when {
+            carrier == null || carrier == routeOption.carrier -> routeOption.geometry
+            else -> routeOption.alternatives
+                .firstOrNull { it.carrier == carrier && it.verdict == Feasible }
+                ?.geometry ?: return null
+        }
         val top = profile[""] ?: return null
         val selected = device?.let { name -> devices.firstOrNull { it.device.equals(name, true) } }
             ?: devices.firstOrNull()
@@ -180,7 +201,7 @@ data class OptionSuperset(
             document["pipeline"] = order
         }
         val block = linkedMapOf<String, Any?>()
-        routeOption.geometry.forEach { (key, value) -> block[key] = value }
+        geometry.forEach { (key, value) -> block[key] = value }
         plan.anchor?.let { anchor ->
             block["lock_anchor_image"] = anchor.image
             block["lock_anchor_bytes"] = anchor.bytes
@@ -234,16 +255,24 @@ data class OptionSuperset(
             val routes = root["routes"].asValueList().orEmpty().mapNotNull { entry ->
                 val map = entry.asValueMap() ?: return@mapNotNull null
                 val route = map["route"] as? String ?: return@mapNotNull null
+                val alternatives = map["alternatives"].asValueList().orEmpty().mapNotNull { alt ->
+                    val altMap = alt.asValueMap() ?: return@mapNotNull null
+                    val carrier = altMap["carrier"] as? String ?: return@mapNotNull null
+                    OptionRouteVariant(
+                        carrier = carrier,
+                        verdict = altMap["verdict"] as? String ?: "",
+                        reason = altMap["reason"] as? String ?: "",
+                        geometry = geometryOf(altMap["geometry"]),
+                    )
+                }
                 OptionRoute(
                     route = route,
                     verdict = map["verdict"] as? String ?: "",
                     reason = map["reason"] as? String ?: "",
                     anchorCapable = map["anchor_capable"] as? Boolean ?: false,
-                    geometry = map["geometry"].asValueMap().orEmpty()
-                        .mapNotNull { (key, value) ->
-                            (value as? Number)?.let { key to it.toLong() }
-                        }
-                        .toMap(),
+                    geometry = geometryOf(map["geometry"]),
+                    carrier = map["carrier"] as? String ?: "native",
+                    alternatives = alternatives,
                 )
             }
             val plans = root["plans"].asValueList().orEmpty().mapNotNull { entry ->
@@ -293,6 +322,11 @@ data class OptionSuperset(
                 pipelineOrder = pipelineOrder,
             )
         }.getOrNull()
+
+        private fun geometryOf(value: Any?): Map<String, Long> =
+            value.asValueMap().orEmpty()
+                .mapNotNull { (key, item) -> (item as? Number)?.let { key to it.toLong() } }
+                .toMap()
 
         private fun plan(value: Any?): OptionPlan? {
             val map = value.asValueMap() ?: return null

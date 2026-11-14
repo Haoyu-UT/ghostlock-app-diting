@@ -21,8 +21,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::anchor::{self, W1Scratch};
 use crate::analysis::RouteVerdict;
+use crate::anchor::{self, W1Scratch};
 use crate::pipeline::{PipelineFacts, PipelineOption};
 
 pub const SCHEMA_VERSION: u32 = 2;
@@ -102,11 +102,30 @@ pub struct DeviceDerivation {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RouteOption {
     pub route: String,
+    /// The carrier of the primary verdict: `native` or `compat`.
+    #[serde(default)]
+    pub carrier: String,
     pub verdict: String,
     pub reason: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub numbers: BTreeMap<String, i64>,
     pub anchor_capable: bool,
+    pub geometry: BTreeMap<String, i64>,
+    /// The route's other feasible carriers, each with its own geometry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alternatives: Vec<RouteVariantOption>,
+}
+
+/// One non-primary carrier of a route. The app's route picker offers these as
+/// the carrier choice; a cut renders the selected variant's geometry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteVariantOption {
+    pub carrier: String,
+    pub verdict: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub numbers: BTreeMap<String, i64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub geometry: BTreeMap<String, i64>,
 }
 
@@ -240,8 +259,8 @@ pub struct Input<'a> {
     pub pipelines: &'a [PipelineOption],
     /// The order the cut writes into the profile.
     pub pipeline_order: &'a [String],
-    /// Full geometry per feasible route (the cut needs all of them).
-    pub geometry: &'a BTreeMap<String, BTreeMap<String, i64>>,
+    /// Full geometry per `(route, carrier)` (the cut needs all of them).
+    pub geometry: &'a BTreeMap<(String, String), BTreeMap<String, i64>>,
     /// `selinux_state.initialized`; `None` fails the scratch arithmetic closed.
     pub initialized: Option<u32>,
     pub kernel: &'a [u8],
@@ -271,17 +290,39 @@ pub fn build(input: &Input<'_>) -> Superset {
     let routes = input
         .verdicts
         .iter()
-        .map(|verdict| RouteOption {
-            route: verdict.route.to_string(),
-            verdict: verdict.verdict.label().to_string(),
-            reason: verdict.reason.clone(),
-            numbers: verdict.numbers.clone(),
-            anchor_capable: verdict.route != "tcp_zerocopy",
-            geometry: input
-                .geometry
-                .get(verdict.route)
-                .cloned()
-                .unwrap_or_default(),
+        .map(|verdict| {
+            let carrier = if verdict.is_compat_carrier() || verdict.is_compat_multicast() {
+                "compat"
+            } else {
+                "native"
+            };
+            let geometry = |name: &str| {
+                input
+                    .geometry
+                    .get(&(verdict.route.to_string(), name.to_string()))
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            RouteOption {
+                route: verdict.route.to_string(),
+                carrier: carrier.to_string(),
+                verdict: verdict.verdict.label().to_string(),
+                reason: verdict.reason.clone(),
+                numbers: verdict.numbers.clone(),
+                anchor_capable: verdict.route != "tcp_zerocopy",
+                geometry: geometry(carrier),
+                alternatives: verdict
+                    .alternatives
+                    .iter()
+                    .map(|alt| RouteVariantOption {
+                        carrier: alt.carrier.label().to_string(),
+                        verdict: alt.verdict.label().to_string(),
+                        reason: alt.reason.clone(),
+                        numbers: alt.numbers.clone(),
+                        geometry: geometry(alt.carrier.label()),
+                    })
+                    .collect(),
+            }
         })
         .collect();
     let devices = input
@@ -700,7 +741,13 @@ fn render_cut(
         lines.push(format!("  image = {}", scratch.image));
         lines.push("}".to_string());
     }
-    for block in ["kernelsnitch", "task_struct", "cred", "offset", "waiter_layout"] {
+    for block in [
+        "kernelsnitch",
+        "task_struct",
+        "cred",
+        "offset",
+        "waiter_layout",
+    ] {
         if let Some(entries) = superset.profile.get(block) {
             lines.push(format!("{block} {{"));
             for (key, value) in entries {
@@ -725,12 +772,7 @@ mod tests {
         }
     }
 
-    fn candidate(
-        name: &str,
-        conditioned: bool,
-        in_anchor: bool,
-        second: bool,
-    ) -> CandidateOption {
+    fn candidate(name: &str, conditioned: bool, in_anchor: bool, second: bool) -> CandidateOption {
         CandidateOption {
             name: name.to_string(),
             image: 0x1000,
@@ -756,7 +798,11 @@ mod tests {
             candidate("serial8250_ports", false, true, false),
         ];
         let plans = plans_for("select_stack", &candidates);
-        let safe: Vec<_> = plans.page_free.iter().filter(|plan| !plan.conditioned).collect();
+        let safe: Vec<_> = plans
+            .page_free
+            .iter()
+            .filter(|plan| !plan.conditioned)
+            .collect();
         /* dump_skip and serial8250 have in-anchor slots; bm_pmd has no scratch
          * that another safe region can host in this synthetic set. */
         assert_eq!(safe.len(), 2, "every safe anchor space is offered");
@@ -778,7 +824,11 @@ mod tests {
             candidate("serial8250_ports", false, false, true),
         ];
         let plans = plans_for("select_stack", &candidates);
-        let safe: Vec<_> = plans.page_free.iter().filter(|plan| !plan.conditioned).collect();
+        let safe: Vec<_> = plans
+            .page_free
+            .iter()
+            .filter(|plan| !plan.conditioned)
+            .collect();
         /* Every anchor without an in-anchor slot gets every *other* safe
          * second region: dump x {bm_pmd, serial}, bm_pmd x serial, serial x
          * bm_pmd. The UI filters/groups; the extractor omits nothing. */
@@ -830,10 +880,7 @@ mod tests {
             .filter(|plan| plan.conditioned)
             .collect();
         assert_eq!(conditioned_plans.len(), 1);
-        assert_eq!(
-            conditioned_plans[0].anchor.as_ref().unwrap().image,
-            0x3000
-        );
+        assert_eq!(conditioned_plans[0].anchor.as_ref().unwrap().image, 0x3000);
         assert!(!auto_plan("select_stack", &candidates).page_free);
     }
 
@@ -904,6 +951,7 @@ mod tests {
             phys_source: "unset".to_string(),
             routes: vec![RouteOption {
                 route: "select_stack".to_string(),
+                carrier: "native".to_string(),
                 verdict: "feasible".to_string(),
                 reason: String::new(),
                 numbers: BTreeMap::new(),
@@ -912,6 +960,7 @@ mod tests {
                     ("waiter_shift".to_string(), -2),
                     ("compact_waiter".to_string(), 1),
                 ]),
+                alternatives: Vec::new(),
             }],
             pipeline_facts: PipelineFacts::default(),
             pipelines: Vec::new(),

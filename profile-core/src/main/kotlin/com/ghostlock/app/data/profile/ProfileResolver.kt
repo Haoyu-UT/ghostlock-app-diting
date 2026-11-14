@@ -67,6 +67,7 @@ object ProfileResolver {
             "compat_carrier" -> "compat_carrier"
             "waiter_home" -> "waiter_home"
             "select_dst_depth" -> "select_dst_depth"
+            "compat_futex_abi" -> "compat_futex_abi"
             /* The sigreturn route's per-build copy-window offsets. Bare paths,
              * like the select route's own geometry keys above, so both the
              * active route's branch and its fallback branch are searched. */
